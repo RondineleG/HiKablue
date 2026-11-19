@@ -156,14 +156,11 @@ fn ip_binary() -> io::Result<&'static str> {
 fn ip(args: &[&str]) -> io::Result<()> {
     let output = Command::new(ip_binary()?).args(args).output()?;
     if !output.status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "ip {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "ip {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
     Ok(())
 }

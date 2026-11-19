@@ -83,8 +83,8 @@ pub fn destination_ip(packet: &[u8]) -> Ipv4Addr {
 /// folds to all ones.
 fn header_checksum_ok(header: &[u8]) -> bool {
     let mut sum: u32 = 0;
-    for word in header.chunks_exact(2) {
-        sum += u16::from_be_bytes([word[0], word[1]]) as u32;
+    for word in header.as_chunks::<2>().0 {
+        sum += u16::from_be_bytes(*word) as u32;
     }
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -114,8 +114,8 @@ mod tests {
 
     fn compute_checksum(header: &[u8]) -> u16 {
         let mut sum: u32 = 0;
-        for word in header.chunks_exact(2) {
-            sum += u16::from_be_bytes([word[0], word[1]]) as u32;
+        for word in header.as_chunks::<2>().0 {
+            sum += u16::from_be_bytes(*word) as u32;
         }
         while sum >> 16 != 0 {
             sum = (sum & 0xffff) + (sum >> 16);
