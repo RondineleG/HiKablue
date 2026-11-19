@@ -28,4 +28,4 @@ Reusable skills live in [`docs/skills/`](../docs/skills/README.md), separate fro
 
 Use the repository's chosen issue, pull-request, or session tracker as the single source of task status. Do not add a second JSON task tracker unless the project explicitly adopts it.
 
-There is no executable application scaffold yet. Do not document placeholder build/test commands or add scripts that cannot be run. Add a root command interface (for example, a `justfile` or the existing toolchain's standard scripts) together with the first executable scaffold, and ensure agent instructions call those real commands rather than duplicating their logic.
+The Rust engine (`engine-rust/vpn-engine`) is the executable scaffold; `agent-go/`, `control-dotnet/`, and `proto/` remain documented placeholders. Do not document placeholder build/test commands or add scripts that cannot be run. Use the real commands of each scaffold (for `engine-rust`: `cargo check`, `cargo test`, `cargo build --release`; see `engine-rust/README.md`) rather than duplicating their logic; add a root command interface (for example, a `justfile`) when a second executable scaffold lands.

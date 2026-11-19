@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# tests/lab/check-diff-safety.sh — lab-safety guardrail.
+#
+# Scans the lines ADDED by this branch's diff for patterns the LAB/SEC rules
+# forbid outside project-owned lab objects: firewall tool invocations,
+# default-route changes, forwarding sysctls, and embedded secrets. Lab-owned
+# files (deploy/debian/**, tests/lab/**) and Markdown (*.md, book/**) are
+# exempt from the network patterns — scoped rule changes are expected there
+# and prose cannot invoke a command — but secrets are scanned in EVERY file,
+# docs included (SEC-01 covers examples too). The scanner fails closed: any
+# error reading the diff aborts the check instead of passing an empty scan.
+#
+# Usage:
+#   tests/lab/check-diff-safety.sh [BASE_SHA] [HEAD_SHA]
+# Defaults: merge-base of HEAD with origin/main, and HEAD.
+set -euo pipefail
+
+# CHECK_DIFF_SAFETY_ROOT exists only so the self-test can point the scanner at
+# a scratch repository; production runs always use the repo containing this
+# script.
+repo_root="${CHECK_DIFF_SAFETY_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
+cd "$repo_root"
+
+base="${1:-$(git merge-base HEAD origin/main)}"
+head="${2:-$(git rev-parse HEAD)}"
+
+# Fail closed: unresolvable refs mean nothing was scanned — that must not PASS.
+for ref in "$base" "$head"; do
+    if ! git rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then
+        echo "check-diff-safety: FAIL — cannot resolve ref '$ref'" >&2
+        exit 1
+    fi
+done
+mapfile -t changed_files < <(git diff --name-only "$base" "$head")
+
+# Forbidden patterns (grep -E) scanned in added lines. Network mutations are
+# exempt in lab-owned and doc files; secrets are scanned everywhere.
+net_patterns='iptables|(^|[^a-z])nft(ables)?[^a-z]|ip route (add|del|replace|change)[^|]*\bdefault\b|net\.ipv4\.ip_forward'
+sec_patterns='BEGIN [A-Z ]*PRIVATE KEY|(password|passwd|secret|api_?key|token)[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']+'
+
+hits=0
+while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    scan="$sec_patterns"
+    case "$file" in
+        deploy/debian/*|tests/lab/*|book/*|*.md) ;; # secrets only
+        *) scan="$sec_patterns|$net_patterns" ;;
+    esac
+    if ! added="$(git diff --unified=0 "$base" "$head" -- "$file")"; then
+        echo "check-diff-safety: FAIL — git diff failed for '$file'" >&2
+        exit 1
+    fi
+    found="$(printf '%s\n' "$added" \
+        | grep -E '^\+' | grep -vE '^\+\+\+' | grep -nE "$scan" || true)"
+    if [ -n "$found" ]; then
+        echo "check-diff-safety: $file"
+        echo "$found" | sed 's/^/    /'
+        hits=1
+    fi
+done < <(printf '%s\n' "${changed_files[@]}")
+
+if [ "$hits" -eq 1 ]; then
+    echo "check-diff-safety: FAIL — forbidden patterns outside lab-owned files" >&2
+    exit 1
+fi
+echo "check-diff-safety: PASS (pattern scan — a tripwire, not a substitute for review or a full secret scanner)"

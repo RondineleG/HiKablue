@@ -1,0 +1,27 @@
+name: Ebook parity
+
+on:
+  pull_request:
+    # Intentional: only PRs targeting main. Stacked PRs (base != main) are
+    # validated locally with tests/checks.sh until they are retargeted.
+    branches: [main]
+    paths:
+      - 'book/**'
+      - 'tests/book/**'
+      - '.github/workflows/book-parity.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'book/**'
+      - 'tests/book/**'
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    name: en / es / pt-BR editions in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tests/book/check-parity.sh

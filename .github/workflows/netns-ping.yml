@@ -1,0 +1,43 @@
+name: TUN/UDP integration (netns)
+
+on:
+  pull_request:
+    # Intentional: only PRs targeting main. Stacked PRs (base != main) are
+    # validated locally with tests/checks.sh until they are retargeted.
+    branches: [main]
+    paths:
+      - 'engine-rust/**'
+      - 'tests/lab/**'
+      - '.github/workflows/netns-ping.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'engine-rust/**'
+      - 'tests/lab/**'
+
+permissions:
+  contents: read
+
+jobs:
+  netns-ping:
+    name: ping between virtual IPs (both directions)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-rust
+
+      - name: Build vpn-engine (release)
+        working-directory: engine-rust
+        run: cargo build --release
+
+      # GitHub-hosted runners have /dev/net/tun and passwordless sudo, so the
+      # real two-namespace ping runs unprivileged-as-root here, no Docker.
+      - name: Run tests/lab/netns-ping.sh
+        run: sudo tests/lab/netns-ping.sh engine-rust/target/release/vpn-engine

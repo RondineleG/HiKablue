@@ -2,7 +2,7 @@
 
 HiKablue is an educational VPN project for Debian. It follows a packet from a Linux client through a tunnel and an exit node, then builds the services that provision, monitor, and revoke that connection. The project uses Rust for packet processing, Go for node operations, and C# for the control plane.
 
-**Status.** The architecture and learning roadmap are documented. The first implementation task is a raw IPv4 TUN/UDP tunnel between two Debian nodes in an isolated lab. Debian 13 is the reference environment, and Debian 12 compatibility is a verification target.
+**Status.** The architecture and learning roadmap are documented. The first delivered implementation is the raw IPv4 TUN/UDP tunnel (`vpn-engine`) between two Debian nodes in an isolated lab — the spec's milestone 2 (TUN), executed ahead of milestone 1 (Telemetry) by explicit request; telemetry remains pending. Debian 13 is the reference environment, and Debian 12 compatibility is a verification target.
 
 ## Architecture
 
@@ -18,8 +18,8 @@ The custom UDP transport is for isolated lab exercises with test traffic. The ro
 
 ## Implementation roadmap
 
-1. Establish the monorepo and verify the toolchains. Use telemetry to practice integrating Rust, Go, and C#.
-2. Build the raw TUN/UDP tunnel and verify a ping between virtual IPs and an HTTP request through the exit node. This is the **initial TUN implementation task**, which maps to the TUN milestone in the specification; it is separate from the telemetry milestone.
+1. Establish the monorepo and verify the toolchains. Use telemetry to practice integrating Rust, Go, and C#. *(Pending.)*
+2. Build the raw TUN/UDP tunnel and verify a ping between virtual IPs. This is the **initial TUN implementation task**, which maps to the TUN milestone in the specification; it is separate from the telemetry milestone. *(Ping verified both ways on Debian 12/13 — delivered out of the planned order; the deferred HTTP-request-through-the-exit-node check depends on forwarding/NAT and belongs to the full-tunnel phase.)*
 3. Add node registration, IP allocation, and session provisioning. Confirm that retrying a command leaves the same applied state.
 4. Integrate the protected lab transport and verify two concurrent clients, individual session revocation, and fresh keys after a restart.
 5. Verify deployment and recovery on Debian, then implement and test the WireGuard profile.
