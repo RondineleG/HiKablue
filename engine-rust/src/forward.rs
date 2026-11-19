@@ -135,6 +135,20 @@ fn sockaddr_to_std(
                 sa.sin_port,
             ))))
         }
+        libc::AF_INET6 => {
+            // A `[::]` bind yields AF_INET6 senders, including IPv4-mapped
+            // ones; rejecting them would silently stall the tunnel.
+            if (len as usize) < std::mem::size_of::<libc::sockaddr_in6>() {
+                return Err(invalid("short IPv6 source address".into()));
+            }
+            let sa: &libc::sockaddr_in6 = unsafe { &*(storage as *const _ as *const _) };
+            Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr),
+                u16::from_be(sa.sin6_port),
+                u32::from_be(sa.sin6_flowinfo),
+                sa.sin6_scope_id,
+            )))
+        }
         family => Err(invalid(format!("unexpected address family {family}"))),
     }
 }
@@ -310,6 +324,36 @@ mod tests {
         assert_eq!(
             classify_server_packet(Some(EP_A), EP_A, PEER_VIP, PEER_VIP),
             ServerInbound::Forward
+        );
+    }
+
+    #[test]
+    fn decodes_ipv6_source_from_dual_stack_socket() {
+        // A `[::]` bind delivers AF_INET6 senders, including IPv4-mapped ones.
+        let sa6 = libc::sockaddr_in6 {
+            sin6_family: libc::AF_INET6 as libc::sa_family_t,
+            sin6_port: 51820u16.to_be(),
+            sin6_flowinfo: 0u32.to_be(),
+            sin6_addr: libc::in6_addr {
+                s6_addr: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 172, 30, 0, 12],
+            },
+            sin6_scope_id: 0,
+        };
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        unsafe {
+            std::ptr::write(&mut storage as *mut _ as *mut libc::sockaddr_in6, sa6)
+        };
+        let addr =
+            sockaddr_to_std(&storage, std::mem::size_of::<libc::sockaddr_in6>() as _)
+                .unwrap();
+        assert_eq!(
+            addr,
+            SocketAddr::V6(std::net::SocketAddrV6::new(
+                std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xac1e, 0x000c),
+                51820,
+                0,
+                0,
+            ))
         );
     }
 
