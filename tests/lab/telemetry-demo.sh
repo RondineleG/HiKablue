@@ -89,10 +89,16 @@ start_engine() {
     sudo sh -c "echo \$\$ >'$PIDFILE'; exec '$ENGINE' server \
         --bind 127.0.0.1:$ENGINE_PORT --tun-cidr 10.80.9.1/24 --peer 10.80.9.2 \
         --tun-name $TUN --metrics-sock '$SOCK' --metrics-group $(id -gn)" &
-    wait_ready 10 test -S "$SOCK" || { echo "engine socket never appeared" >&2; exit 1; }
+    # The pidfile appears before exec — grab the PID first so cleanup can
+    # always kill the engine and drop the TUN, even if the socket is late.
+    wait_ready 10 test -f "$PIDFILE" || { echo "engine never wrote its pid" >&2; exit 1; }
     ENGINE_PID=$(sudo cat "$PIDFILE")
-    sudo kill -0 "$ENGINE_PID" || { echo "engine failed to start" >&2; exit 1; }
     CREATED_TUN=1
+    if ! wait_ready 10 test -S "$SOCK"; then
+        echo "engine socket never appeared" >&2
+        exit 1 # cleanup kills ENGINE_PID and removes the TUN via trap
+    fi
+    sudo kill -0 "$ENGINE_PID" || { echo "engine failed to start" >&2; exit 1; }
 }
 
 echo "== control plane up (unprivileged, loopback only)"

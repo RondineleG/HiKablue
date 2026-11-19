@@ -21,5 +21,6 @@ source (`urls`, `ASPNETCORE_URLS`, appsettings). Real identity arrives with
 the mTLS gRPC `NodeChannel` in the control-plane milestone.
 
 Run: `dotnet run --project VpnControl` (binds `http://127.0.0.1:5080` by
-default; `VPN_CONTROL_URL`/`urls` must stay loopback) · Test: `dotnet test
+default; `urls` config or `ASPNETCORE_URLS` may override but must stay
+loopback) · Test: `dotnet test
 VpnControl.Tests`

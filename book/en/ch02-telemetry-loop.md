@@ -44,7 +44,7 @@ The protocol on `/run/vpn/engine.sock` is the smallest thing that works:
 └───────────────┴──────────────────────┘
 ```
 
-Request `{"request_id":"req-1","version":1,"op":"GetMetrics"}` gets an
+Request `{"request_id":"req-1","version":1,"op":"GetMetrics","payload":{}}` gets an
 envelope back: the echoed `request_id`, a `status` of `"ok"` plus a `result`
 object, or `"error"` plus `code`/`message`:
 

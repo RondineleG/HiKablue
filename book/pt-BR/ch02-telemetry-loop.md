@@ -47,7 +47,7 @@ O protocolo em `/run/vpn/engine.sock` é o mínimo que funciona:
 └───────────────┴──────────────────────┘
 ```
 
-O pedido `{"request_id":"req-1","version":1,"op":"GetMetrics"}` recebe um
+O pedido `{"request_id":"req-1","version":1,"op":"GetMetrics","payload":{}}` recebe um
 envelope: o `request_id` eco, um `status` de `"ok"` mais um objeto `result`,
 ou `"error"` mais `code`/`message`:
 

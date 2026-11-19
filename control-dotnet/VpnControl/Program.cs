@@ -19,6 +19,16 @@ if (LoopbackGuard.FindNonLoopback(urls) is { } bad)
     throw new InvalidOperationException(
         $"vpn-control may only bind loopback while heartbeats are unauthenticated; refusing '{bad}'");
 }
+// Kestrel:Endpoints entries take precedence over UseUrls — guard them too,
+// or a config file could open the unauthenticated API to the network.
+foreach (var ep in builder.Configuration.GetSection("Kestrel:Endpoints").GetChildren())
+{
+    if (ep["Url"] is { } epUrl && LoopbackGuard.FindNonLoopback(epUrl) is { } badEp)
+    {
+        throw new InvalidOperationException(
+            $"vpn-control may only bind loopback while heartbeats are unauthenticated; refusing '{badEp}'");
+    }
+}
 builder.WebHost.UseUrls(urls.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
 
 builder.Services.AddSingleton<NodeRegistry>();

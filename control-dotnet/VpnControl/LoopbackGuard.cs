@@ -32,20 +32,18 @@ public static class LoopbackGuard
 
     private static bool IsLoopbackHost(string host)
     {
+        // Only the literal "localhost" or a literal loopback IP: Kestrel
+        // treats any other name as an external bind (all interfaces), even
+        // when DNS happens to resolve it to 127.0.0.1.
         if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }
-        // Wildcards (+, *, 0.0.0.0, [::]) listen on every interface.
         if (host is "+" or "*")
         {
             return false;
         }
-        if (!IPAddress.TryParse(host, out var ip))
-        {
-            return Dns.GetHostAddresses(host).All(IsLoopbackAddress);
-        }
-        return IsLoopbackAddress(ip);
+        return IPAddress.TryParse(host, out var ip) && IsLoopbackAddress(ip);
     }
 
     private static bool IsLoopbackAddress(IPAddress ip)
