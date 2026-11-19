@@ -1,4 +1,4 @@
-//! Command-line interface and configuration for `vpngine`.
+//! Command-line interface and configuration for `vpn-engine`.
 
 use std::net::Ipv4Addr;
 use std::str::FromStr;
@@ -10,7 +10,7 @@ pub const DEFAULT_TUN_NAME: &str = "tun0";
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "vpngine",
+    name = "vpn-engine",
     version,
     about = "Raw IPv4 TUN <-> UDP forwarder for the isolated HiKablue lab"
 )]

@@ -31,7 +31,7 @@ async fn main() {
     };
 
     if let Err(err) = forward::run(config).await {
-        eprintln!("vpngine: {err}");
+        eprintln!("vpn-engine: {err}");
         std::process::exit(1);
     }
 }

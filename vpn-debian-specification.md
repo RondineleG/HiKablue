@@ -14,7 +14,7 @@ The custom UDP transport is restricted to an isolated lab with test data. Deploy
 
 | Component | Responsibility | Main skill |
 |---|---|---|
-| `engine-rust` / `vpngine` | Experimental engine on the node. Reads TUN packets, validates their source against the peer, and forwards traffic between TUN and UDP. Exposes controls and metrics over a Unix socket. | Ownership, buffers, error handling, and asynchronous I/O with Tokio. |
+| `engine-rust` / `vpn-engine` | Experimental engine on the node. Reads TUN packets, validates their source against the peer, and forwards traffic between TUN and UDP. Exposes controls and metrics over a Unix socket. | Ownership, buffers, error handling, and asynchronous I/O with Tokio. |
 | `engine-rust` / `vpn-cli` | Authenticates over HTTPS, requests a session, configures the client tunnel, checks status, and restores configuration on exit. Shares the codec with the engine. | CLI design, state machines, and Linux integration. |
 | `agent-go` / `vpn-agent` | Opens the gRPC channel to C#, configures networking on the node, applies commands through the backend, and reports results. Owns the node's VPN network rules. | Interfaces, contexts, timeouts, concurrency, and reconciliation. |
 | `control-dotnet` / `vpn-control` | Handles authentication, authorization, node selection, IP address management (IPAM), session lifecycle, auditing, and telemetry. PostgreSQL stores the desired state. | ASP.NET Core, EF Core, transactions, and asynchronous services. |

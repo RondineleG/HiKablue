@@ -25,4 +25,4 @@ fi
     exit 1
 }
 
-echo "node ready: run vpngine with sudo (CAP_NET_ADMIN) per engine-rust/README.md"
+echo "node ready: run vpn-engine with sudo (CAP_NET_ADMIN) per engine-rust/README.md"

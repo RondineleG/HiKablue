@@ -8,7 +8,7 @@ The specification's milestone table and first-implementation-session text curren
 
 - Implement only the monorepo scaffold and a raw point-to-point IPv4 TUN/UDP tunnel on Debian 12/13. Raw UDP is restricted to test traffic in an isolated, authorized lab.
 - Use `engine-rust/`, `agent-go/`, `control-dotnet/`, `proto/`, and `deploy/debian/` as defaults. Adapt to existing structure when useful and document it. Keep Go, C#, and Protobuf as placeholders for this task.
-- Build `vpngine` in Rust edition 2021 with Tokio. Expose server and client modes, a UDP bind address, a virtual IPv4 CIDR, and the client's remote endpoint. Separate CLI, Linux TUN access, and forwarding into readable modules.
+- Build `vpn-engine` in Rust edition 2021 with Tokio. Expose server and client modes, a UDP bind address, a virtual IPv4 CIDR, and the client's remote endpoint. Separate CLI, Linux TUN access, and forwarding into readable modules.
 
 ## Tunnel and lifecycle
 

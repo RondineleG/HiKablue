@@ -1,6 +1,6 @@
-# vpngine — Phase 1 raw TUN ↔ UDP forwarder
+# vpn-engine — Phase 1 raw TUN ↔ UDP forwarder
 
-`vpngine` moves raw IPv4 packets between a Linux TUN interface and a UDP socket.
+`vpn-engine` moves raw IPv4 packets between a Linux TUN interface and a UDP socket.
 It is the experimental engine from `vpn-debian-specification.md` milestone 2 (TUN),
 restricted to **test traffic in an isolated, authorized lab**. There is no
 encryption, authentication, NAT, or default-route handling in this phase.
@@ -14,13 +14,13 @@ cargo test
 cargo build --release
 ```
 
-The binary is `target/release/vpngine`. Rust edition 2021; dependencies are
+The binary is `target/release/vpn-engine`. Rust edition 2021; dependencies are
 Tokio, clap, and libc.
 
 ## Privileges
 
 Creating the TUN interface and applying its address/MTU require
-`CAP_NET_ADMIN`. Run `vpngine` as root (`sudo`) in the lab, or grant the
+`CAP_NET_ADMIN`. Run `vpn-engine` as root (`sudo`) in the lab, or grant the
 capability to the binary (`setcap cap_net_admin+ep`). It also calls `ip(8)`
 from `iproute2` to configure the interface, so that package must be installed.
 
@@ -40,7 +40,7 @@ sudo deploy/debian/lab-node-setup.sh   # checks tun module + iproute2
 Node A (server — learns its single peer):
 
 ```sh
-sudo ./vpngine server \
+sudo ./vpn-engine server \
   --bind 192.168.56.11:51820 \
   --tun-cidr 10.80.1.1/24 \
   --peer 10.80.1.2
@@ -49,7 +49,7 @@ sudo ./vpngine server \
 Node B (client — fixed remote endpoint):
 
 ```sh
-sudo ./vpngine client \
+sudo ./vpn-engine client \
   --bind 192.168.56.12:51820 \
   --remote 192.168.56.11:51820 \
   --tun-cidr 10.80.1.2/24
@@ -107,7 +107,7 @@ sudo deploy/debian/lab-node-cleanup.sh
 | Ping both directions | Debian 12 (bookworm) containers, same topology | 3/3 replies each way |
 | SIGINT / SIGTERM exit 0 + TUN cleanup | Debian 13 containers | observed |
 | Client survives ping while server is down, then recovers | Debian 13 containers | process stayed up, ping resumed |
-| Second `vpngine` on an existing `tun0` | Debian 13 container | refused with `already exists` error |
+| Second `vpn-engine` on an existing `tun0` | Debian 13 container | refused with `already exists` error |
 | 2500-byte datagram, forged IPv4 header TL=2048 | Debian 13 server | dropped; nothing written to `tun0` |
 
 Unverified: nothing in the Phase 1 scope. The documented VM walkthrough is

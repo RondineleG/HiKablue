@@ -168,7 +168,7 @@ pub async fn run(cfg: Config) -> io::Result<()> {
 
     let role = if is_server { "server" } else { "client" };
     eprintln!(
-        "vpngine {role}: {} mtu={} bind={}",
+        "vpn-engine {role}: {} mtu={} bind={}",
         cfg.tun_cidr,
         cfg.mtu,
         socket.local_addr()?,
@@ -205,7 +205,7 @@ pub async fn run(cfg: Config) -> io::Result<()> {
                     Some(socket.send(&tun_buf[..n]).await)
                 };
                 if let Some(Err(err)) = sent {
-                    eprintln!("vpngine: dropping outbound datagram: {err}");
+                    eprintln!("vpn-engine: dropping outbound datagram: {err}");
                 }
             }
             result = recv_datagram(&socket, &mut udp_buf) => {
@@ -215,7 +215,7 @@ pub async fn run(cfg: Config) -> io::Result<()> {
                 let (real_len, from) = match result {
                     Ok(v) => v,
                     Err(err) => {
-                        eprintln!("vpngine: dropping inbound datagram: {err}");
+                        eprintln!("vpn-engine: dropping inbound datagram: {err}");
                         continue;
                     }
                 };
@@ -236,7 +236,7 @@ pub async fn run(cfg: Config) -> io::Result<()> {
                         // UDP port and spoof the peer's virtual IP would pass.
                         ServerInbound::Learn => {
                             learned_peer = Some(from);
-                            eprintln!("vpngine: learned peer endpoint {from}");
+                            eprintln!("vpn-engine: learned peer endpoint {from}");
                         }
                         ServerInbound::Forward => {}
                         ServerInbound::Drop => continue,
@@ -247,7 +247,7 @@ pub async fn run(cfg: Config) -> io::Result<()> {
         }
     }
 
-    eprintln!("vpngine: shutting down");
+    eprintln!("vpn-engine: shutting down");
     Ok(())
 }
 
