@@ -160,13 +160,26 @@ if libc::ioctl(fd, TUNSETIFF, &req as *const Ifreq) < 0 {
 **2. Decidiendo qué cuenta como paquete** — `src/packet.rs`, `validate_ipv4`
 
 ```rust
-if packet.len() < MIN_IPV4_HEADER_LEN { return Err(PacketError::Truncated); }
-if packet[0] >> 4 != IPV4_VERSION    { return Err(PacketError::NotIpv4); }
+if packet.len() < MIN_IPV4_HEADER_LEN {
+    return Err(PacketError::Truncated);
+}
+if packet[0] >> 4 != IPV4_VERSION {
+    return Err(PacketError::NotIpv4);
+}
 let ihl = (packet[0] & 0x0f) as usize;
-if ihl < 5 { return Err(PacketError::BadHeaderLength); }
+if ihl < 5 {
+    return Err(PacketError::BadHeaderLength);
+}
+let header_len = ihl * 4;
+if header_len > packet.len() {
+    return Err(PacketError::Truncated);
+}
 let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
 if total_len < header_len || total_len != packet.len() {
     return Err(PacketError::BadTotalLength);
+}
+if !header_checksum_ok(&packet[..header_len]) {
+    return Err(PacketError::BadChecksum);
 }
 ```
 
@@ -186,10 +199,68 @@ suma `0xffff`.
 loop {
     tokio::select! {
         biased;
-        result = tokio::signal::ctrl_c() => { result?; break; }
-        _ = sigterm.recv() => { break; }
-        result = tun.read(&mut tun_buf) => { /* validar → enviar por UDP */ }
-        result = recv_datagram(&socket, &mut udp_buf) => { /* validar → escribir en TUN */ }
+        result = tokio::signal::ctrl_c() => {
+            result?;
+            break;
+        }
+        _ = sigterm.recv() => {
+            break;
+        }
+        result = tun.read(&mut tun_buf) => {
+            let n = result?;
+            if validate_ipv4(&tun_buf[..n], cfg.mtu as usize).is_err() {
+                continue;
+            }
+            // A failed send for one datagram (e.g. ECONNREFUSED while the
+            // peer is down, or EMSGSIZE) must not kill the tunnel.
+            let sent = if is_server {
+                match learned_peer {
+                    Some(peer) => Some(socket.send_to(&tun_buf[..n], peer).await),
+                    None => None,
+                }
+            } else {
+                Some(socket.send(&tun_buf[..n]).await)
+            };
+            if let Some(Err(err)) = sent {
+                eprintln!("vpn-engine: dropping outbound datagram: {err}");
+            }
+        }
+        result = recv_datagram(&socket, &mut udp_buf) => {
+            // Per-datagram receive errors (e.g. a queued ICMP
+            // port-unreachable on a connected socket) are not fatal
+            // either.
+            let (real_len, from) = match result {
+                Ok(v) => v,
+                Err(err) => {
+                    eprintln!("vpn-engine: dropping inbound datagram: {err}");
+                    continue;
+                }
+            };
+            if real_len > udp_buf.len() {
+                // Truncated by the buffer: not a complete packet.
+                continue;
+            }
+            let packet = &udp_buf[..real_len];
+            if validate_ipv4(packet, cfg.mtu as usize).is_err() {
+                continue;
+            }
+            if is_server {
+                let peer_vip = cfg.peer_vip.expect("server sets peer_vip");
+                match classify_server_packet(learned_peer, from, source_ip(packet), peer_vip) {
+                    // Learn the endpoint only after structural validation
+                    // and an inner source-IP match. This pins the peer but
+                    // is not authentication: any sender that can reach this
+                    // UDP port and spoof the peer's virtual IP would pass.
+                    ServerInbound::Learn => {
+                        learned_peer = Some(from);
+                        eprintln!("vpn-engine: learned peer endpoint {from}");
+                    }
+                    ServerInbound::Forward => {}
+                    ServerInbound::Drop => continue,
+                }
+            }
+            tun.write(packet).await?;
+        }
     }
 }
 ```
@@ -201,6 +272,19 @@ pendiente siempre gana frente a más tráfico —el túnel muere cuando se le
 pide, no cuando está ocioso. `tun_buf` y `udp_buf` se reservan una vez *antes*
 del bucle y se reutilizan en cada iteración: ningún paquete provoca una
 reserva de memoria en el heap.
+
+Leyendo los brazos de arriba abajo: los dos de señal solo hacen `break` en el
+`loop`, que retorna y suelta el descriptor TUN. El **brazo TUN** lee un
+paquete, lo descarta si `validate_ipv4` falla y luego lo envía —`send_to`
+hacia el par aprendido en un servidor (o a ninguna parte, mientras
+`learned_peer` sea `None`), `send` en el cliente, cuyo socket está conectado;
+un fallo por datagrama se registra y se traga con el guarda
+`if let Some(Err(err))` en lugar de propagarse con `?`. El **brazo UDP** es el
+espejo: desenvolver o `continue` ante error, descartar lo que la lectura
+`MSG_TRUNC` reportó más largo que el búfer, descartar paquetes inválidos,
+aplicar la decisión de aprendizaje de abajo y escribir el paquete sobreviviente
+en el TUN. Cada `continue` es un datagrama descartado; cada `?` es una salida
+fatal — esas son las únicas dos salidas.
 
 **4. Aprendiendo el único par** — `src/forward.rs`, dentro del brazo UDP
 
@@ -255,6 +339,18 @@ descarta todo lo demás.
 | ECONNREFUSED | El error que un socket UDP conectado reporta tras un ICMP «puerto inalcanzable» (par caído). | Se registra y se ignora: un par caído no debe tumbar el túnel. |
 | NAT | Network Address Translation — reescritura de direcciones de paquetes. | Diferido: no hace falta para un ping entre nodos. |
 | AEAD | Authenticated Encryption with Associated Data — cifrado + integridad en un paso. | El transporte de la Fase 4; su etiqueta de 16 bytes explica el MTU 1400. |
+| `ping` | Comando que envía ecos ICMP y muestra las respuestas. | La prueba de aceptación de extremo a extremo de todo el capítulo. |
+| `ip` | La navaja suiza de iproute2 para direcciones, enlaces y rutas. | Ajusta MTU, dirección y estado del enlace en `configure_interface`. |
+| `tcpdump` | Captura de paquetes por línea de comandos: imprime lo que una interfaz ve. | Demuestra las direcciones internas vs. externas (`tun0` vs. `eth0`). |
+| `tcpdump -ni` | `-n` = no resolver IPs a nombres; `-i` = capturar en esta interfaz. | Mantiene las capturas en crudo (`-ni tun0`, `-ni eth0`). |
+| `tcpdump -c1` | `-c` = parar tras N paquetes (aquí, 1). | Captura exactamente un paquete para el ejercicio. |
+| `MIN_IPV4_HEADER_LEN` | Nuestra constante `20` — la cabecera IPv4 legal más pequeña en bytes. | La primera comprobación estructural: por debajo no puede ser IPv4. |
+| `PacketError` | Nuestro enum de resultados de validación (`Oversized`, `Truncated`, `NotIpv4`, `BadHeaderLength`, `BadTotalLength`, `BadChecksum`). | Nombra *por qué* se descartó un paquete. |
+| `Ifreq` / `TUNSETIFF` | La estructura y el número de comando que el kernel espera para «crear un TUN». | Las dos piezas del `ioctl` que fabrica `tun0`. |
+| `Option` / `Some` / `None` | El tipo «quizá un valor» de Rust: `Some(x)` o `None`. | `learned_peer` es `None` hasta que el servidor fija su par. |
+| `match` | La ramificación exhaustiva de Rust sobre los casos de un valor. | Los tres resultados `ServerInbound` son un `match`. |
+| `eprintln!` | Macro que imprime en stderr. | La única salida de log del engine — sin telemetría en la Fase 1. |
+| `?` (Rust) | «Si hay `Err`, devuélvelo ya» — operador de retorno anticipado. | Los errores fatales (lectura de TUN, `tun.write`) sí se propagan; `continue` y el `if let` con guarda cubren los no fatales. |
 
 ## Ejecútalo tú mismo
 
