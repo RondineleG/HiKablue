@@ -116,7 +116,10 @@ lesson of this chapter:
 let read = async {
     let len = stream.read_u32().await?;          // 4-byte length, big-endian
     if len > MAX_FRAME {
-        return Err(/* reject before allocating */)
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("metrics frame of {len} bytes exceeds {MAX_FRAME}"),
+        ));
     }
     let mut frame = vec![0u8; len as usize];     // allocate exactly the frame
     stream.read_exact(&mut frame).await?;        // loop until it is complete

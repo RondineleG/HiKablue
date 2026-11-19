@@ -15,6 +15,8 @@ import (
 // silent is true — accepts the connection and never writes. The silent case
 // is the milestone exercise: without the context deadline the read would
 // hang forever and stall every later collection.
+var readCh = make(chan struct{}, 8)
+
 func fakeEngine(t *testing.T, silent bool) (string, func()) {
 	t.Helper()
 	dir := t.TempDir()
@@ -30,7 +32,22 @@ func fakeEngine(t *testing.T, silent bool) (string, func()) {
 				return
 			}
 			if silent {
-				continue // hold the connection open, say nothing
+				go func(c net.Conn) {
+					var n uint32
+					if err := binary.Read(c, binary.BigEndian, &n); err != nil {
+						return
+					}
+					buf := make([]byte, n)
+					if _, err := io.ReadFull(c, buf); err != nil {
+						return
+					}
+					select {
+					case readCh <- struct{}{}:
+					default:
+					}
+					select {} // read the frame, then stay silent forever
+				}(c)
+				continue
 			}
 			go func(c net.Conn) {
 				defer c.Close()
@@ -84,7 +101,13 @@ func TestCancelWithoutDeadlineStopsSilentEngine(t *testing.T) {
 		_, err := FetchMetrics(ctx, path)
 		done <- err
 	}()
-	time.Sleep(50 * time.Millisecond) // let the read block
+	// Wait until the engine read our request frame: the read is provably in
+	// flight when we cancel, so the error is the interruption, not a dial.
+	select {
+	case <-readCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("engine never received the request frame")
+	}
 	cancel()
 	select {
 	case err := <-done:
@@ -141,5 +164,32 @@ func TestDeadlineStopsSilentEngineAndNextPollRuns(t *testing.T) {
 	}
 	if m.RxBytes != 10 {
 		t.Fatalf("second collection got %+v", m)
+	}
+}
+
+func TestMismatchedRequestIDIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "engine.sock")
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		c, _ := l.Accept()
+		var n uint32
+		_ = binary.Read(c, binary.BigEndian, &n)
+		buf := make([]byte, n)
+		_, _ = io.ReadFull(c, buf)
+		resp, _ := json.Marshal(map[string]any{
+			"request_id": "not-mine", "version": 1, "status": "ok",
+			"result": Metrics{RxBytes: 1},
+		})
+		_ = binary.Write(c, binary.BigEndian, uint32(len(resp)))
+		_, _ = c.Write(resp)
+		c.Close()
+	}()
+	if _, err := FetchMetrics(context.Background(), path); err == nil {
+		t.Fatal("expected mismatched request_id to be rejected")
 	}
 }

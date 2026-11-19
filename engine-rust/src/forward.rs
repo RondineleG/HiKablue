@@ -196,10 +196,15 @@ pub async fn run(cfg: Config) -> io::Result<()> {
     // that nobody observes.
     let metrics_listener =
         metrics::bind(&cfg.metrics_sock, cfg.metrics_group.as_deref()).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("{e} (use --metrics-sock to pick a writable path)"),
-            )
+            // Suggest --metrics-sock only when the failure is about the path
+            // itself — a bad --metrics-group is not fixed by a writable path.
+            match e.kind() {
+                io::ErrorKind::Other => e,
+                _ => io::Error::new(
+                    e.kind(),
+                    format!("{e} (use --metrics-sock to pick a writable path)"),
+                ),
+            }
         })?;
     let metrics_task = tokio::spawn(metrics::serve(metrics.clone(), metrics_listener));
     if !is_server {
