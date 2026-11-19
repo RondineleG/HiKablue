@@ -31,6 +31,6 @@ public sealed class HeartbeatEndpoint : BaseEndPoint<Node>, IEndpointAsync
         [FromBody] Heartbeat request,
         [FromServices] IRegisterNodeHeartbeatUseCase useCase) =>
         HandleUseCaseAsync(useCase, request,
-            result => Results.Accepted(value: result.Data),
+            result => Results.Accepted(value: CreateApiResponse(result, StatusCodes.Status202Accepted, includeData: true)),
             "Heartbeat registration failed");
 }

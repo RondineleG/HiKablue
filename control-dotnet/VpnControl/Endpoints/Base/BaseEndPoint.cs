@@ -81,7 +81,7 @@ public abstract class BaseEndPoint<TEntity>
         };
     }
 
-    private static ApiResponse<T> CreateApiResponse<T>(RequestResult<T> result, int statusCode, bool includeData) =>
+    protected static ApiResponse<T> CreateApiResponse<T>(RequestResult<T> result, int statusCode, bool includeData) =>
         new()
         {
             Success = result.Status == EResultStatus.Success,

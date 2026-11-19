@@ -202,6 +202,11 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Revision notes
 
+- `r6` — Contract check: `HttpContractTests` (WebApplicationFactory)
+  verifies the `ApiResponse` envelope end to end — `202` + node under
+  `data` for a valid heartbeat, `422` for a blank `nodeId`, node list
+  under `data` on `GET /v1/nodes`. The 202 body now carries the envelope
+  too, so *every* response shares one shape.
 - `r5` — Reorganization, second pass: the API now mirrors the
   MinimalTemplate layout — endpoint classes are
   `BaseEndPoint<Node>, IEndpointAsync` with `RegisterAsync`, DI registers
