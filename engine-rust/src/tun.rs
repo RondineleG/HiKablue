@@ -40,6 +40,20 @@ impl Tun {
                 format!("interface name {name:?} exceeds IFNAMSIZ"),
             ));
         }
+        // Refuse to reuse an interface that already exists: TUNSETIFF could
+        // attach to a persistent TUN owned by another VPN and we would
+        // reconfigure it (LAB-02: touch only project-owned objects). Transient
+        // interfaces die with their descriptor, so any surviving `name` is
+        // not ours.
+        if std::path::Path::new(&format!("/sys/class/net/{name}")).exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "interface {name:?} already exists (foreign or persistent TUN); \
+                     pick another --tun-name or remove it"
+                ),
+            ));
+        }
         let file = OpenOptions::new()
             .read(true)
             .write(true)
