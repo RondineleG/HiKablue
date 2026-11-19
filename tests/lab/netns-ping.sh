@@ -73,16 +73,27 @@ ip netns exec "$NS_B" ping -c 3 -W 2 "$VIP_A"
 echo "== A -> B =="
 ip netns exec "$NS_A" ping -c 3 -W 2 "$VIP_B"
 
+# SIGTERM both engines: they must exit 0 (orderly shutdown).
 kill "$PID_A" "$PID_B" 2>/dev/null || true
-wait "$PID_A" 2>/dev/null || true
-wait "$PID_B" 2>/dev/null || true
+FAILED=0
+if ! wait "$PID_A" 2>/dev/null; then
+    echo "netns-ping.sh: server exited abnormally" >&2
+    FAILED=1
+fi
+if ! wait "$PID_B" 2>/dev/null; then
+    echo "netns-ping.sh: client exited abnormally" >&2
+    FAILED=1
+fi
 PID_A=""
 PID_B=""
 
 # The transient TUNs must be gone with their engines.
-if ip netns exec "$NS_A" ip link show tun0 >/dev/null 2>&1; then
-    echo "netns-ping.sh: tun0 survived engine shutdown in $NS_A" >&2
-    exit 1
-fi
+for ns in "$NS_A" "$NS_B"; do
+    if ip netns exec "$ns" ip link show tun0 >/dev/null 2>&1; then
+        echo "netns-ping.sh: tun0 survived engine shutdown in $ns" >&2
+        FAILED=1
+    fi
+done
+[ "$FAILED" -eq 0 ] || exit 1
 
 echo "netns-ping.sh: PASS"

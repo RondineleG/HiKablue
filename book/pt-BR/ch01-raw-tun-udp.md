@@ -345,6 +345,7 @@ só vale a checagem de destino (o `else if` acima).
 | VPN | Virtual Private Network — software que faz máquinas remotas se comportarem como se estivessem na mesma rede privada. | O que este livro constrói, peça por peça. |
 | TUN | "network TUNnel": interface virtual do Linux cuja outra ponta é um descritor de arquivo; passa pacotes de camada 3 (IP). | A ponta local do túnel. Seu irmão TAP passa quadros Ethernet de camada 2; não o usamos. |
 | IFF_TUN / IFF_NO_PI | Flags do pedido ao kernel: "um dispositivo TUN" / "não adicione o cabeçalho de informação de pacote de 4 bytes". | Juntas fazem cada leitura/escrita ser exatamente um pacote IP cru. |
+| IFF_TUN_EXCL | Flag "falhe se o nome da interface já estiver tomado". | Permite ao kernel recusar um `tun0` alheio atomicamente — sem corrida entre verificar e criar. |
 | ioctl | "I/O control" — a syscall do Unix para comandos específicos de dispositivo que não cabem em `read`/`write`. | Cria a interface via o comando `TUNSETIFF`. |
 | fd (file descriptor) | O identificador inteiro que o kernel dá a um processo por arquivo ou dispositivo aberto. | A ponta do `tun0` e do socket UDP no `vpn-engine` são fds. |
 | /dev/net/tun | O arquivo de dispositivo que fabrica descritores TUN/TAP. | Abri-lo é o primeiro passo de `Tun::open`. |
