@@ -148,7 +148,7 @@ mod tests {
     fn rejects_non_ipv4() {
         let mut p = valid_packet();
         p[0] = 0x65; // version 6
-        // fix checksum so only the version check can fail
+                     // fix checksum so only the version check can fail
         p[10] = 0;
         p[11] = 0;
         let sum = compute_checksum(&p[..20]);
@@ -210,10 +210,7 @@ mod tests {
 
     #[test]
     fn extracts_destination_ip() {
-        assert_eq!(
-            destination_ip(&valid_packet()),
-            Ipv4Addr::new(10, 80, 1, 2)
-        );
+        assert_eq!(destination_ip(&valid_packet()), Ipv4Addr::new(10, 80, 1, 2));
     }
 
     #[test]

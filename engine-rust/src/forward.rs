@@ -137,9 +137,10 @@ fn sockaddr_to_std(
             // s_addr is stored in network byte order; from_be yields the
             // host-order value Ipv4Addr::from expects.
             let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
-            Ok(SocketAddr::V4(SocketAddrV4::new(ip, u16::from_be(
-                sa.sin_port,
-            ))))
+            Ok(SocketAddr::V4(SocketAddrV4::new(
+                ip,
+                u16::from_be(sa.sin_port),
+            )))
         }
         libc::AF_INET6 => {
             // A `[::]` bind yields AF_INET6 senders, including IPv4-mapped
@@ -390,12 +391,9 @@ mod tests {
             sin6_scope_id: 0,
         };
         let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        unsafe {
-            std::ptr::write(&mut storage as *mut _ as *mut libc::sockaddr_in6, sa6)
-        };
+        unsafe { std::ptr::write(&mut storage as *mut _ as *mut libc::sockaddr_in6, sa6) };
         let addr =
-            sockaddr_to_std(&storage, std::mem::size_of::<libc::sockaddr_in6>() as _)
-                .unwrap();
+            sockaddr_to_std(&storage, std::mem::size_of::<libc::sockaddr_in6>() as _).unwrap();
         assert_eq!(
             addr,
             SocketAddr::V6(std::net::SocketAddrV6::new(

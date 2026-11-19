@@ -85,7 +85,6 @@ impl Ipv4Cidr {
         let shift = 32 - self.prefix;
         (u32::from(self.addr) >> shift) == (u32::from(ip) >> shift)
     }
-
 }
 
 impl FromStr for Ipv4Cidr {
@@ -95,7 +94,9 @@ impl FromStr for Ipv4Cidr {
         let (addr, prefix) = s
             .split_once('/')
             .ok_or_else(|| format!("expected A.B.C.D/N, got {s:?}"))?;
-        let addr: Ipv4Addr = addr.parse().map_err(|_| format!("bad IPv4 address in {s:?}"))?;
+        let addr: Ipv4Addr = addr
+            .parse()
+            .map_err(|_| format!("bad IPv4 address in {s:?}"))?;
         let prefix: u8 = prefix
             .parse()
             .map_err(|_| format!("bad prefix length in {s:?}"))?;

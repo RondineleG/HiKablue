@@ -43,9 +43,7 @@ impl Tun {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "interface name {name:?} invalid: 1-15 chars of [A-Za-z0-9._-]"
-                ),
+                format!("interface name {name:?} invalid: 1-15 chars of [A-Za-z0-9._-]"),
             ));
         }
         // Refuse to reuse an interface that already exists: TUNSETIFF could
@@ -140,12 +138,7 @@ pub fn configure_interface(ifname: &str, cidr: &str, mtu: u16) -> io::Result<()>
 
 /// Candidate absolute locations for iproute2's `ip`. Resolving it ourselves
 /// keeps a root-run engine immune to a hostile PATH.
-const IP_CANDIDATES: &[&str] = &[
-    "/sbin/ip",
-    "/usr/sbin/ip",
-    "/bin/ip",
-    "/usr/bin/ip",
-];
+const IP_CANDIDATES: &[&str] = &["/sbin/ip", "/usr/sbin/ip", "/bin/ip", "/usr/bin/ip"];
 
 fn ip_binary() -> io::Result<&'static str> {
     IP_CANDIDATES
