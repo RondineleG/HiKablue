@@ -12,21 +12,24 @@ HiKablue follows one packet end to end: from a Linux client's TUN interface, thr
 ## Architecture
 
 ```
-        ┌──────────────┐   HTTPS    ┌─────────────────┐
-        │   client     │───────────▶│  vpn-control    │  sessions, IPs,
-        │  vpn-cli     │            │   (C#/.NET)     │  revocation, state
-        └──────┬───────┘            └────────┬────────┘
-               │                             │ gRPC + mTLS (planned)
-               │                      ┌──────▼─────────┐
-               │   tunneled traffic   │   vpn-agent    │
-               └─────────────────────▶│     (Go)       │
-                    client → exit     └──────┬─────────┘
-                                             │ Unix socket
-                                      ┌──────▼─────────┐
-                                      │  vpn-engine    │  TUN ↔ UDP
-                                      │    (Rust)      │  + GetMetrics
-                                      └────────────────┘
+┌────────────┐   HTTPS    ┌──────────────────┐
+│  client    │───────────▶│   vpn-control    │  sessions, IPs,
+│  vpn-cli   │            │    (C#/.NET)     │  revocation, state
+└─────┬──────┘            └────────▲─────────┘
+      │                          │ gRPC + mTLS (planned)
+      │ UDP (test traffic)  ┌────┴──────┐
+      │                     │ vpn-agent │
+      ▼                     │   (Go)    │
+┌────────────┐   Unix sock  └───────────┘
+│ vpn-engine │◀──────────────────┘
+│   (Rust)   │  GetMetrics + engine control
+└─────┬──────┘
+      │ TUN
+      ▼
+  node kernel
 ```
+
+Tunneled traffic flows client → engine (UDP in the lab) — the agent stays on the control path.
 
 | Component | Role | Status |
 |---|---|---|
@@ -43,18 +46,19 @@ Keep this table current: every milestone change set updates the status and links
 
 | # | Milestone | Status |
 |---|---|---|
-| 0 | Foundation — monorepo + toolchains | **Delivered** — Rust, Go, and C# all run real components |
+| 0 | Foundation — monorepo + toolchains | **Delivered** — Rust, Go, and C# all run real components; versions pinned (`rust-toolchain.toml`, `global.json`, `go.mod` + `.go-version`) |
 | 1 | **Telemetry** — metrics socket, Go fetcher, C# heartbeat registry | **Implemented on `feat/telemetry` ([PR #6](https://github.com/RondineleG/HiKablue/pull/6)), merge pending** |
 | 2 | Raw TUN ↔ UDP tunnel | **Delivered** in [PR #4](https://github.com/RondineleG/HiKablue/pull/4) — ping verified both ways on Debian 12/13 (delivered out of order, ahead of milestone 1) |
-| 3 | Control plane — registration, IP allocation, sessions (gRPC `NodeChannel` + mTLS + PostgreSQL) | Pending |
-| 4 | Protected transport — AEAD/WG, concurrent clients, revocation, key rotation | Pending |
-| 5 | Deployment, recovery, WireGuard profile | Pending |
+| 3 | Control plane — PostgreSQL, IPAM, session states, outbox; gRPC `NodeChannel` over mTLS replaces the HTTP heartbeat | Pending |
+| 4 | End-to-end session — encrypted Rust backend, CLI, peer operations, local expiration, reconciliation | Pending |
+| 5 | Deployment and recovery — Debian install automation, restarts, stream loss, route rollback | Pending |
+| 6 | WireGuard — agent backend + client configuration, split tunneling | Pending |
 
 Deferred inside milestone 2: IPv4 forwarding, NAT, MSS clamping, split/full-tunnel routing, and the HTTP-through-the-exit-node acceptance — they belong to the full-tunnel phase.
 
 ## Validate locally
 
-One command runs the whole gate — commit conventions, diff safety, shellcheck, fmt/clippy/tests/build for Rust, Go, and .NET, book parity, and the lab integration tests:
+One command runs the whole gate — commit conventions, diff safety, shellcheck, Rust fmt + clippy + tests + release build, Go gofmt + vet + tests, .NET build + tests, book parity, and the lab integration tests (`--lab` also builds and runs the agent binary):
 
 ```bash
 bash tests/checks.sh          # everything except privileged lab steps
