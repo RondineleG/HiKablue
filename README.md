@@ -1,34 +1,80 @@
 # HiKablue
 
-HiKablue is an educational VPN project for Debian. It follows a packet from a Linux client through a tunnel and an exit node, then builds the services that provision, monitor, and revoke that connection. The project uses Rust for packet processing, Go for node operations, and C# for the control plane.
+**An educational VPN, built in public and explained in three languages.**
 
-**Status.** The architecture and learning roadmap are documented. The first delivered implementation is the raw IPv4 TUN/UDP tunnel (`vpn-engine`) between two Debian nodes in an isolated lab — the spec's milestone 2 (TUN), executed ahead of milestone 1 (Telemetry) by explicit request; telemetry remains pending. Debian 13 is the reference environment, and Debian 12 compatibility is a verification target.
+HiKablue follows one packet end to end: from a Linux client's TUN interface, through a tunnel, across an exit node, and back — then builds the services that provision, monitor, and revoke that connection. Every milestone ships working code *and* the chapter that explains it, so the repository doubles as a course on systems networking in Rust, Go, and C#.
+
+- **Rust** — packet processing where latency and memory control matter (`vpn-engine`, `vpn-cli`)
+- **Go** — node operations where concurrency stays simple (`vpn-agent`)
+- **C#/.NET** — the control plane where identity and state live (`vpn-control`)
+- **Lab target** — Debian 13 (reference), Debian 12 (compatibility check), isolated `netns` environments
 
 ## Architecture
 
-| Component | Role |
-|---|---|
-| Rust · `vpn-engine` and `vpn-cli` | Forward packets between TUN and UDP in the lab, configure the client tunnel, and expose engine metrics. |
-| Go · `vpn-agent` | Configure networking on each exit node, apply peer changes, and report the applied state to the control plane. |
-| C#/.NET · `vpn-control` | Authenticate clients, allocate tunnel IPs, manage session lifecycles, and store desired state in PostgreSQL. |
+```
+┌────────────┐   HTTPS    ┌──────────────────┐
+│  client    │───────────▶│   vpn-control    │  sessions, IPs,
+│  vpn-cli   │            │    (C#/.NET)     │  revocation, state
+└─────┬──────┘            └────────▲─────────┘
+      │                          │ gRPC + mTLS (planned)
+      │ UDP (test traffic)  ┌────┴──────┐
+      │                     │ vpn-agent │
+      ▼                     │   (Go)    │
+┌────────────┐   Unix sock  └───────────┘
+│ vpn-engine │◀──────────────────┘
+│   (Rust)   │  GetMetrics + engine control
+└─────┬──────┘
+      │ TUN
+      ▼
+  node kernel
+```
 
-The client uses HTTPS to request a session. The agent and control plane communicate over gRPC with mutual TLS. On the lab node, the agent uses a Unix socket to manage the Rust engine. User traffic flows directly between the client and the exit node.
+Tunneled traffic flows client → engine (UDP in the lab) — the agent stays on the control path.
 
-The custom UDP transport is for isolated lab exercises with test traffic. The roadmap specifies a WireGuard backend for deployments carrying real traffic.
+| Component | Role | Status |
+|---|---|---|
+| `engine-rust/` | Forwards IPv4 packets between TUN and UDP; serves `GetMetrics` on a hardened Unix socket (`0660` + `--metrics-group`, length-prefixed JSON envelope, deadlines, connection cap) | Implemented |
+| `agent-go/` | Fetches engine metrics with context deadlines; will apply node configuration and report applied state | Metrics fetcher implemented |
+| `control-dotnet/` | In-memory node registry behind loopback-only HTTP (`POST /internal/heartbeats`, `GET /v1/nodes`); real auth and PostgreSQL arrive with the gRPC control plane | Lab service implemented |
+| `proto/` | gRPC `NodeChannel` definitions | Placeholder |
 
-## Implementation roadmap
+The custom UDP transport exists **only for isolated lab exercises** with test traffic. The roadmap specifies a WireGuard backend before real traffic is carried.
 
-1. Establish the monorepo and verify the toolchains. Use telemetry to practice integrating Rust, Go, and C#. *(Pending.)*
-2. Build the raw TUN/UDP tunnel and verify a ping between virtual IPs. This is the **initial TUN implementation task**, which maps to the TUN milestone in the specification; it is separate from the telemetry milestone. *(Ping verified both ways on Debian 12/13 — delivered out of the planned order; the deferred HTTP-request-through-the-exit-node check depends on forwarding/NAT and belongs to the full-tunnel phase.)*
-3. Add node registration, IP allocation, and session provisioning. Confirm that retrying a command leaves the same applied state.
-4. Integrate the protected lab transport and verify two concurrent clients, individual session revocation, and fresh keys after a restart.
-5. Verify deployment and recovery on Debian, then implement and test the WireGuard profile.
+## Milestones
+
+Keep this table current: every milestone change set updates the status and links the PR that delivered it.
+
+| # | Milestone | Status |
+|---|---|---|
+| 0 | Foundation — monorepo + toolchains | **Delivered** — Rust, Go, and C# all run real components; versions pinned (`rust-toolchain.toml`, `global.json`, `go.mod` + `.go-version`) |
+| 1 | **Telemetry** — metrics socket, Go fetcher, C# heartbeat registry | **Implemented on `feat/telemetry` ([PR #6](https://github.com/RondineleG/HiKablue/pull/6)), merge pending** |
+| 2 | Raw TUN ↔ UDP tunnel | **Delivered** in [PR #4](https://github.com/RondineleG/HiKablue/pull/4) — ping verified both ways on Debian 12/13 (delivered out of order, ahead of milestone 1) |
+| 3 | Control plane — PostgreSQL, IPAM, session states, outbox; gRPC `NodeChannel` over mTLS replaces the HTTP heartbeat | Pending |
+| 4 | End-to-end session — encrypted Rust backend, CLI, peer operations, local expiration, reconciliation | Pending |
+| 5 | Deployment and recovery — Debian install automation, restarts, stream loss, route rollback | Pending |
+| 6 | WireGuard — agent backend + client configuration, split tunneling | Pending |
+
+Deferred inside milestone 2: IPv4 forwarding, NAT, MSS clamping, split/full-tunnel routing, and the HTTP-through-the-exit-node acceptance — they belong to the full-tunnel phase.
+
+## Validate locally
+
+One command runs the whole gate — commit conventions, diff safety, shellcheck, Rust fmt + clippy + tests + release build, Go gofmt + vet + tests, .NET build + tests, book parity, line coverage ≥ 90% per component (`tests/coverage.sh`, rule TEST-02 — Rust lines in `src/` excluding test code and `// coverage: lab-only` spans, Go statements via `-coverpkg=./...`, C# lines via coverlet), and the lab integration tests (`--lab` also builds and runs the agent binary):
+
+```bash
+bash tests/checks.sh          # everything except privileged lab steps
+bash tests/checks.sh --lab    # full gate: TUN/UDP ping + telemetry E2E + resource safety
+```
+
+The lab steps use `sudo` only where TUN creation and namespaces require it, run in `mktemp`-isolated directories, refuse to touch resources they did not create, and clean up after themselves.
 
 ## The Journey of my VPN
 
-The project will be accompanied by a living ebook in **English, Spanish, and Brazilian Portuguese**. Each implementation milestone updates all three editions in the same change set as the code. Chapters connect requirements to the implementation and tests, explain the decisions, and include a lab exercise. When a later chapter replaces an earlier approach, linked revision notes preserve the original reasoning and explain what changed.
+The living ebook ships in **English, Spanish, and Brazilian Portuguese**, updated in the same change set as each milestone. Chapters map requirements to code and tests, explain the decisions and tradeoffs, and end with a reproducible lab exercise. Revision notes preserve the history when later chapters replace earlier approaches.
 
-Chapter 1 will trace a ping through TUN and UDP, explain the routing and privileges involved, and show how to reproduce the lab and verify cleanup.
+| Chapter | en | es | pt-BR |
+|---|---|---|---|
+| 1 — Raw TUN ↔ UDP | [read](book/en/ch01-raw-tun-udp.md) | [leer](book/es/ch01-raw-tun-udp.md) | [ler](book/pt-BR/ch01-raw-tun-udp.md) |
+| 2 — Telemetry loop | [read](book/en/ch02-telemetry-loop.md) | [leer](book/es/ch02-telemetry-loop.md) | [ler](book/pt-BR/ch02-telemetry-loop.md) |
 
 ## Project documents
 

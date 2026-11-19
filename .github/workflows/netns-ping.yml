@@ -7,12 +7,14 @@ on:
     branches: [main]
     paths:
       - 'engine-rust/**'
+      - 'rust-toolchain.toml'
       - 'tests/lab/**'
       - '.github/workflows/netns-ping.yml'
   push:
     branches: [main]
     paths:
       - 'engine-rust/**'
+      - 'rust-toolchain.toml'
       - 'tests/lab/**'
 
 permissions:

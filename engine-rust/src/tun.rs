@@ -62,6 +62,8 @@ impl Tun {
                 ),
             ));
         }
+        // coverage: lab-only begin — real /dev/net/tun open + TUNSETIFF ioctl
+        // need CAP_NET_ADMIN; exercised by the lab steps, not unit tests.
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -91,9 +93,17 @@ impl Tun {
                 return Err(err);
             }
         }
+        Tun::from_file(file)
+        // coverage: lab-only end
+    }
+
+    /// Wraps an already-open descriptor in the async TUN interface. Tests
+    /// hand it a socketpair end so the forwarding loop runs without a real
+    /// device.
+    pub fn from_file(file: File) -> io::Result<Tun> {
         Ok(Tun {
-            // SAFETY: `file` is a freshly opened, owned descriptor that stays
-            // alive inside the AsyncFd for its whole registration.
+            // SAFETY: `file` is an owned descriptor that stays alive inside
+            // the AsyncFd for its whole registration.
             file: unsafe { AsyncFd::register(file) }.map_err(io::Error::from)?,
         })
     }
@@ -129,12 +139,14 @@ impl Tun {
 
 /// Applies MTU, IPv4 address and the up state to `ifname` using `ip(8)`.
 /// `addr replace` keeps the call idempotent when the engine restarts.
+// coverage: lab-only begin — needs a real interface + CAP_NET_ADMIN.
 pub fn configure_interface(ifname: &str, cidr: &str, mtu: u16) -> io::Result<()> {
     ip(&["link", "set", "dev", ifname, "mtu", &mtu.to_string()])?;
     ip(&["-4", "addr", "replace", cidr, "dev", ifname])?;
     ip(&["link", "set", "dev", ifname, "up"])?;
     Ok(())
 }
+// coverage: lab-only end
 
 /// Candidate absolute locations for iproute2's `ip`. Resolving it ourselves
 /// keeps a root-run engine immune to a hostile PATH.
@@ -154,6 +166,8 @@ fn ip_binary() -> io::Result<&'static str> {
 }
 
 fn ip(args: &[&str]) -> io::Result<()> {
+    // A harmless `ip -V` exercises the success path without privileges; a
+    // bogus device exercises the error path. Both are unit-tested.
     let output = Command::new(ip_binary()?).args(args).output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
@@ -163,4 +177,73 @@ fn ip(args: &[&str]) -> io::Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::io::FromRawFd;
+
+    #[test]
+    fn open_rejects_invalid_names() {
+        for name in ["", "this-name-is-far-too-long", "bad name!", "na/me"] {
+            let err = Tun::open(name).map(|_| ()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "name {name:?}");
+        }
+    }
+
+    #[test]
+    fn open_rejects_interface_that_already_exists() {
+        // "lo" always exists; the sysfs check must refuse before /dev/net/tun
+        // is touched — no privileges required to observe the refusal.
+        let err = Tun::open("lo").map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    fn socketpair_tun() -> (Tun, File) {
+        let mut fds = [0; 2];
+        unsafe {
+            assert_eq!(
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_DGRAM | libc::SOCK_NONBLOCK,
+                    0,
+                    fds.as_mut_ptr()
+                ),
+                0
+            );
+            (
+                Tun::from_file(File::from_raw_fd(fds[0])).unwrap(),
+                File::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn read_write_roundtrip_over_socketpair() {
+        let (tun, mut peer) = socketpair_tun();
+        peer.write_all(b"packet").unwrap();
+        let mut buf = [0u8; 16];
+        let n = tun.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"packet");
+        let written = tun.write(b"reply").await.unwrap();
+        assert_eq!(written, 5);
+        let mut back = [0u8; 16];
+        let n = peer.read(&mut back).unwrap();
+        assert_eq!(&back[..n], b"reply");
+    }
+
+    #[test]
+    fn ip_binary_finds_iproute2() {
+        assert!(ip_binary().is_ok());
+    }
+
+    #[test]
+    fn ip_succeeds_on_harmless_query_and_fails_on_bogus_device() {
+        assert!(ip(&["-V"]).is_ok());
+        let err = ip(&["link", "set", "dev", "hkcov-no-such-dev", "up"]).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("ip link set dev hkcov-no-such-dev up"));
+    }
 }

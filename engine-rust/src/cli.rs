@@ -7,6 +7,7 @@ use clap::{Args, Parser, Subcommand};
 
 pub const DEFAULT_MTU: u16 = 1400;
 pub const DEFAULT_TUN_NAME: &str = "tun0";
+pub const DEFAULT_METRICS_SOCK: &str = "/run/vpn/engine.sock";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -66,6 +67,13 @@ pub struct CommonArgs {
     /// Name of the TUN interface to create.
     #[arg(long, default_value = DEFAULT_TUN_NAME)]
     pub tun_name: String,
+    /// Unix socket that answers GetMetrics (u32-BE length + JSON frame).
+    #[arg(long, default_value = DEFAULT_METRICS_SOCK)]
+    pub metrics_sock: std::path::PathBuf,
+    /// Group that owns the metrics socket file (mode is 0660); without it
+    /// the socket is limited to the engine's own user/group.
+    #[arg(long)]
+    pub metrics_group: Option<String>,
 }
 
 /// An IPv4 address with prefix length, written `A.B.C.D/N`.
@@ -130,6 +138,13 @@ mod tests {
         assert!("10.80.1.1".parse::<Ipv4Cidr>().is_err());
         assert!("10.80.1.1/33".parse::<Ipv4Cidr>().is_err());
         assert!("10.80.1.x/24".parse::<Ipv4Cidr>().is_err());
+    }
+
+    #[test]
+    fn cidr_zero_prefix_matches_everything() {
+        let net: Ipv4Cidr = "0.0.0.0/0".parse().unwrap();
+        assert!(net.contains(Ipv4Addr::new(1, 2, 3, 4)));
+        assert!(net.contains(Ipv4Addr::LOCALHOST));
     }
 
     #[test]

@@ -101,14 +101,40 @@ step_rust() {
 }
 run_step "rust: fmt, clippy, test, release build" step_rust
 
+step_go() {
+    command -v go >/dev/null 2>&1 || return 1
+    # The go CLI does not read .go-version; enforce the pinned toolchain here.
+    local want have
+    want=$(cat agent-go/.go-version)
+    have=$(go version | awk '{sub(/^go/, "", $3); print $3}')
+    [ "$have" = "$want" ] || { echo "go $want required by agent-go/.go-version (have $have)" >&2; return 1; }
+    (cd agent-go && gofmt -l . | grep -q . && return 1; go vet ./... && go test ./...)
+}
+run_step "go: gofmt, vet, test" step_go
+
+step_dotnet() {
+    command -v dotnet >/dev/null 2>&1 || return 1
+    dotnet build control-dotnet/VpnControl/VpnControl.csproj -v q --nologo >/dev/null &&
+        dotnet test control-dotnet/VpnControl.Tests -v q --nologo
+}
+run_step "dotnet: build + test vpn-control" step_dotnet
+
 run_step "book parity (en / es / pt-BR)" bash tests/book/check-parity.sh
+
+# TEST-02: line coverage must stay >= COVERAGE_MIN (default 90%) per
+# component — the step fails below the threshold.
+run_step "coverage >= 90% (rust/go/c#, TEST-02)" bash tests/coverage.sh
 
 if [ "$run_lab" -eq 1 ]; then
     run_step "lab integration: ip netns ping (sudo)" \
         sudo tests/lab/netns-ping.sh engine-rust/target/release/vpn-engine
+    run_step "lab integration: telemetry demo (end to end)" \
+        tests/lab/telemetry-demo.sh
+    run_step "lab integration: telemetry demo preserves foreign resources (sudo)" \
+        sudo tests/lab/telemetry-demo-safety.test.sh
 else
-    record_skip "lab integration: ip netns ping" \
-        "privileged — run 'tests/checks.sh --lab' or 'sudo tests/lab/netns-ping.sh engine-rust/target/release/vpn-engine' in the authorized lab"
+    record_skip "lab integration: ip netns ping + telemetry demo" \
+        "privileged — run 'tests/checks.sh --lab' in the authorized lab"
 fi
 
 echo

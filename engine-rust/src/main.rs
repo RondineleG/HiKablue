@@ -1,5 +1,8 @@
+// coverage: lab-only begin — process bootstrap glue; exercised end-to-end
+// by the lab demos, not unit tests.
 mod cli;
 mod forward;
+mod metrics;
 mod packet;
 mod tun;
 
@@ -19,6 +22,8 @@ async fn main() {
             tun_cidr: args.tun_cidr,
             tun_name: args.common.tun_name,
             mtu: args.common.mtu,
+            metrics_sock: args.common.metrics_sock,
+            metrics_group: args.common.metrics_group,
         },
         Mode::Client(args) => Config {
             bind: args.bind,
@@ -27,6 +32,8 @@ async fn main() {
             tun_cidr: args.tun_cidr,
             tun_name: args.common.tun_name,
             mtu: args.common.mtu,
+            metrics_sock: args.common.metrics_sock,
+            metrics_group: args.common.metrics_group,
         },
     };
 
@@ -35,3 +42,4 @@ async fn main() {
         std::process::exit(1);
     }
 }
+// coverage: lab-only end

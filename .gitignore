@@ -427,3 +427,7 @@ FodyWeavers.xsd
 
 # Rust
 engine-rust/target/
+
+# coverage artifacts
+agent-go/coverage.out
+control-dotnet/**/TestResults/

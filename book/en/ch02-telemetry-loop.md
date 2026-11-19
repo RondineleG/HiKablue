@@ -1,0 +1,276 @@
+<!-- chapter-id: ch02-telemetry-loop -->
+# Chapter 2 — The Engine Learns to Answer: Telemetry
+
+*The Journey of my VPN* · Chapter `ch02-telemetry-loop` · Milestone 1: telemetry
+
+Chapter 1 built a tunnel that forwards bytes. This chapter makes the engine
+*accountable*: it counts every datagram it sees, answers `GetMetrics` on a
+Unix socket, and a Go agent learns to ask — politely, with a deadline — while
+a C# control plane keeps a list of who is alive.
+
+> **Lab boundary.** As in Chapter 1, everything here runs in an isolated,
+> authorized lab (`.agc/RULES.md` LAB-01). The metrics socket carries no
+> authentication yet; the control-plane milestone replaces the temporary
+> HTTP heartbeat with the gRPC `NodeChannel` stream.
+
+## What we built, and why it is split this way
+
+Three small pieces, one per language, each with a job the others cannot do:
+
+- **Rust engine** — owns the counters. `rx_bytes` increments on *every*
+  received datagram, even ones validation later drops: the milestone's
+  acceptance check is "a 5-byte datagram raises the counter by five", and
+  that only works if counting happens before filtering. The counters live in
+  `Arc<Metrics>` of `AtomicU64` relaxed atomics, shared between the packet
+  loop and a second tokio task that serves the socket — so telemetry can
+  never block the dataplane.
+- **Go agent** — owns the asking. `FetchMetrics(ctx)` dials the Unix socket,
+  writes one request frame, reads one response frame. The `ctx` deadline is
+  applied to the socket itself, so a peer that accepts and stays silent is
+  cut off instead of stalling the collection loop forever.
+- **C# control plane** — owns the bookkeeping. `POST /internal/heartbeats`
+  records a node; `GET /v1/nodes` lists them. `lastSeen` (when the node last
+  spoke) and `engineHealthy` (what the node *reported* about its engine) are
+  separate fields, because "quiet" and "broken" are different failures.
+
+## The frame: one length, one JSON blob
+
+The protocol on `/run/vpn/engine.sock` is the smallest thing that works:
+
+```text
+┌───────────────┬──────────────────────┐
+│ u32 big-endian│  UTF-8 JSON envelope │
+│ frame length  │  (max 1 MiB)         │
+└───────────────┴──────────────────────┘
+```
+
+Request `{"request_id":"req-1","version":1,"op":"GetMetrics","payload":{}}` gets an
+envelope back: the echoed `request_id`, a `status` of `"ok"` plus a `result`
+object, or `"error"` plus `code`/`message`:
+
+```json
+{"request_id":"req-1","version":1,"status":"ok",
+ "result":{"rx_bytes":5,"rx_pkts":0,"tx_bytes":0,"tx_pkts":0,
+           "dropped_pkts":2,"peers":0,"uptime_secs":2}}
+```
+
+`AddPeer`/`RemovePeer`/`SyncPeers` share this socket in the spec; only
+`GetMetrics` is implemented now — unknown ops get a `status:"error"` envelope.
+The socket file is mode `0660` shared through a dedicated group
+(`--metrics-group`), so users outside it cannot connect, and each connection
+gets a read/write deadline plus a cap on concurrent connections — a silent
+or idle peer cannot exhaust descriptors.
+
+## Exercise — why one read can return half a frame
+
+A stream socket is a *byte pipe*, not a message queue. If the writer sends
+`LLLL{json}` in two `write()` calls — or the kernel chops it into segments —
+one `read()` on the reader's side can return any prefix of the frame: the
+length alone, the length plus three bytes of JSON, anything. The fix is
+always the same shape: read the 4-byte length with `read_exact`, allocate,
+then `read_exact` the body. In Rust, `tokio::io::AsyncReadExt::read_exact`
+loops until the buffer is full; in Go, `io.ReadFull` does the same.
+
+`engine-rust/src/metrics.rs` reproduces the pathology in a test: the client
+writes the *request* in two halves with a delay between them, and the engine
+still assembles the whole frame before answering. Delete the `read_exact`
+calls and the test flakes exactly the way production would. The listener
+side has the same lesson on the way out — replies are written with
+`write_u32` + `write_all`, and both directions sit under a deadline.
+
+## Exercise — the silent engine
+
+What if the peer accepts the connection and then says nothing? Without a
+deadline, the read blocks forever and every later collection stalls behind
+it. `agent-go/metrics_test.go` runs a fake engine that accepts and stays
+mute: `FetchMetrics` under a 150 ms context deadline returns an error in
+~150 ms, and the *next* call against a healthy engine succeeds — proving the
+deadline kills the read, not the loop.
+
+## Exercise — missing heartbeat vs. dead engine
+
+The C# `NodeRegistryTests` show the difference the data model exists to
+capture: a node that stops beating keeps its old `LastSeen` (stale), while a
+node that beats with `engineHealthy=false` has a fresh `LastSeen` *and* a
+separate bad flag. "Last reported state" and "last contact" answer different
+questions; conflating them is how dashboards lie.
+
+## Observed, not promised
+
+`tests/lab/telemetry-demo.sh` runs the whole milestone on localhost — engine
+under `sudo` (the TUN still needs `CAP_NET_ADMIN`), agent and control plane
+unprivileged — and prints `telemetry-demo: PASS` only after observing:
+
+1. a 5-byte UDP datagram raises `rx_bytes` by exactly five;
+2. `GET /v1/nodes` lists the node carrying those metrics;
+3. after `SIGTERM`, the agent's fetch fails and the next heartbeat the
+   script forwards reports `engineHealthy: false`;
+4. after restart, `GetMetrics` answers again.
+
+## Reading the code
+
+The heart of `handle()` is three lines that look trivial and carry the whole
+lesson of this chapter:
+
+```rust
+let read = async {
+    let len = stream.read_u32().await?;          // 4-byte length, big-endian
+    if len > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("metrics frame of {len} bytes exceeds {MAX_FRAME}"),
+        ));
+    }
+    let mut frame = vec![0u8; len as usize];     // allocate exactly the frame
+    stream.read_exact(&mut frame).await?;        // loop until it is complete
+    Ok::<_, io::Error>(frame)
+};
+let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
+```
+
+- `read_u32` is `AsyncReadExt::read_u32`: four bytes, big-endian — the same
+  length the Go agent writes with `binary.Write(..., binary.BigEndian, ...)`.
+- The length is checked *before* the `vec!` allocates: a hostile or broken
+  peer cannot make the engine allocate 4 GiB for a "frame".
+- The rejection builds a real error: `io::Error::new` wraps the
+  `io::ErrorKind::InvalidData` kind plus a `format!` message naming the
+  offender's size. The message reaches the engine's stderr — the socket
+  loop logs the failure and closes the connection without a response frame,
+  so the peer sees an EOF, not this text.
+- `read_exact` is the fix for the partial-read exercise — it keeps reading
+  until `frame` is full, no matter how the kernel chunked the bytes.
+- `timeout(IO_DEADLINE, read)` is the fix for the silent-peer exercise: the
+  deadline covers the *whole* read — ten seconds for the frame to complete,
+  not ten seconds between bytes.
+
+| File | What it does |
+|---|---|
+| `engine-rust/src/metrics.rs` | `Metrics` counters; `bind()` probes a stale-vs-live socket path, sets `0660`, optional `chgrp`; `serve()` accepts with a connection cap + I/O deadline; `handle()` reads/writes the JSON envelope |
+| `engine-rust/src/forward.rs` | Increments counters on every dataplane path (`rx_bytes` before validation, `dropped_pkts` on each drop — including outbound packets with no learned peer); client sets `peers=1` for its configured remote |
+| `engine-rust/src/cli.rs` | Flags `--metrics-sock` (default `/run/vpn/engine.sock`) and `--metrics-group` |
+| `agent-go/metrics.go` | `FetchMetrics(ctx)` — dial, deadline + cancel watcher, writes the envelope, `io.ReadFull` the response, decodes `result` |
+| `agent-go/cmd/vpn-agent/main.go` | One-shot CLI that prints the decoded metrics |
+| `control-dotnet/VpnControl/Services/NodeRegistry.cs` + `Services/NodeService.cs` | In-memory node table: `lastSeen` and `engineHealthy` kept apart; `NodeService` answers in `RequestResult` |
+| `control-dotnet/VpnControl/UseCases/Nodes/` | `RegisterNodeHeartbeatUseCase` and `GetNodesUseCase` — `IUseCase<TRequest, TResponse>` implementations |
+| `control-dotnet/VpnControl/Requests/` + `Endpoints/Base/` | `RequestResult`/`EResultStatus` (OnForkHub result pattern) and `BaseEndPoint<Node>` — status → `ApiResponse` + HTTP code |
+| `control-dotnet/VpnControl/Program.cs` | bootstrap + loopback guard + convention DI; endpoint classes `BaseEndPoint<Node>, IEndpointAsync` under `Endpoints/` |
+| `tests/lab/telemetry-demo.sh` | End-to-end acceptance: +5 bytes, outage, recovery on both socket and control plane; refuses preexisting `hktelem0` |
+| `io::Error::new` / `InvalidData` / `format!` | Constructs an I/O error of the "invalid data" kind with a formatted message — used to reject an oversized frame. |
+
+## Glossary
+
+- **`AF_UNIX` socket** — an address family for same-host IPC: the endpoint is
+  a filesystem path, not an IP:port.
+- **`AddVpnControl` / `MapRegisteredEndpointsAsync`** — the two extension
+  methods `Program.cs` calls: one registers `NodeRegistry`, endpoints, use
+  cases and services in the DI container by convention, the other lets
+  each `IEndpointAsync` class map its own route.
+- **`AtomicU64` / relaxed ordering** — a 64-bit counter that can be updated
+  concurrently without locks; `Relaxed` means "no extra synchronization
+  guarantees", which is all independent counters need.
+- **`CAP_NET_ADMIN`** — the Linux capability required to create/configure a
+  TUN interface; why the engine runs under `sudo` while the agent does not.
+- **`// coverage: lab-only begin` / `end`** — Rust markers around code that
+  only runs with privileges (`/dev/net/tun` open + `TUNSETIFF`, interface
+  configuration, `main`'s bootstrap); `tests/coverage.sh` drops those lines
+  from the total because the lab steps exercise them, not unit tests.
+- **`coverage.sh` / `TEST-02`** — the gate step that fails below 90% line
+  coverage per component: Rust lines (`llvm-cov`, test code excluded), Go
+  statements (`-coverpkg=./...`), C# lines (coverlet).
+- **`ctx` / context deadline** — Go's way of carrying "give up after T" into
+  blocking calls; here applied to socket reads/writes.
+- **`DescribeLastMapped` / `IEndpointNameMetadata` / `RoutePattern` /
+  `IHttpMethodMetadata`** — how a registration reports itself honestly:
+  after `MapGet`/`MapPost` (the calls that register an HTTP route for
+  GET/POST), `DescribeLastMapped` reads the endpoint record
+  the framework just built — `IEndpointNameMetadata` holds the name set by
+  `WithName`, `RoutePattern` the raw route text, `IHttpMethodMetadata` the
+  HTTP verbs — instead of restating them by hand.
+- **`IEndpointAsync`** — the small interface every endpoint class
+  implements (`Task<RequestResult<EndpointRegistrationResponse>>
+  RegisterAsync(WebApplication)`), keeping route registration out of
+  `Program.cs` and reporting each mapped route as a typed result.
+- **`io.ReadFull` / `read_exact`** — read-until-buffer-full helpers that turn
+  stream semantics into frame semantics.
+- **`lastSeen`** — timestamp of the last heartbeat, kept separate from the
+  node's last *reported* engine health.
+- **Length-prefixed frame** — message framing that sends the byte count
+  before the payload, so the reader knows how much to assemble.
+- **`LoopbackGuard`** — the startup check that inspects the configured
+  URLs and refuses to boot on a non-loopback bind while heartbeats are
+  unauthenticated.
+- **`0660` + dedicated group** — Unix socket mode that gives the owner and
+  the named group access; the lab procedure's way of sharing the engine
+  socket with the unprivileged agent without opening it to every local user.
+- **`request_id` / envelope** — the JSON wrapper the socket contract
+  requires: request id + version + op + payload out, echoed id + status +
+  result-or-error back, so replies can be matched to requests.
+- **Heartbeat** — a periodic "I'm here" signal from a node; temporary HTTP
+  POST until the gRPC channel lands in the control-plane milestone.
+- **`HeartbeatEndpoint` / `GetNodesEndpoint`** — the classes that hold
+  `POST /internal/heartbeats` and `GET /v1/nodes`, so `Program.cs` stays
+  a bootstrap file.
+- **`RequestResult` / `IUseCase` / `BaseEndPoint<T>`** — the OnForkHub
+  result pattern the API is organized around: a use case returns a
+  `RequestResult<T>` carrying an `EResultStatus`, and `BaseEndPoint` maps
+  that status to the HTTP code plus the `ApiResponse` envelope.
+- **`HttpContractTests` / `WebApplicationFactory`** — the HTTP contract
+  suite and the host it runs on: `WebApplicationFactory` hosts the real
+  app in memory (no port, no Kestrel), so tests exercise routing and
+  JSON exactly as a client sees them.
+
+## Revision notes
+
+- `r10` — Coverage gate (TEST-02): `tests/coverage.sh` now fails the gate
+  below 90% per component. `run` was split so `run_loop` is unit-testable
+  with a socketpair TUN; `main` became a testable `run(args)` in Go; the
+  startup guard moved to `LoopbackGuard.EnforceLoopbackOnly`.
+- `r9` — `RegisterAsync` no longer restates name/route/verb: it returns
+  `DescribeLastMapped(app)`, which reads the just-mapped endpoint's own
+  record (`IEndpointNameMetadata`, `RoutePattern`, `IHttpMethodMetadata`).
+- `r8` — `EndpointMappingTests` proves the mapper throws
+  `InvalidOperationException` (endpoint name + error) when a registrant
+  fails; because `Program.cs` awaits the mapping before `app.Run()`,
+  that exception aborts startup.
+- `r7` — Typed registration: `RegisterAsync` now returns
+  `RequestResult<EndpointRegistrationResponse>` — the route it mapped as
+  a typed object — and `MapRegisteredEndpointsAsync` consumes it (throws
+  on failure, logs each `METHOD /route` it registered).
+- `r6` — Contract check: `HttpContractTests` (WebApplicationFactory)
+  verifies the `ApiResponse` envelope end to end — `202` + node under
+  `data` for a valid heartbeat, `422` for a blank `nodeId`, node list
+  under `data` on `GET /v1/nodes`. The 202 body now carries the envelope
+  too, so every response *our handlers produce* shares one shape — a
+  malformed body is still answered by the framework's `ProblemDetails`
+  before our code runs.
+- `r5` — Reorganization, second pass: the API now mirrors the
+  MinimalTemplate layout — endpoint classes are
+  `BaseEndPoint<Node>, IEndpointAsync` with `RegisterAsync`, DI registers
+  endpoints/use cases/services by convention, use cases live in
+  `UseCases/`, `NodeService` wraps `NodeRegistry`, and every handler-produced
+  response goes through the OnForkHub `RequestResult`/`EResultStatus`/
+  `ApiResponse` result pattern.
+- `r4` — Reorganization: `VpnControl` split into MinimalTemplate-style
+  folders (`Endpoints/`, `Extensions/`, `Interfaces/`, `Models/`,
+  `Services/`, `Security/`); `Program.cs` is now only bootstrap and routes
+  live in `IEndpoint` classes; glossary extended for the new terms.
+- `r3` — Review hardening: the socket enforces the envelope contract
+  (required `request_id`/`version`/`op`/`payload`, only version 1, valid
+  JSON error envelopes, responses serialized with serde_json); `bind()`
+  refuses non-socket paths and only removes stale sockets; vpn-control
+  validates its URLs and refuses any non-loopback bind while heartbeats
+  are unauthenticated; the demo keeps all run state in an exclusive
+  per-run directory, refuses occupied ports/interfaces, and documents that
+  the script — not the agent — forwards the heartbeat.
+
+- `r2` — Review fixes: the socket protocol now uses the spec's envelope
+  (`request_id`, `version`, `op`, `status`/`result`/`error`, 1 MiB cap) with
+  read/write deadlines and a connection cap; the socket file is `0660` with
+  `--metrics-group`; `bind()` refuses to replace a live socket; the client
+  reports its configured peer; unlearned drops count; the demo verifies
+  control-plane recovery and refuses preexisting interfaces.
+- `r1` — Milestone 1 telemetry delivered and verified by
+  `tests/lab/telemetry-demo.sh` on a local lab: +5-byte counter, outage and
+  recovery observed; 32 Rust tests, 3 Go tests, 3 C# tests. The HTTP
+  heartbeat and in-memory registry are deliberately temporary — they are
+  replaced by gRPC and PostgreSQL in the control-plane milestone.
