@@ -15,7 +15,7 @@ fi
 git cat-file -e "${BASE_SHA}^{commit}"
 git cat-file -e "${HEAD_SHA}^{commit}"
 
-pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9][a-z0-9-]*\))?(!)?: .+$'
+pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^()]+\))?(!)?: .+$'
 mapfile -t commits < <(git rev-list --no-merges "${BASE_SHA}..${HEAD_SHA}")
 
 if ((${#commits[@]} == 0)); then
