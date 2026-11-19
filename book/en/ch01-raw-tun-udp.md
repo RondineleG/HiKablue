@@ -72,9 +72,11 @@ with `sudo`.
    reports one round trip.
 
 > **Peer learning is not authentication.** The check is *structural
-> validation plus an inner-source-IP match* — input validation, nothing more.
-> Any sender that can reach A's UDP port and spoof `10.80.1.2` inside would
-> pass. Milestone 4's AEAD transport is what will make this safe.
+> validation plus an inner-source-IP match* — on **every** datagram, before
+> and after learning, so the pinned endpoint cannot inject packets that
+> claim other virtual IPs. It is input validation, nothing more. Any sender
+> that can reach A's UDP port and spoof `10.80.1.2` inside would still pass.
+> Milestone 4's AEAD transport is what will make this safe.
 
 ## MTU and reusable buffers
 
@@ -112,7 +114,9 @@ the TUN address: `10.80.1.0/24 dev tun0`. Two consequences:
 - `SIGINT` and `SIGTERM` break the `tokio::select!` loop, drop the TUN
   descriptor — which removes the transient interface — and exit with code 0.
 - `deploy/debian/lab-node-setup.sh` prepares a node idempotently (tun module,
-  `iproute2`); `lab-node-cleanup.sh` deletes `tun0` only when it carries a
+  `iproute2`); `lab-node-cleanup.sh` only *verifies* that `tun0` is gone —
+  our interface is transient and dies with its descriptor — and removes a
+  surviving one only when you pass `--lab-owned` *and* it carries a
   `10.80.0.0/16` lab address, so another VPN's interface is never removed.
   For the same reason, the engine refuses to open a TUN name that already
   exists instead of reconfiguring someone else's interface.
@@ -364,14 +368,14 @@ addresses (`172.30.0.11/12` instead of `192.168.56.11/12`).
 | Forward IPv4 both directions, fixed peer per node | `src/forward.rs` `run()` | ping both ways (verified, below) |
 | Reusable buffers, bound MTU | `src/forward.rs` `BUFFER_SIZE`, `MAX_MTU` | `rejects_zero_and_huge_mtu` |
 | Drop malformed IPv4 | `src/packet.rs` `validate_ipv4`; `src/forward.rs` `recv_datagram` (MSG_TRUNC) | 8 unit tests: truncation, version, IHL, length, checksum, oversize; forged oversized datagram dropped in lab |
-| Server peer learning by inner source IP | `src/forward.rs` `classify_server_packet` | 4 deterministic cases: learn on match, drop divergent source, forward pinned peer, drop other endpoint; observed `learned peer endpoint` log |
+| Server peer learning by inner source IP | `src/forward.rs` `classify_server_packet` | 5 deterministic cases: learn on match, drop divergent source, forward pinned peer, drop pinned endpoint with divergent inner source, drop other endpoint; observed `learned peer endpoint` log |
 | Clean shutdown on SIGINT/SIGTERM | `src/forward.rs` signal arms | observed exit 0 on Debian 13 |
 
 ## Observed results vs. expectations
 
 | Check | Environment | Observed |
 |---|---|---|
-| `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 warnings; 23/23 tests pass |
+| `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 warnings; 25/25 tests pass |
 | Ping `10.80.1.1` from B and `10.80.1.2` from A | Debian 13 (trixie) containers, `hikablue-lab` net | 3/3 replies each direction |
 | Same pings | Debian 12 (bookworm) containers | 3/3 replies each direction |
 | SIGINT / `docker stop` (SIGTERM) | Debian 13 containers | exit code 0; `tun0` gone with the process |

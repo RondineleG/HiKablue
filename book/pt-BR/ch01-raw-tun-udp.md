@@ -71,9 +71,11 @@ laboratório executa o `vpn-engine` com `sudo`.
    ida e volta.
 
 > **Aprender o par não é autenticação.** A verificação é *validação estrutural
-> mais correspondência da IP de origem interna* — validação de entrada, nada
-> mais. Qualquer emissor que alcance a porta UDP de A e falsifique `10.80.1.2`
-> por dentro passaria. O transporte AEAD do marco 4 é o que tornará isso
+> mais correspondência da IP de origem interna* — em **cada** datagrama, antes
+> e depois de aprender, então o endpoint fixado não pode injetar pacotes que
+> reivindiquem outros IPs virtuais. É validação de entrada, nada mais.
+> Qualquer emissor que alcance a porta UDP de A e falsifique `10.80.1.2` por
+> dentro ainda passaria. O transporte AEAD do marco 4 é o que tornará isso
 > seguro.
 
 ## MTU e buffers reutilizáveis
@@ -113,10 +115,12 @@ a partir do endereço do TUN: `10.80.1.0/24 dev tun0`. Duas consequências:
 - `SIGINT` e `SIGTERM` interrompem o laço `tokio::select!`, liberam o descritor
   do TUN — o que remove a interface transitória — e saem com código 0.
 - `deploy/debian/lab-node-setup.sh` prepara um nó de forma idempotente (módulo
-  tun, `iproute2`); `lab-node-cleanup.sh` remove `tun0` apenas quando ele
-  carrega um endereço do laboratório `10.80.0.0/16`, então a interface de outra
-  VPN nunca é removida. Pela mesma razão, o motor se recusa a abrir um nome de
-  TUN que já existe em vez de reconfigurar a interface alheia.
+  tun, `iproute2`); `lab-node-cleanup.sh` apenas *verifica* que o `tun0` sumiu
+  — nossa interface é transitória e morre com o descritor — e remove uma que
+  sobreviva somente se você passar `--lab-owned` *e* ela carregar um endereço
+  do laboratório `10.80.0.0/16`, então a interface de outra VPN nunca é
+  removida. Pela mesma razão, o motor se recusa a abrir um nome de TUN que já
+  existe em vez de reconfigurar a interface alheia.
 
 ## Lendo o código
 
@@ -367,14 +371,14 @@ underlay (`172.30.0.11/12` em vez de `192.168.56.11/12`).
 | Encaminhar IPv4 nas duas direções, um par fixo por nó | `src/forward.rs` `run()` | ping nos dois sentidos (verificado abaixo) |
 | Buffers reutilizáveis, MTU limitada | `src/forward.rs` `BUFFER_SIZE`, `MAX_MTU` | `rejects_zero_and_huge_mtu` |
 | Descartar IPv4 malformado | `src/packet.rs` `validate_ipv4`; `src/forward.rs` `recv_datagram` (MSG_TRUNC) | 8 testes unitários: truncado, versão, IHL, comprimento, checksum, tamanho; datagrama excedente falsificado descartado no lab |
-| Aprendizado do par pela IP de origem interna | `src/forward.rs` `classify_server_packet` | 4 casos determinísticos: aprende se confere, descarta origem divergente, encaminha par fixado, descarta outro endpoint; log `learned peer endpoint` observado |
+| Aprendizado do par pela IP de origem interna | `src/forward.rs` `classify_server_packet` | 5 casos determinísticos: aprende se confere, descarta origem divergente, encaminha par fixado, descarta par fixado com origem interna divergente, descarta outro endpoint; log `learned peer endpoint` observado |
 | Desligamento limpo com SIGINT/SIGTERM | `src/forward.rs` ramos de sinal | saída 0 observada no Debian 13 |
 
 ## Resultados observados vs. esperados
 
 | Verificação | Ambiente | Observado |
 |---|---|---|
-| `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 avisos; 23/23 testes passam |
+| `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 avisos; 25/25 testes passam |
 | Ping `10.80.1.1` a partir de B e `10.80.1.2` a partir de A | Contêineres Debian 13 (trixie), rede `hikablue-lab` | 3/3 respostas em cada direção |
 | Mesmos pings | Contêineres Debian 12 (bookworm) | 3/3 respostas em cada direção |
 | SIGINT / `docker stop` (SIGTERM) | Contêineres Debian 13 | código de saída 0; `tun0` some junto com o processo |

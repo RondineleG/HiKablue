@@ -84,10 +84,14 @@ fn classify_server_packet(
     peer_vip: Ipv4Addr,
 ) -> ServerInbound {
     match learned {
+        // The inner source must match the configured peer VIP on every
+        // datagram — learning does not suspend source validation, so the
+        // pinned endpoint can never inject packets from other virtual IPs.
         None if inner_src == peer_vip => ServerInbound::Learn,
-        None => ServerInbound::Drop,
-        Some(peer) if peer == from => ServerInbound::Forward,
-        Some(_) => ServerInbound::Drop,
+        Some(peer) if peer == from && inner_src == peer_vip => {
+            ServerInbound::Forward
+        }
+        _ => ServerInbound::Drop,
     }
 }
 
@@ -324,6 +328,17 @@ mod tests {
         assert_eq!(
             classify_server_packet(Some(EP_A), EP_A, PEER_VIP, PEER_VIP),
             ServerInbound::Forward
+        );
+    }
+
+    #[test]
+    fn learned_endpoint_with_wrong_inner_source_is_dropped() {
+        // A packet from the pinned endpoint but carrying a foreign virtual IP
+        // must not be injected into the TUN: learning does not suspend source
+        // validation.
+        assert_eq!(
+            classify_server_packet(Some(EP_A), EP_A, OTHER_VIP, PEER_VIP),
+            ServerInbound::Drop
         );
     }
 

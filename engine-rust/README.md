@@ -55,10 +55,13 @@ sudo ./vpn-engine client \
   --tun-cidr 10.80.1.2/24
 ```
 
-Acceptance check — ping the virtual IPs in **both** directions:
+Acceptance check — ping the virtual IPs in **both** directions. Ping the
+client side **first**: the server has no remote endpoint until it receives a
+valid packet from the configured `--peer`, so `ping 10.80.1.1` on B is what
+lets A learn where to send replies.
 
 ```sh
-# on B                        # on A
+# on B (first)                # on A (after B's ping)
 ping 10.80.1.1                ping 10.80.1.2
 ```
 
@@ -69,17 +72,23 @@ sudo tcpdump -ni tun0 icmp                 # inner IPv4: 10.80.1.x
 sudo tcpdump -ni eth0 udp port 51820       # outer UDP:  192.168.56.x
 ```
 
-Cleanup on each node (SIGINT/SIGTERM already releases the TUN fd):
+Cleanup on each node — the interface is transient and dies with the
+vpn-engine process, so the script normally only confirms it is gone:
 
 ```sh
-sudo deploy/debian/lab-node-cleanup.sh
+sudo deploy/debian/lab-node-cleanup.sh               # verify only
+sudo deploy/debian/lab-node-cleanup.sh --lab-owned   # remove a leftover
+                                                     # lab interface you
+                                                     # know is ours
 ```
 
 ## How it works
 
-- `server` binds UDP and learns one remote endpoint: only after a datagram
+- `server` binds UDP and learns one remote endpoint only after a datagram
   passes IPv4 structural validation **and** its inner source IP equals
-  `--peer`. This pins the peer; it is **not** authentication.
+  `--peer`. The inner source is re-checked on **every** datagram, so the
+  pinned endpoint cannot inject packets from other virtual IPs. This pins
+  the peer; it is **not** authentication.
 - `client` uses a connected UDP socket, so only the configured remote can
   inject packets.
 - Buffers: two fixed 2048-byte buffers are reused for every packet;
@@ -102,7 +111,7 @@ sudo deploy/debian/lab-node-cleanup.sh
 
 | Check | Where | Result |
 |---|---|---|
-| `cargo check` / `cargo test` / `cargo build --release` | Ubuntu 22.04 host, Rust 1.99.1 | 0 warnings, 23 tests pass |
+| `cargo check` / `cargo test` / `cargo build --release` | Ubuntu 22.04 host, Rust 1.99.1 | 0 warnings, 25 tests pass |
 | Ping both directions | Debian 13 (trixie) containers on a private Docker net | 3/3 replies each way |
 | Ping both directions | Debian 12 (bookworm) containers, same topology | 3/3 replies each way |
 | SIGINT / SIGTERM exit 0 + TUN cleanup | Debian 13 containers | observed |
