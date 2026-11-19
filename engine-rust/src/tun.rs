@@ -14,6 +14,7 @@ use tokio::io::unix::AsyncFd;
 
 const IFF_TUN: libc::c_short = 0x0001;
 const IFF_NO_PI: libc::c_short = 0x1000;
+const IFF_TUN_EXCL: libc::c_short = 0x8000u16.cast_signed();
 const TUNSETIFF: libc::c_ulong = 0x400454ca;
 
 #[repr(C)]
@@ -34,17 +35,26 @@ impl Tun {
     /// information (`IFF_TUN | IFF_NO_PI`): reads and writes are raw IP
     /// datagrams.
     pub fn open(name: &str) -> io::Result<Tun> {
-        if name.len() >= libc::IFNAMSIZ {
+        if name.is_empty()
+            || name.len() >= libc::IFNAMSIZ
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("interface name {name:?} exceeds IFNAMSIZ"),
+                format!(
+                    "interface name {name:?} invalid: 1-15 chars of [A-Za-z0-9._-]"
+                ),
             ));
         }
         // Refuse to reuse an interface that already exists: TUNSETIFF could
         // attach to a persistent TUN owned by another VPN and we would
         // reconfigure it (LAB-02: touch only project-owned objects). Transient
         // interfaces die with their descriptor, so any surviving `name` is
-        // not ours.
+        // not ours. The sysfs check gives the friendly error; IFF_TUN_EXCL
+        // below makes the kernel refuse atomically, closing the TOCTOU window
+        // between this check and the ioctl.
         if std::path::Path::new(&format!("/sys/class/net/{name}")).exists() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -68,9 +78,19 @@ impl Tun {
             for (slot, byte) in req.ifr_name.iter_mut().zip(name.bytes()) {
                 *slot = byte as libc::c_char;
             }
-            req.ifr_flags = IFF_TUN | IFF_NO_PI;
+            req.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL;
             if libc::ioctl(fd, TUNSETIFF, &req as *const Ifreq) < 0 {
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EBUSY) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!(
+                            "interface {name:?} already exists (foreign or persistent \
+                             TUN); pick another --tun-name or remove it"
+                        ),
+                    ));
+                }
+                return Err(err);
             }
         }
         Ok(Tun {
@@ -118,8 +138,30 @@ pub fn configure_interface(ifname: &str, cidr: &str, mtu: u16) -> io::Result<()>
     Ok(())
 }
 
+/// Candidate absolute locations for iproute2's `ip`. Resolving it ourselves
+/// keeps a root-run engine immune to a hostile PATH.
+const IP_CANDIDATES: &[&str] = &[
+    "/sbin/ip",
+    "/usr/sbin/ip",
+    "/bin/ip",
+    "/usr/bin/ip",
+];
+
+fn ip_binary() -> io::Result<&'static str> {
+    IP_CANDIDATES
+        .iter()
+        .copied()
+        .find(|p| std::path::Path::new(p).is_file())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "iproute2 `ip` not found under /sbin, /usr/sbin, /bin or /usr/bin",
+            )
+        })
+}
+
 fn ip(args: &[&str]) -> io::Result<()> {
-    let output = Command::new("ip").args(args).output()?;
+    let output = Command::new(ip_binary()?).args(args).output()?;
     if !output.status.success() {
         return Err(io::Error::new(
             io::ErrorKind::Other,

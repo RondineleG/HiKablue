@@ -13,7 +13,7 @@ use tokio::net::UdpSocket;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::cli::Ipv4Cidr;
-use crate::packet::{source_ip, validate_ipv4};
+use crate::packet::{destination_ip, source_ip, validate_ipv4};
 use crate::tun::{configure_interface, Tun};
 
 /// Fixed reusable buffer size; also the largest supported inner MTU.
@@ -76,21 +76,23 @@ enum ServerInbound {
 
 /// Server-side peer selection, kept pure so it can be tested without sockets.
 /// Learning requires the inner source IP to equal the configured peer virtual
-/// IP — input validation, not authentication.
+/// IP and the inner destination to equal this node's own virtual IP — input
+/// validation, not authentication.
 fn classify_server_packet(
     learned: Option<SocketAddr>,
     from: SocketAddr,
     inner_src: Ipv4Addr,
+    inner_dst: Ipv4Addr,
     peer_vip: Ipv4Addr,
+    local_vip: Ipv4Addr,
 ) -> ServerInbound {
+    let addressed_to_us = inner_src == peer_vip && inner_dst == local_vip;
     match learned {
-        // The inner source must match the configured peer VIP on every
-        // datagram — learning does not suspend source validation, so the
-        // pinned endpoint can never inject packets from other virtual IPs.
-        None if inner_src == peer_vip => ServerInbound::Learn,
-        Some(peer) if peer == from && inner_src == peer_vip => {
-            ServerInbound::Forward
-        }
+        // The inner source and destination are re-checked on every datagram
+        // — learning does not suspend source validation, so the pinned
+        // endpoint can never inject packets from or toward other virtual IPs.
+        None if addressed_to_us => ServerInbound::Learn,
+        Some(peer) if peer == from && addressed_to_us => ServerInbound::Forward,
         _ => ServerInbound::Drop,
     }
 }
@@ -233,7 +235,14 @@ pub async fn run(cfg: Config) -> io::Result<()> {
                 }
                 if is_server {
                     let peer_vip = cfg.peer_vip.expect("server sets peer_vip");
-                    match classify_server_packet(learned_peer, from, source_ip(packet), peer_vip) {
+                    match classify_server_packet(
+                        learned_peer,
+                        from,
+                        source_ip(packet),
+                        destination_ip(packet),
+                        peer_vip,
+                        cfg.tun_cidr.addr,
+                    ) {
                         // Learn the endpoint only after structural validation
                         // and an inner source-IP match. This pins the peer but
                         // is not authentication: any sender that can reach this
@@ -245,6 +254,11 @@ pub async fn run(cfg: Config) -> io::Result<()> {
                         ServerInbound::Forward => {}
                         ServerInbound::Drop => continue,
                     }
+                } else if destination_ip(packet) != cfg.tun_cidr.addr {
+                    // Client: the connected socket already pins the remote,
+                    // but the peer must not inject packets addressed to
+                    // other tunnel IPs.
+                    continue;
                 }
                 tun.write(packet).await?;
             }
@@ -301,6 +315,7 @@ mod tests {
     }
 
     const PEER_VIP: Ipv4Addr = Ipv4Addr::new(10, 80, 1, 2);
+    const LOCAL_VIP: Ipv4Addr = Ipv4Addr::new(10, 80, 1, 1);
     const OTHER_VIP: Ipv4Addr = Ipv4Addr::new(10, 80, 1, 99);
     const EP_A: SocketAddr =
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 56, 12), 51820));
@@ -310,7 +325,7 @@ mod tests {
     #[test]
     fn first_valid_packet_with_peer_source_learns() {
         assert_eq!(
-            classify_server_packet(None, EP_A, PEER_VIP, PEER_VIP),
+            classify_server_packet(None, EP_A, PEER_VIP, LOCAL_VIP, PEER_VIP, LOCAL_VIP),
             ServerInbound::Learn
         );
     }
@@ -318,7 +333,17 @@ mod tests {
     #[test]
     fn divergent_inner_source_is_dropped_not_learned() {
         assert_eq!(
-            classify_server_packet(None, EP_A, OTHER_VIP, PEER_VIP),
+            classify_server_packet(None, EP_A, OTHER_VIP, LOCAL_VIP, PEER_VIP, LOCAL_VIP),
+            ServerInbound::Drop
+        );
+    }
+
+    #[test]
+    fn divergent_inner_destination_is_dropped_not_learned() {
+        // Source matches the peer VIP but the packet is not addressed to this
+        // node's virtual IP: it must not pin the endpoint.
+        assert_eq!(
+            classify_server_packet(None, EP_A, PEER_VIP, OTHER_VIP, PEER_VIP, LOCAL_VIP),
             ServerInbound::Drop
         );
     }
@@ -326,7 +351,7 @@ mod tests {
     #[test]
     fn learned_endpoint_forwards() {
         assert_eq!(
-            classify_server_packet(Some(EP_A), EP_A, PEER_VIP, PEER_VIP),
+            classify_server_packet(Some(EP_A), EP_A, PEER_VIP, LOCAL_VIP, PEER_VIP, LOCAL_VIP),
             ServerInbound::Forward
         );
     }
@@ -337,7 +362,17 @@ mod tests {
         // must not be injected into the TUN: learning does not suspend source
         // validation.
         assert_eq!(
-            classify_server_packet(Some(EP_A), EP_A, OTHER_VIP, PEER_VIP),
+            classify_server_packet(Some(EP_A), EP_A, OTHER_VIP, LOCAL_VIP, PEER_VIP, LOCAL_VIP),
+            ServerInbound::Drop
+        );
+    }
+
+    #[test]
+    fn learned_endpoint_with_wrong_inner_destination_is_dropped() {
+        // The pinned endpoint sending to a foreign inner destination must not
+        // reach the TUN either.
+        assert_eq!(
+            classify_server_packet(Some(EP_A), EP_A, PEER_VIP, OTHER_VIP, PEER_VIP, LOCAL_VIP),
             ServerInbound::Drop
         );
     }
@@ -377,7 +412,7 @@ mod tests {
         // Even with a spoofed matching inner source, a different outer
         // endpoint cannot take over the pinned peer.
         assert_eq!(
-            classify_server_packet(Some(EP_A), EP_B, PEER_VIP, PEER_VIP),
+            classify_server_packet(Some(EP_A), EP_B, PEER_VIP, LOCAL_VIP, PEER_VIP, LOCAL_VIP),
             ServerInbound::Drop
         );
     }

@@ -86,11 +86,16 @@ sudo deploy/debian/lab-node-cleanup.sh --lab-owned   # remove a leftover
 
 - `server` binds UDP and learns one remote endpoint only after a datagram
   passes IPv4 structural validation **and** its inner source IP equals
-  `--peer`. The inner source is re-checked on **every** datagram, so the
-  pinned endpoint cannot inject packets from other virtual IPs. This pins
-  the peer; it is **not** authentication.
+  `--peer` and its inner destination is this node's own virtual IP. Both
+  checks are re-applied on **every** datagram, so the pinned endpoint
+  cannot inject packets from or toward other virtual IPs.
+  **This pins the peer; it is *not* authentication.** Any sender that can
+  reach the UDP port and spoof `--peer`'s virtual IP would still pass —
+  real authentication only arrives with the AEAD transport milestone.
+  Acceptable for an isolated lab, not for production.
 - `client` uses a connected UDP socket, so only the configured remote can
-  inject packets.
+  inject datagrams — and each one is still dropped unless its inner
+  destination is the client's own virtual IP.
 - Buffers: two fixed 2048-byte buffers are reused for every packet;
   `--mtu` is bounded to 2048 and defaults to 1400.
 - Packets failing structural validation (truncated, wrong version, bad IHL,
@@ -100,8 +105,12 @@ sudo deploy/debian/lab-node-cleanup.sh --lab-owned   # remove a leftover
   injected as a truncated packet.
 - Per-datagram UDP errors (e.g. `ECONNREFUSED` while the peer is down) are
   logged and dropped — they do not tear down the tunnel.
-- The engine refuses to reuse a TUN interface that already exists, so a
-  foreign or persistent `tun0` is never reconfigured.
+- The engine refuses to reuse a TUN interface that already exists — the
+  kernel check is atomic via `IFF_TUN_EXCL` on `TUNSETIFF` (a friendly
+  error is printed when the name is already taken) — so a foreign or
+  persistent `tun0` is never reconfigured. Interface names are limited to
+  `[A-Za-z0-9._-]{1,15}` and `ip(8)` is invoked by absolute path with
+  `Command::arg` (no shell, no PATH lookup).
 - `SIGINT`/`SIGTERM` break the `tokio::select!` loop, drop the TUN descriptor
   (removing the transient interface), and exit 0.
 - Routes: assigning `--tun-cidr` installs only the connected route for the lab
@@ -111,7 +120,8 @@ sudo deploy/debian/lab-node-cleanup.sh --lab-owned   # remove a leftover
 
 | Check | Where | Result |
 |---|---|---|
-| `cargo check` / `cargo test` / `cargo build --release` | Ubuntu 22.04 host, Rust 1.99.1 | 0 warnings, 25 tests pass |
+| `cargo check` / `cargo test` / `cargo build --release` | Ubuntu 22.04 host, Rust 1.99.1 | 0 warnings, 28 tests pass |
+| `tests/lab/netns-ping.sh` (two `ip netns` nodes, veth pair) | Ubuntu 22.04 host | PASS: 3/3 pings each way, TUN gone after shutdown |
 | Ping both directions | Debian 13 (trixie) containers on a private Docker net | 3/3 replies each way |
 | Ping both directions | Debian 12 (bookworm) containers, same topology | 3/3 replies each way |
 | SIGINT / SIGTERM exit 0 + TUN cleanup | Debian 13 containers | observed |

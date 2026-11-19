@@ -71,12 +71,12 @@ laboratório executa o `vpn-engine` com `sudo`.
    ida e volta.
 
 > **Aprender o par não é autenticação.** A verificação é *validação estrutural
-> mais correspondência da IP de origem interna* — em **cada** datagrama, antes
-> e depois de aprender, então o endpoint fixado não pode injetar pacotes que
-> reivindiquem outros IPs virtuais. É validação de entrada, nada mais.
-> Qualquer emissor que alcance a porta UDP de A e falsifique `10.80.1.2` por
-> dentro ainda passaria. O transporte AEAD do marco 4 é o que tornará isso
-> seguro.
+> mais correspondência dos IPs de origem e destino internos* — em **cada**
+> datagrama, antes e depois de aprender, então o endpoint fixado não pode
+> injetar pacotes que reivindiquem outros IPs virtuais nem dirigidos a eles.
+> É validação de entrada, nada mais. Qualquer emissor que alcance a porta UDP
+> de A e falsifique `10.80.1.2` por dentro ainda passaria. O transporte AEAD
+> do marco 4 é o que tornará isso seguro.
 
 ## MTU e buffers reutilizáveis
 
@@ -119,8 +119,9 @@ a partir do endereço do TUN: `10.80.1.0/24 dev tun0`. Duas consequências:
   — nossa interface é transitória e morre com o descritor — e remove uma que
   sobreviva somente se você passar `--lab-owned` *e* ela carregar um endereço
   do laboratório `10.80.0.0/16`, então a interface de outra VPN nunca é
-  removida. Pela mesma razão, o motor se recusa a abrir um nome de TUN que já
-  existe em vez de reconfigurar a interface alheia.
+  removida. Pela mesma razão, o motor pede `IFF_TUN_EXCL` para que o kernel
+  recuse *atomicamente* um nome de TUN que já existe em vez de nos deixar
+  reconfigurar a interface alheia.
 
 ## Lendo o código
 
@@ -135,9 +136,19 @@ let mut req: Ifreq = std::mem::zeroed();
 for (slot, byte) in req.ifr_name.iter_mut().zip(name.bytes()) {
     *slot = byte as libc::c_char;
 }
-req.ifr_flags = IFF_TUN | IFF_NO_PI;
+req.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL;
 if libc::ioctl(fd, TUNSETIFF, &req as *const Ifreq) < 0 {
-    return Err(io::Error::last_os_error());
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EBUSY) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "interface {name:?} already exists (foreign or persistent \
+                 TUN); pick another --tun-name or remove it"
+            ),
+        ));
+    }
+    return Err(err);
 }
 ```
 
@@ -145,14 +156,18 @@ if libc::ioctl(fd, TUNSETIFF, &req as *const Ifreq) < 0 {
   espera para ioctls de interface: um campo de 16 bytes para o nome mais as
   flags. `zeroed()` a preenche com zeros — uma struct de C precisa ser
   totalmente inicializada — e o laço copia nosso nome (`tun0`) byte a byte.
-- `ifr_flags = IFF_TUN | IFF_NO_PI` *é* o pedido: um dispositivo de camada 3,
-  sem cabeçalho extra.
+- `ifr_flags = IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL` *é* o pedido: um
+  dispositivo de camada 3, sem cabeçalho extra, e —`IFF_TUN_EXCL`— "falhe se
+  o nome já estiver tomado" para que o kernel recuse um `tun0` alheio
+  *atomicamente*, sem corrida entre a nossa verificação e a criação.
 - `ioctl(fd, TUNSETIFF, &req)` executa a chamada: `ioctl` significa "I/O
   control", a syscall genérica para comandos específicos de dispositivo, e
   `TUNSETIFF` é o número de comando para "anexar este descritor a uma
   interface TUN com estas flags". Um retorno menor que 0 significa que o
   kernel recusou (sem `CAP_NET_ADMIN`, flags inválidas…) e convertemos o erro
-  do kernel num `Err` do Rust.
+  do kernel num `Err` do Rust — `EBUSY` (nome ocupado, levantado por
+  `IFF_TUN_EXCL`) recebe a mensagem amigável "escolha outro nome"; qualquer
+  outro é propagado.
 
 **2. Decidindo o que conta como pacote** — `src/packet.rs`, `validate_ipv4`
 
@@ -243,7 +258,14 @@ loop {
             }
             if is_server {
                 let peer_vip = cfg.peer_vip.expect("server sets peer_vip");
-                match classify_server_packet(learned_peer, from, source_ip(packet), peer_vip) {
+                match classify_server_packet(
+                    learned_peer,
+                    from,
+                    source_ip(packet),
+                    destination_ip(packet),
+                    peer_vip,
+                    cfg.tun_cidr.addr,
+                ) {
                     // Learn the endpoint only after structural validation
                     // and an inner source-IP match. This pins the peer but
                     // is not authentication: any sender that can reach this
@@ -255,6 +277,11 @@ loop {
                     ServerInbound::Forward => {}
                     ServerInbound::Drop => continue,
                 }
+            } else if destination_ip(packet) != cfg.tun_cidr.addr {
+                // Client: the connected socket already pins the remote,
+                // but the peer must not inject packets addressed to
+                // other tunnel IPs.
+                continue;
             }
             tun.write(packet).await?;
         }
@@ -284,7 +311,14 @@ saída fatal — essas são as únicas duas saídas.
 **4. Aprendendo o único par** — `src/forward.rs`, dentro do braço UDP
 
 ```rust
-match classify_server_packet(learned_peer, from, source_ip(packet), peer_vip) {
+match classify_server_packet(
+    learned_peer,
+    from,
+    source_ip(packet),
+    destination_ip(packet),
+    peer_vip,
+    cfg.tun_cidr.addr,
+) {
     ServerInbound::Learn => {
         learned_peer = Some(from);
         eprintln!("vpn-engine: learned peer endpoint {from}");
@@ -295,10 +329,14 @@ match classify_server_packet(learned_peer, from, source_ip(packet), peer_vip) {
 ```
 
 A decisão é uma função pura (sem E/S) para ser testável em unidade: dado o par
-atualmente fixado, o remetente deste datagrama, o IP de origem *interno* do
-pacote e o `--peer` configurado, ela devolve um de três resultados. `Learn`
-fixa `from` — o endpoint *externo* — só depois de a origem interna conferir;
-`Forward` é "par já fixado, prossiga"; `Drop` descarta todo o resto.
+atualmente fixado, o remetente deste datagrama, os IPs de origem e destino
+*internos* do pacote, o `--peer` configurado e o nosso próprio IP virtual,
+ela devolve um de três resultados. `Learn` fixa `from` — o endpoint *externo*
+— só depois de a origem *e* o destino internos conferirem; `Forward` é "par
+já fixado, prossiga" — e continua exigindo os dois IPs, então o endpoint
+fixado não pode injetar pacotes de nem para outros IPs virtuais; `Drop`
+descarta todo o resto. No cliente o socket já é conectado a `--remote`, então
+só vale a checagem de destino (o `else if` acima).
 
 ## Cada sigla, decodificada
 
@@ -372,14 +410,15 @@ underlay (`172.30.0.11/12` em vez de `192.168.56.11/12`).
 | Encaminhar IPv4 nas duas direções, um par fixo por nó | `src/forward.rs` `run()` | ping nos dois sentidos (verificado abaixo) |
 | Buffers reutilizáveis, MTU limitada | `src/forward.rs` `BUFFER_SIZE`, `MAX_MTU` | `rejects_zero_and_huge_mtu` |
 | Descartar IPv4 malformado | `src/packet.rs` `validate_ipv4`; `src/forward.rs` `recv_datagram` (MSG_TRUNC) | 8 testes unitários: truncado, versão, IHL, comprimento, checksum, tamanho; datagrama excedente falsificado descartado no lab |
-| Aprendizado do par pela IP de origem interna | `src/forward.rs` `classify_server_packet` | 5 casos determinísticos: aprende se confere, descarta origem divergente, encaminha par fixado, descarta par fixado com origem interna divergente, descarta outro endpoint; log `learned peer endpoint` observado |
+| Aprendizado do par pelos IPs de origem/destino internos | `src/forward.rs` `classify_server_packet` | 7 casos determinísticos: aprende se confere, descarta origem divergente, descarta destino divergente, encaminha par fixado, descarta par fixado com origem ou destino interno divergente, descarta outro endpoint; log `learned peer endpoint` observado |
 | Desligamento limpo com SIGINT/SIGTERM | `src/forward.rs` ramos de sinal | saída 0 observada no Debian 13 |
 
 ## Resultados observados vs. esperados
 
 | Verificação | Ambiente | Observado |
 |---|---|---|
-| `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 avisos; 25/25 testes passam |
+| `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 avisos; 28/28 testes passam |
+| `tests/lab/netns-ping.sh` (dois nós `ip netns` sobre um par veth) | Ubuntu 22.04 | PASS: 3/3 pings em cada direção, TUN removido ao encerrar |
 | Ping `10.80.1.1` a partir de B e `10.80.1.2` a partir de A | Contêineres Debian 13 (trixie), rede `hikablue-lab` | 3/3 respostas em cada direção |
 | Mesmos pings | Contêineres Debian 12 (bookworm) | 3/3 respostas em cada direção |
 | SIGINT / `docker stop` (SIGTERM) | Contêineres Debian 13 | código de saída 0; `tun0` some junto com o processo |

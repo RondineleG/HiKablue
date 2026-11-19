@@ -73,12 +73,12 @@ laboratorio ejecuta `vpn-engine` con `sudo`.
    viaje de ida y vuelta.
 
 > **Aprender el par no es autenticación.** La comprobación es *validación
-> estructural más coincidencia de la IP de origen interna* — en **cada**
-> datagrama, antes y después de aprender, así que el endpoint fijado no puede
-> inyectar paquetes que reclamen otras IPs virtuales. Es validación de
-> entrada, nada más. Cualquier emisor que pueda alcanzar el puerto UDP de A y
-> falsificar `10.80.1.2` por dentro aún pasaría. El transporte AEAD del hito 4
-> es lo que hará esto seguro.
+> estructural más coincidencia de las IPs de origen y destino internas* — en
+> **cada** datagrama, antes y después de aprender, así que el endpoint fijado
+> no puede inyectar paquetes que reclamen otras IPs virtuales ni dirigidos a
+> ellas. Es validación de entrada, nada más. Cualquier emisor que pueda
+> alcanzar el puerto UDP de A y falsificar `10.80.1.2` por dentro aún
+> pasaría. El transporte AEAD del hito 4 es lo que hará esto seguro.
 
 ## MTU y búferes reutilizables
 
@@ -125,8 +125,9 @@ consecuencias:
   haya desaparecido —nuestra interfaz es transitoria y muere con su
   descriptor— y elimina una que sobreviva solo si pasas `--lab-owned` *y*
   lleva una dirección del laboratorio `10.80.0.0/16`, así que la interfaz de
-  otra VPN nunca se elimina. Por la misma razón, el motor se niega a abrir un
-  nombre de TUN que ya existe en lugar de reconfigurar la interfaz ajena.
+  otra VPN nunca se elimina. Por la misma razón, el motor pide `IFF_TUN_EXCL`
+  para que el kernel rechace *atómicamente* un nombre de TUN ya existente en
+  vez de dejarnos reconfigurar la interfaz ajena.
 
 ## Leyendo el código
 
@@ -141,9 +142,19 @@ let mut req: Ifreq = std::mem::zeroed();
 for (slot, byte) in req.ifr_name.iter_mut().zip(name.bytes()) {
     *slot = byte as libc::c_char;
 }
-req.ifr_flags = IFF_TUN | IFF_NO_PI;
+req.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL;
 if libc::ioctl(fd, TUNSETIFF, &req as *const Ifreq) < 0 {
-    return Err(io::Error::last_os_error());
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EBUSY) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "interface {name:?} already exists (foreign or persistent \
+                 TUN); pick another --tun-name or remove it"
+            ),
+        ));
+    }
+    return Err(err);
 }
 ```
 
@@ -152,14 +163,18 @@ if libc::ioctl(fd, TUNSETIFF, &req as *const Ifreq) < 0 {
   las banderas. `zeroed()` la rellena con ceros —una estructura de C debe
   quedar totalmente inicializada— y el bucle copia nuestro nombre (`tun0`)
   byte a byte.
-- `ifr_flags = IFF_TUN | IFF_NO_PI` *es* la petición: un dispositivo de capa 3,
-  sin cabecera extra.
+- `ifr_flags = IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL` *es* la petición: un
+  dispositivo de capa 3, sin cabecera extra, y —`IFF_TUN_EXCL`— «falla si el
+  nombre ya está tomado» para que el kernel rechace un `tun0` ajeno
+  *atómicamente*, sin carrera entre nuestra comprobación y la creación.
 - `ioctl(fd, TUNSETIFF, &req)` ejecuta la llamada: `ioctl` significa «I/O
   control», la syscall genérica para comandos específicos de dispositivo, y
   `TUNSETIFF` es el número de comando para «adjuntar este descriptor a una
   interfaz TUN con estas banderas». Un retorno menor que 0 significa que el
   kernel se negó (sin `CAP_NET_ADMIN`, banderas inválidas…) y convertimos el
-  error del kernel en un `Err` de Rust.
+  error del kernel en un `Err` de Rust — `EBUSY` (nombre ocupado, provocado
+  por `IFF_TUN_EXCL`) recibe el mensaje amable «elige otro nombre»; cualquier
+  otro se propaga.
 
 **2. Decidiendo qué cuenta como paquete** — `src/packet.rs`, `validate_ipv4`
 
@@ -250,7 +265,14 @@ loop {
             }
             if is_server {
                 let peer_vip = cfg.peer_vip.expect("server sets peer_vip");
-                match classify_server_packet(learned_peer, from, source_ip(packet), peer_vip) {
+                match classify_server_packet(
+                    learned_peer,
+                    from,
+                    source_ip(packet),
+                    destination_ip(packet),
+                    peer_vip,
+                    cfg.tun_cidr.addr,
+                ) {
                     // Learn the endpoint only after structural validation
                     // and an inner source-IP match. This pins the peer but
                     // is not authentication: any sender that can reach this
@@ -262,6 +284,11 @@ loop {
                     ServerInbound::Forward => {}
                     ServerInbound::Drop => continue,
                 }
+            } else if destination_ip(packet) != cfg.tun_cidr.addr {
+                // Client: the connected socket already pins the remote,
+                // but the peer must not inject packets addressed to
+                // other tunnel IPs.
+                continue;
             }
             tun.write(packet).await?;
         }
@@ -293,7 +320,14 @@ fatal — esas son las únicas dos salidas.
 **4. Aprendiendo el único par** — `src/forward.rs`, dentro del brazo UDP
 
 ```rust
-match classify_server_packet(learned_peer, from, source_ip(packet), peer_vip) {
+match classify_server_packet(
+    learned_peer,
+    from,
+    source_ip(packet),
+    destination_ip(packet),
+    peer_vip,
+    cfg.tun_cidr.addr,
+) {
     ServerInbound::Learn => {
         learned_peer = Some(from);
         eprintln!("vpn-engine: learned peer endpoint {from}");
@@ -304,11 +338,15 @@ match classify_server_packet(learned_peer, from, source_ip(packet), peer_vip) {
 ```
 
 La decisión es una función pura (sin E/S) para que sea probable en tests:
-dado el par actualmente fijado, el remitente de este datagrama, la IP de
-origen *interna* del paquete y el `--peer` configurado, devuelve uno de tres
-resultados. `Learn` fija `from` —el endpoint *externo*— solo después de que la
-fuente interna coincidiera; `Forward` es «par ya fijado, adelante»; `Drop`
-descarta todo lo demás.
+dado el par actualmente fijado, el remitente de este datagrama, las IPs de
+origen y destino *internas* del paquete, el `--peer` configurado y nuestra
+propia IP virtual, devuelve uno de tres resultados. `Learn` fija `from` —el
+endpoint *externo*— solo después de que origen *y* destino internos
+coincidieran; `Forward` es «par ya fijado, adelante» —y sigue exigiendo ambas
+IPs, así que el endpoint fijado no puede inyectar paquetes desde ni hacia
+otras IPs virtuales; `Drop` descarta todo lo demás. En el cliente el socket
+ya está conectado a `--remote`, así que solo aplica la comprobación de
+destino (el `else if` de arriba).
 
 ## Cada sigla, decodificada
 
@@ -317,6 +355,7 @@ descarta todo lo demás.
 | VPN | Virtual Private Network — software que hace que máquinas remotas se comporten como si compartieran una red privada. | Lo que este libro construye, pieza a pieza. |
 | TUN | «network TUNnel»: interfaz virtual de Linux cuyo otro extremo es un descriptor de archivo; pasa paquetes de capa 3 (IP). | El extremo local del túnel. Su hermano TAP pasa tramas Ethernet de capa 2; no lo usamos. |
 | IFF_TUN / IFF_NO_PI | Banderas de la petición al kernel: «un dispositivo TUN» / «no antepongas la cabecera de información de paquete de 4 bytes». | Juntas hacen que cada lectura/escritura sea exactamente un paquete IP crudo. |
+| IFF_TUN_EXCL | Bandera «falla si el nombre de interfaz ya está tomado». | Permite al kernel rechazar un `tun0` ajeno atómicamente — sin carrera entre comprobar y crear. |
 | ioctl | «I/O control» — la syscall de Unix para comandos específicos de dispositivo que no caben en `read`/`write`. | Crea la interfaz mediante el comando `TUNSETIFF`. |
 | fd (file descriptor) | El identificador entero que el kernel da a un proceso por cada archivo o dispositivo abierto. | El extremo de `tun0` y del socket UDP en `vpn-engine` son fds. |
 | /dev/net/tun | El archivo de dispositivo que fabrica descriptores TUN/TAP. | Abrirlo es el primer paso de `Tun::open`. |
@@ -382,14 +421,15 @@ del underlay (`172.30.0.11/12` en lugar de `192.168.56.11/12`).
 | Reenviar IPv4 en ambas direcciones, un par fijo por nodo | `src/forward.rs` `run()` | ping en ambos sentidos (verificado abajo) |
 | Búferes reutilizables, MTU acotada | `src/forward.rs` `BUFFER_SIZE`, `MAX_MTU` | `rejects_zero_and_huge_mtu` |
 | Descartar IPv4 malformado | `src/packet.rs` `validate_ipv4`; `src/forward.rs` `recv_datagram` (MSG_TRUNC) | 8 pruebas unitarias: truncado, versión, IHL, longitud, suma, tamaño; datagrama sobredimensionado falsificado descartado en el lab |
-| Aprendizaje del par por IP de origen interna | `src/forward.rs` `classify_server_packet` | 5 casos deterministas: aprende si coincide, descarta origen divergente, reenvía par fijado, descarta par fijado con origen interna divergente, descarta otro extremo; log `learned peer endpoint` observado |
+| Aprendizaje del par por IPs de origen/destino internas | `src/forward.rs` `classify_server_packet` | 7 casos deterministas: aprende si coincide, descarta origen divergente, descarta destino divergente, reenvía par fijado, descarta par fijado con origen o destino interno divergente, descarta otro extremo; log `learned peer endpoint` observado |
 | Apagado limpio con SIGINT/SIGTERM | `src/forward.rs` ramas de señal | salida 0 observada en Debian 13 |
 
 ## Resultados observados frente a esperados
 
 | Verificación | Entorno | Observado |
 |---|---|---|
-| `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 avisos; 25/25 pruebas pasan |
+| `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 avisos; 28/28 pruebas pasan |
+| `tests/lab/netns-ping.sh` (dos nodos `ip netns` sobre un par veth) | Ubuntu 22.04 | PASS: 3/3 pings en cada dirección, TUN eliminado al cerrar |
 | Ping `10.80.1.1` desde B y `10.80.1.2` desde A | Contenedores Debian 13 (trixie), red `hikablue-lab` | 3/3 respuestas en cada dirección |
 | Mismos pings | Contenedores Debian 12 (bookworm) | 3/3 respuestas en cada dirección |
 | SIGINT / `docker stop` (SIGTERM) | Contenedores Debian 13 | código de salida 0; `tun0` desaparece con el proceso |

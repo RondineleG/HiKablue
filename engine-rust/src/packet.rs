@@ -9,6 +9,7 @@ use std::net::Ipv4Addr;
 pub const MIN_IPV4_HEADER_LEN: usize = 20;
 const IPV4_VERSION: u8 = 4;
 const IPV4_SOURCE_OFFSET: usize = 12;
+const IPV4_DESTINATION_OFFSET: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketError {
@@ -65,6 +66,16 @@ pub fn source_ip(packet: &[u8]) -> Ipv4Addr {
         packet[IPV4_SOURCE_OFFSET + 1],
         packet[IPV4_SOURCE_OFFSET + 2],
         packet[IPV4_SOURCE_OFFSET + 3],
+    )
+}
+
+/// Returns the destination address of a packet that passed [`validate_ipv4`].
+pub fn destination_ip(packet: &[u8]) -> Ipv4Addr {
+    Ipv4Addr::new(
+        packet[IPV4_DESTINATION_OFFSET],
+        packet[IPV4_DESTINATION_OFFSET + 1],
+        packet[IPV4_DESTINATION_OFFSET + 2],
+        packet[IPV4_DESTINATION_OFFSET + 3],
     )
 }
 
@@ -195,6 +206,14 @@ mod tests {
     #[test]
     fn extracts_source_ip() {
         assert_eq!(source_ip(&valid_packet()), Ipv4Addr::new(10, 80, 1, 1));
+    }
+
+    #[test]
+    fn extracts_destination_ip() {
+        assert_eq!(
+            destination_ip(&valid_packet()),
+            Ipv4Addr::new(10, 80, 1, 2)
+        );
     }
 
     #[test]

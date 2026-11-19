@@ -72,11 +72,12 @@ with `sudo`.
    reports one round trip.
 
 > **Peer learning is not authentication.** The check is *structural
-> validation plus an inner-source-IP match* — on **every** datagram, before
-> and after learning, so the pinned endpoint cannot inject packets that
-> claim other virtual IPs. It is input validation, nothing more. Any sender
-> that can reach A's UDP port and spoof `10.80.1.2` inside would still pass.
-> Milestone 4's AEAD transport is what will make this safe.
+> validation plus an inner source- and destination-IP match* — on **every**
+> datagram, before and after learning, so the pinned endpoint cannot inject
+> packets that claim other virtual IPs or are aimed at them. It is input
+> validation, nothing more. Any sender that can reach A's UDP port and spoof
+> `10.80.1.2` inside would still pass. Milestone 4's AEAD transport is what
+> will make this safe.
 
 ## MTU and reusable buffers
 
@@ -118,8 +119,9 @@ the TUN address: `10.80.1.0/24 dev tun0`. Two consequences:
   our interface is transient and dies with its descriptor — and removes a
   surviving one only when you pass `--lab-owned` *and* it carries a
   `10.80.0.0/16` lab address, so another VPN's interface is never removed.
-  For the same reason, the engine refuses to open a TUN name that already
-  exists instead of reconfiguring someone else's interface.
+  For the same reason, the engine asks for `IFF_TUN_EXCL` so the kernel
+  *atomically* refuses a TUN name that already exists instead of letting us
+  reconfigure someone else's interface.
 
 ## Reading the code
 
@@ -134,9 +136,19 @@ let mut req: Ifreq = std::mem::zeroed();
 for (slot, byte) in req.ifr_name.iter_mut().zip(name.bytes()) {
     *slot = byte as libc::c_char;
 }
-req.ifr_flags = IFF_TUN | IFF_NO_PI;
+req.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL;
 if libc::ioctl(fd, TUNSETIFF, &req as *const Ifreq) < 0 {
-    return Err(io::Error::last_os_error());
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EBUSY) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "interface {name:?} already exists (foreign or persistent \
+                 TUN); pick another --tun-name or remove it"
+            ),
+        ));
+    }
+    return Err(err);
 }
 ```
 
@@ -144,13 +156,17 @@ if libc::ioctl(fd, TUNSETIFF, &req as *const Ifreq) < 0 {
   interface ioctls: a 16-byte field for the name plus the flags. `zeroed()`
   fills it with zeros — a C struct must be fully initialized — and the loop
   copies our name (`tun0`) in byte by byte.
-- `ifr_flags = IFF_TUN | IFF_NO_PI` *is* the request: a layer-3 device, no
-  extra header.
+- `ifr_flags = IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL` *is* the request: a
+  layer-3 device, no extra header, and — `IFF_TUN_EXCL` — "fail if the name
+  is taken" so the kernel refuses a foreign `tun0` *atomically*, with no
+  race between our check and the create.
 - `ioctl(fd, TUNSETIFF, &req)` performs the call: `ioctl` means "I/O control",
   the generic syscall for device-specific commands, and `TUNSETIFF` is the
   command number for "attach this descriptor to a TUN interface with these
   flags". A return value below 0 means the kernel refused (no `CAP_NET_ADMIN`,
-  bad flags…) and we turn the kernel's error into a Rust `Err`.
+  bad flags…) and we turn the kernel's error into a Rust `Err` — `EBUSY`
+  (name already taken, raised by `IFF_TUN_EXCL`) gets the friendly
+  "pick another name" message; anything else propagates.
 
 **2. Deciding what counts as a packet** — `src/packet.rs`, `validate_ipv4`
 
@@ -240,7 +256,14 @@ loop {
             }
             if is_server {
                 let peer_vip = cfg.peer_vip.expect("server sets peer_vip");
-                match classify_server_packet(learned_peer, from, source_ip(packet), peer_vip) {
+                match classify_server_packet(
+                    learned_peer,
+                    from,
+                    source_ip(packet),
+                    destination_ip(packet),
+                    peer_vip,
+                    cfg.tun_cidr.addr,
+                ) {
                     // Learn the endpoint only after structural validation
                     // and an inner source-IP match. This pins the peer but
                     // is not authentication: any sender that can reach this
@@ -252,6 +275,11 @@ loop {
                     ServerInbound::Forward => {}
                     ServerInbound::Drop => continue,
                 }
+            } else if destination_ip(packet) != cfg.tun_cidr.addr {
+                // Client: the connected socket already pins the remote,
+                // but the peer must not inject packets addressed to
+                // other tunnel IPs.
+                continue;
             }
             tun.write(packet).await?;
         }
@@ -281,7 +309,14 @@ surviving packet into the TUN. Every `continue` is a dropped datagram; every
 **4. Learning the one peer** — `src/forward.rs`, inside the UDP arm
 
 ```rust
-match classify_server_packet(learned_peer, from, source_ip(packet), peer_vip) {
+match classify_server_packet(
+    learned_peer,
+    from,
+    source_ip(packet),
+    destination_ip(packet),
+    peer_vip,
+    cfg.tun_cidr.addr,
+) {
     ServerInbound::Learn => {
         learned_peer = Some(from);
         eprintln!("vpn-engine: learned peer endpoint {from}");
@@ -292,10 +327,15 @@ match classify_server_packet(learned_peer, from, source_ip(packet), peer_vip) {
 ```
 
 The decision is a pure function (no I/O) so it is unit-testable: given the
-currently pinned peer, this datagram's sender, the packet's *inner* source IP
-and the configured `--peer`, it returns one of three outcomes. `Learn` pins
-`from` — the *outer* endpoint — only after the inner source matched;
-`Forward` is "peer already pinned, proceed"; `Drop` discards everything else.
+currently pinned peer, this datagram's sender, the packet's *inner* source
+and destination IPs, the configured `--peer` and our own virtual IP, it
+returns one of three outcomes. `Learn` pins `from` — the *outer* endpoint —
+only after inner source *and* destination matched; `Forward` is "peer
+already pinned, proceed" — and still requires both IPs to match, so the
+pinned endpoint cannot inject packets from or toward other virtual IPs;
+`Drop` discards everything else. On the client the socket is already
+connected to `--remote`, so only the destination check applies (the
+`else if` above).
 
 ## Every acronym, decoded
 
@@ -304,6 +344,7 @@ and the configured `--peer`, it returns one of three outcomes. `Learn` pins
 | VPN | Virtual Private Network — software that makes remote machines behave as if they shared one private network. | The thing this book builds, piece by piece. |
 | TUN | "network TUNnel": a Linux virtual interface whose other end is a file descriptor; it passes layer-3 (IP) packets. | Our tunnel's local end — where packets enter/leave the program. Its sibling TAP passes layer-2 Ethernet frames; we don't use it. |
 | IFF_TUN / IFF_NO_PI | Flags in the kernel request: "a TUN device" / "don't prepend the 4-byte packet-information header". | Together they make every read/write exactly one raw IP packet. |
+| IFF_TUN_EXCL | Flag meaning "fail if the interface name is already taken". | Lets the kernel refuse a foreign `tun0` atomically — no race between checking and creating. |
 | ioctl | "I/O control" — the Unix syscall for device-specific commands that don't fit `read`/`write`. | Creates the interface via the `TUNSETIFF` command. |
 | fd (file descriptor) | The integer handle the kernel gives a process for an open file or device. | `vpn-engine`'s end of `tun0` and of the UDP socket are both fds. |
 | /dev/net/tun | The device file that manufactures TUN/TAP descriptors. | Opening it is step one of `Tun::open`. |
@@ -369,14 +410,15 @@ addresses (`172.30.0.11/12` instead of `192.168.56.11/12`).
 | Forward IPv4 both directions, fixed peer per node | `src/forward.rs` `run()` | ping both ways (verified, below) |
 | Reusable buffers, bound MTU | `src/forward.rs` `BUFFER_SIZE`, `MAX_MTU` | `rejects_zero_and_huge_mtu` |
 | Drop malformed IPv4 | `src/packet.rs` `validate_ipv4`; `src/forward.rs` `recv_datagram` (MSG_TRUNC) | 8 unit tests: truncation, version, IHL, length, checksum, oversize; forged oversized datagram dropped in lab |
-| Server peer learning by inner source IP | `src/forward.rs` `classify_server_packet` | 5 deterministic cases: learn on match, drop divergent source, forward pinned peer, drop pinned endpoint with divergent inner source, drop other endpoint; observed `learned peer endpoint` log |
+| Server peer learning by inner source/destination IP | `src/forward.rs` `classify_server_packet` | 7 deterministic cases: learn on match, drop divergent source, drop divergent destination, forward pinned peer, drop pinned endpoint with divergent inner source or destination, drop other endpoint; observed `learned peer endpoint` log |
 | Clean shutdown on SIGINT/SIGTERM | `src/forward.rs` signal arms | observed exit 0 on Debian 13 |
 
 ## Observed results vs. expectations
 
 | Check | Environment | Observed |
 |---|---|---|
-| `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 warnings; 25/25 tests pass |
+| `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 warnings; 28/28 tests pass |
+| `tests/lab/netns-ping.sh` (two `ip netns` nodes on a veth pair) | Ubuntu 22.04 | PASS: 3/3 pings each way, TUN gone after shutdown |
 | Ping `10.80.1.1` from B and `10.80.1.2` from A | Debian 13 (trixie) containers, `hikablue-lab` net | 3/3 replies each direction |
 | Same pings | Debian 12 (bookworm) containers | 3/3 replies each direction |
 | SIGINT / `docker stop` (SIGTERM) | Debian 13 containers | exit code 0; `tun0` gone with the process |
