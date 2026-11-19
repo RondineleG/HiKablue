@@ -16,7 +16,9 @@ The specification's milestone table and first-implementation-session text curren
 - Forward raw IPv4 in both directions. The server learns one remote endpoint only after structural validation and a match against the configured peer virtual IP; explain that this does not authenticate the peer. The client uses a connected UDP socket.
 - Reuse fixed 2048-byte buffers and bound the supported MTU accordingly. Reject malformed, truncated, and oversized packets. Handle SIGINT and SIGTERM by releasing the TUN descriptor and exiting successfully after orderly cleanup.
 - Provide idempotent Debian setup and cleanup helpers. Scope IPv4 forwarding, NAT, and mandatory bidirectional TCP MSS clamping to lab configuration and project-owned rules. Default to split tunneling. For opt-in full tunneling, preserve the UDP endpoint's IPv4 host route through the original path and document route checks and restoration.
+  - **Deferred by explicit user scope (Phase 1 delivery, PR #4):** forwarding, NAT, MSS clamping, split/full tunnel selection, and route checks/restoration are postponed to the full-tunnel/app-connectivity phase. The raw point-to-point delivery ships only the idempotent setup/cleanup helpers scoped to project-owned objects.
 - In the engine README, give exact two-node lab commands for ping and an HTTP request to a controlled endpoint. For full tunneling, use a controlled lab endpoint that reports the observed source IP.
+  - **Deferred with the items above:** the HTTP request needs forwarding/NAT and belongs to the full-tunnel phase; the README ships the ping commands.
 
 ## Verification
 

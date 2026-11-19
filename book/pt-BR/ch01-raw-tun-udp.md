@@ -466,3 +466,8 @@ resposta de volta.
 - `r2` — O binário passou de `vpngine` para `vpn-engine`, e o capítulo ganhou o
   passeio *Lendo o código* e o glossário de siglas exigidos por
   `.agc/RULES.md` DOC-03 para este e todos os capítulos futuros.
+- `r3` — O `.agc/IMPLEMENTATION.md` foi emendado para registrar, no próprio
+  checklist, o adiamento de forwarding/NAT/MSS clamping, da seleção split vs.
+  full tunnel e da verificação HTTP para a fase de túnel completo. O texto do
+  capítulo não muda: o adiamento que ele já descrevia agora está escrito onde
+  vive o requisito.

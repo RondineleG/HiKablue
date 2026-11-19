@@ -463,3 +463,8 @@ One `ping -c1` yields two datagrams — request out, reply back.
 - `r2` — The binary was renamed `vpngine` → `vpn-engine`, and the chapter
   gained the *Reading the code* walkthrough and the acronym glossary required
   by `.agc/RULES.md` DOC-03 for this and every later chapter.
+- `r3` — `.agc/IMPLEMENTATION.md` was amended to record, in the checklist
+  itself, the deferral of forwarding/NAT/MSS clamping, split-vs-full tunnel
+  selection, and the HTTP endpoint check to the full-tunnel phase. The chapter
+  text is unchanged: the deferral it already described is now written where
+  the requirement lives.
