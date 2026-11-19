@@ -39,11 +39,13 @@ The custom UDP transport exists **only for isolated lab exercises** with test tr
 
 ## Milestones
 
+Keep this table current: every milestone change set updates the status and links the PR that delivered it.
+
 | # | Milestone | Status |
 |---|---|---|
 | 0 | Foundation — monorepo + toolchains | **Delivered** — Rust, Go, and C# all run real components |
 | 1 | **Telemetry** — metrics socket, Go fetcher, C# heartbeat registry | **Implemented on `feat/telemetry` ([PR #6](https://github.com/RondineleG/HiKablue/pull/6)), merge pending** |
-| 2 | Raw TUN ↔ UDP tunnel | **Delivered** — ping verified both ways on Debian 12/13 (delivered out of order, ahead of milestone 1) |
+| 2 | Raw TUN ↔ UDP tunnel | **Delivered** in [PR #4](https://github.com/RondineleG/HiKablue/pull/4) — ping verified both ways on Debian 12/13 (delivered out of order, ahead of milestone 1) |
 | 3 | Control plane — registration, IP allocation, sessions (gRPC `NodeChannel` + mTLS + PostgreSQL) | Pending |
 | 4 | Protected transport — AEAD/WG, concurrent clients, revocation, key rotation | Pending |
 | 5 | Deployment, recovery, WireGuard profile | Pending |
