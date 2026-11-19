@@ -1,0 +1,47 @@
+name: Rust CI
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'engine-rust/**'
+      - '.github/workflows/rust-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'engine-rust/**'
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: fmt, clippy, test, release build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine-rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-rust
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy (warnings as errors)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo build --release
+        run: cargo build --release
