@@ -207,6 +207,9 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Revision notes
 
+- `r9` — `RegisterAsync` no longer restates name/route/verb: it returns
+  `DescribeLastMapped(app)`, which reads the just-mapped endpoint's own
+  record (`IEndpointNameMetadata`, `RoutePattern`, `IHttpMethodMetadata`).
 - `r8` — `EndpointMappingTests` proves the mapper throws
   `InvalidOperationException` (endpoint name + error) when a registrant
   fails; because `Program.cs` awaits the mapping before `app.Run()`,

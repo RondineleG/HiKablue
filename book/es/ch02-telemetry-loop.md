@@ -216,6 +216,9 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Notas de revisión
 
+- `r9` — `RegisterAsync` ya no repite nombre/ruta/verbo: devuelve
+  `DescribeLastMapped(app)`, que lee el registro del endpoint recién
+  mapeado (`IEndpointNameMetadata`, `RoutePattern`, `IHttpMethodMetadata`).
 - `r8` — `EndpointMappingTests` prueba que el mapeador lanza
   `InvalidOperationException` (nombre del endpoint + error) cuando un
   registrante falla; como `Program.cs` espera el mapeo antes de

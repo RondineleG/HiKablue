@@ -23,7 +23,7 @@ public sealed class GetNodesEndpoint : BaseEndPoint<Node>, IEndpointAsync
             .Produces(StatusCodes.Status200OK);
 
         return Task.FromResult(RequestResult<EndpointRegistrationResponse>.Success(
-            new EndpointRegistrationResponse("GetNodesV1", Route, "GET")));
+            DescribeLastMapped(app)));
     }
 
     private static Task<IResult> HandleAsync(

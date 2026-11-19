@@ -25,7 +25,7 @@ public sealed class HeartbeatEndpoint : BaseEndPoint<Node>, IEndpointAsync
             .Produces(StatusCodes.Status422UnprocessableEntity);
 
         return Task.FromResult(RequestResult<EndpointRegistrationResponse>.Success(
-            new EndpointRegistrationResponse("RegisterNodeHeartbeat", Route, "POST")));
+            DescribeLastMapped(app)));
     }
 
     private static Task<IResult> HandleAsync(

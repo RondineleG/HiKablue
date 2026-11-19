@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using VpnControl.Extensions;
 using VpnControl.Interfaces.Configuration;
@@ -29,5 +30,42 @@ public class EndpointMappingTests
             app.MapRegisteredEndpointsAsync);
         Assert.Contains(nameof(FailingEndpoint), ex.Message);
         Assert.Contains("boom", ex.Message);
+    }
+
+    private sealed class ProbeEndpoint : IEndpointAsync
+    {
+        public Task<RequestResult<EndpointRegistrationResponse>> RegisterAsync(WebApplication app)
+        {
+            app.MapGet("/probe", () => "ok").WithName("Probe");
+            var endpoint = ((IEndpointRouteBuilder)app).DataSources
+                .SelectMany(ds => ds.Endpoints).Last();
+            var route = endpoint is RouteEndpoint re ? re.RoutePattern.RawText ?? "" : "";
+            var methods = endpoint.Metadata.GetMetadata<IHttpMethodMetadata>()?.HttpMethods;
+            var name = endpoint.Metadata.GetMetadata<IEndpointNameMetadata>()?.EndpointName
+                ?? endpoint.DisplayName ?? "";
+            return Task.FromResult(RequestResult<EndpointRegistrationResponse>.Success(
+                new EndpointRegistrationResponse(name, route,
+                    methods is { Count: > 0 } ? string.Join(",", methods) : "")));
+        }
+    }
+
+    [Fact]
+    public async Task RegistrationReportsTheRouteActuallyMapped()
+    {
+        var builder = WebApplication.CreateBuilder();
+        builder.Services.AddScoped<IEndpointAsync>(_ => new ProbeEndpoint());
+        await using var app = builder.Build();
+
+        await app.MapRegisteredEndpointsAsync();
+
+        // The probe reads back the framework's own endpoint record: the name
+        // from WithName, the raw route pattern, and the GET method metadata —
+        // none of it restated by hand.
+        var mapped = ((IEndpointRouteBuilder)app).DataSources
+            .SelectMany(ds => ds.Endpoints).Last() as RouteEndpoint;
+        Assert.NotNull(mapped);
+        Assert.Equal("/probe", mapped.RoutePattern.RawText);
+        Assert.Equal("Probe",
+            mapped.Metadata.GetMetadata<IEndpointNameMetadata>()?.EndpointName);
     }
 }
