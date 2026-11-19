@@ -86,6 +86,7 @@ start_engine() {
     # orphan the engine and `wait` would block on a live child.
     # --metrics-group gives the unprivileged agent's group access to the
     # 0660 socket, per the lab procedure (dedicated group + traversal).
+    rm -f "$PIDFILE" # clear the previous run's PID before we wait on it
     sudo sh -c "echo \$\$ >'$PIDFILE'; exec '$ENGINE' server \
         --bind 127.0.0.1:$ENGINE_PORT --tun-cidr 10.80.9.1/24 --peer 10.80.9.2 \
         --tun-name $TUN --metrics-sock '$SOCK' --metrics-group $(id -gn)" &

@@ -35,9 +35,11 @@ fi
 # --- 2. occupied engine port is respected ---
 # The tun check runs first, so prove the tun is free before blaming the port.
 ip link show "$TUN" >/dev/null 2>&1 && { echo "SKIP: $TUN exists"; exit 0; }
-nc -u -l 127.0.0.1 "$ENGINE_PORT" >/dev/null 2>&1 &
+# Hold the port with a real UDP bind (nc -l exits on stdin EOF).
+python3 -c "import socket,time;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('127.0.0.1',$ENGINE_PORT));time.sleep(60)" &
 HOLD_PID=$!
 sleep 0.5
+kill -0 "$HOLD_PID" || { echo "FAIL: could not occupy :$ENGINE_PORT" >&2; exit 1; }
 OUT=$(tests/lab/telemetry-demo.sh 2>&1) && {
     echo "FAIL: demo ran despite :$ENGINE_PORT being occupied" >&2
     kill "$HOLD_PID"; exit 1
