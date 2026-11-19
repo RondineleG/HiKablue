@@ -214,8 +214,10 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Notas de revisão
 
-- `r8` — `EndpointMappingTests` prova que um registrante que falha
-  aborta a inicialização com o nome do endpoint + erro na exceção.
+- `r8` — `EndpointMappingTests` prova que o mapeador lança
+  `InvalidOperationException` (nome do endpoint + erro) quando um
+  registrante falha; como o `Program.cs` aguarda o mapeamento antes do
+  `app.Run()`, essa exceção aborta a inicialização.
 - `r7` — Registro tipado: `RegisterAsync` agora devolve
   `RequestResult<EndpointRegistrationResponse>` — a rota mapeada como
   objeto tipado — e o `MapRegisteredEndpointsAsync` consome o resultado
