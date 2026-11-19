@@ -16,4 +16,4 @@ The architecture specification is authoritative for protocol and topology. `.agc
 - Preserve learning history across revisions and distinguish observed results from expectations. Report where checks ran and their outcomes; identify unverified behavior and reproduction commands. Report compilation, packet forwarding, and application connectivity separately.
 - Raw UDP is for test traffic in an isolated, authorized lab only. See `.agc/RULES.md` for required safeguards.
 
-Name branches `feature/<slug>` for additive work and `fix/<slug>` for bug fixes. Use Conventional Commits and the Git identity configured for the repository. Do not add AI attribution trailers such as `Generated with ...` or `Co-Authored-By`.
+Name branches `feat/<slug>` for additive work and `fix/<slug>` for bug fixes. Use Conventional Commits and the Git identity configured for the repository. Do not add AI attribution trailers such as `Generated with ...` or `Co-Authored-By`. The pull-request check validates branch names and commit subjects.
