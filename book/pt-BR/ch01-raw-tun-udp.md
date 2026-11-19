@@ -374,6 +374,8 @@ só vale a checagem de destino (o `else if` acima).
 | AEAD | Authenticated Encryption with Associated Data — cifragem + integridade num passo só. | O transporte da Fase 4; sua tag de 16 bytes explica o MTU 1400. |
 | `ping` | Comando que envia ecos ICMP e mostra as respostas. | O teste de aceitação de ponta a ponta do capítulo inteiro. |
 | `ip` | O canivete suíço do iproute2 para endereços, enlaces e rotas. | Ajusta MTU, endereço e estado do enlace em `configure_interface`. |
+| `ip netns` | Subcomando do `ip` que gerencia network namespaces — cópias isoladas da pilha de rede do kernel (interfaces, rotas e sockets próprios). | O `tests/lab/netns-ping.sh` coloca cada nó do lab em seu próprio namespace. |
+| `veth` | Par Ethernet virtual: duas interfaces ligadas que funcionam como as pontas de um cabo virtual entre namespaces. | `hkl-a`/`hkl-b` carregam o tráfico UDP externo do túnel no teste netns. |
 | `--lab-owned` | Flag do `lab-node-cleanup.sh`: "afirmo que este `tun0` pertence ao laboratório". | Sem ela o script só verifica a limpeza — um `tun0` que sobreviva só é removido com a sua palavra explícita mais um endereço `10.80.x`, então uma interface que não é nossa nunca é removida. |
 | `tcpdump` | Captura de pacotes por linha de comando: imprime o que uma interface vê. | Prova os endereços internos vs. externos (`tun0` vs. `eth0`). |
 | `tcpdump -ni` | `-n` = não resolver IPs para nomes; `-i` = capturar nesta interface. | Mantém as capturas cruas (`-ni tun0`, `-ni eth0`). |
@@ -420,6 +422,7 @@ underlay (`172.30.0.11/12` em vez de `192.168.56.11/12`).
 |---|---|---|
 | `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 avisos; 28/28 testes passam |
 | `tests/lab/netns-ping.sh` (dois nós `ip netns` sobre um par veth) | Ubuntu 22.04 | PASS: 3/3 pings em cada direção, TUN removido ao encerrar |
+| Mesmo script com um `hik-lab-a` estranho presente | Ubuntu 22.04 | recusado antes de tocá-lo (LAB-02); o namespace sobreviveu |
 | Ping `10.80.1.1` a partir de B e `10.80.1.2` a partir de A | Contêineres Debian 13 (trixie), rede `hikablue-lab` | 3/3 respostas em cada direção |
 | Mesmos pings | Contêineres Debian 12 (bookworm) | 3/3 respostas em cada direção |
 | SIGINT / `docker stop` (SIGTERM) | Contêineres Debian 13 | código de saída 0; `tun0` some junto com o processo |

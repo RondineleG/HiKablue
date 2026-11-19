@@ -373,6 +373,8 @@ connected to `--remote`, so only the destination check applies (the
 | AEAD | Authenticated Encryption with Associated Data — encryption + integrity in one step. | Phase 4's transport; its 16-byte tag is why the MTU is 1400. |
 | `ping` | Command that sends ICMP echo requests and prints the replies. | The end-to-end acceptance test of the whole chapter. |
 | `ip` | The iproute2 Swiss-army command for addresses, links and routes. | Sets MTU, address and link state in `configure_interface`. |
+| `ip netns` | `ip` subcommand managing network namespaces — isolated copies of the kernel's network stack (own interfaces, routes, sockets). | `tests/lab/netns-ping.sh` puts each lab node in its own namespace. |
+| `veth` | Virtual Ethernet pair: two linked interfaces acting as the ends of a virtual cable between namespaces. | `hkl-a`/`hkl-b` carry the tunnel's outer UDP traffic in the netns test. |
 | `--lab-owned` | `lab-node-cleanup.sh` flag: "I assert this `tun0` belongs to the lab". | Without it the script only verifies cleanup — a `tun0` that survives gets deleted only on your explicit word plus a `10.80.x` address, so an interface that is not ours is never removed. |
 | `tcpdump` | Command-line packet capture: prints packets as an interface sees them. | Proves inner vs. outer addresses (`tun0` vs. `eth0`). |
 | `tcpdump -ni` | `-n` = don't resolve names to hostnames; `-i` = capture on this interface. | Keeps captures raw (`-ni tun0`, `-ni eth0`). |
@@ -419,6 +421,7 @@ addresses (`172.30.0.11/12` instead of `192.168.56.11/12`).
 |---|---|---|
 | `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 warnings; 28/28 tests pass |
 | `tests/lab/netns-ping.sh` (two `ip netns` nodes on a veth pair) | Ubuntu 22.04 | PASS: 3/3 pings each way, TUN gone after shutdown |
+| Same script with a foreign `hik-lab-a` present | Ubuntu 22.04 | refused before touching it (LAB-02); namespace survived |
 | Ping `10.80.1.1` from B and `10.80.1.2` from A | Debian 13 (trixie) containers, `hikablue-lab` net | 3/3 replies each direction |
 | Same pings | Debian 12 (bookworm) containers | 3/3 replies each direction |
 | SIGINT / `docker stop` (SIGTERM) | Debian 13 containers | exit code 0; `tun0` gone with the process |
