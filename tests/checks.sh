@@ -121,9 +121,9 @@ run_step "dotnet: build + test vpn-control" step_dotnet
 
 run_step "book parity (en / es / pt-BR)" bash tests/book/check-parity.sh
 
-# Line-coverage measurement for the three components. Reporting only — the
-# step fails on a broken tool, never on a low percentage.
-run_step "coverage measurement (rust/go/c#, report only)" bash tests/coverage.sh
+# TEST-02: line coverage must stay >= COVERAGE_MIN (default 90%) per
+# component — the step fails below the threshold.
+run_step "coverage >= 90% (rust/go/c#, TEST-02)" bash tests/coverage.sh
 
 if [ "$run_lab" -eq 1 ]; then
     run_step "lab integration: ip netns ping (sudo)" \

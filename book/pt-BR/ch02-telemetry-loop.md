@@ -175,6 +175,14 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   sincronização", que é tudo que contadores independentes precisam.
 - **`CAP_NET_ADMIN`** — capability do Linux necessária para criar/configurar
   uma interface TUN; por isso o motor roda com `sudo` e o agente não.
+- **`// coverage: lab-only begin` / `end`** — marcadores em Rust ao redor do
+  código que só roda com privilégios (abertura do `/dev/net/tun` +
+  `TUNSETIFF`, configuração da interface, bootstrap do `main`);
+  `tests/coverage.sh` exclui essas linhas do total porque quem as exercita
+  são os passos de laboratório, não os testes unitários.
+- **`coverage.sh` / `TEST-02`** — o passo do gate que falha abaixo de 90%
+  de cobertura por componente: linhas de Rust (`llvm-cov`, código de teste
+  excluído), statements de Go (`-coverpkg=./...`), linhas de C# (coverlet).
 - **`ctx` / deadline de contexto** — a forma do Go de carregar "desistir
   depois de T" para chamadas bloqueantes; aqui aplicado a reads/writes do
   socket.
@@ -221,6 +229,11 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Notas de revisão
 
+- `r10` — Gate de cobertura (TEST-02): `tests/coverage.sh` agora falha o
+  gate abaixo de 90% por componente. `run` foi dividido para `run_loop` ser
+  testável com um socketpair como TUN; `main` virou um `run(args)` testável
+  em Go; o guard de inicialização foi para
+  `LoopbackGuard.EnforceLoopbackOnly`.
 - `r9` — `RegisterAsync` não repete mais nome/rota/verbo: devolve
   `DescribeLastMapped(app)`, que lê o registro do endpoint recém-mapeado
   (`IEndpointNameMetadata`, `RoutePattern`, `IHttpMethodMetadata`).

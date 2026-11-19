@@ -11,6 +11,41 @@ namespace VpnControl.Security;
 public static class LoopbackGuard
 {
     /// <summary>
+    /// Refuses to start unless every configured listen URL is loopback:
+    /// checks the resolved "urls" value (config, then ASPNETCORE_URLS, then
+    /// the default) plus every Kestrel:Endpoints Url, which would otherwise
+    /// take precedence over UseUrls and bypass the guard.
+    /// </summary>
+    public static void EnforceLoopbackOnly(IConfiguration configuration)
+    {
+        var urls = configuration["urls"]
+            ?? Environment.GetEnvironmentVariable("ASPNETCORE_URLS")
+            ?? "http://127.0.0.1:5080";
+        if (FindNonLoopback(urls) is { } bad)
+        {
+            throw new InvalidOperationException(
+                $"vpn-control may only bind loopback while heartbeats are unauthenticated; refusing '{bad}'");
+        }
+        foreach (var ep in configuration.GetSection("Kestrel:Endpoints").GetChildren())
+        {
+            if (ep["Url"] is { } epUrl && FindNonLoopback(epUrl) is { } badEp)
+            {
+                throw new InvalidOperationException(
+                    $"vpn-control may only bind loopback while heartbeats are unauthenticated; refusing '{badEp}'");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns the configured semicolon-separated listen URLs.
+    /// </summary>
+    public static string[] ListenUrls(IConfiguration configuration) =>
+        (configuration["urls"]
+            ?? Environment.GetEnvironmentVariable("ASPNETCORE_URLS")
+            ?? "http://127.0.0.1:5080")
+        .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    /// <summary>
     /// Returns the first non-loopback URL in the semicolon-separated list,
     /// or null when every endpoint binds loopback only.
     /// </summary>

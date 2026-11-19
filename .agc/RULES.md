@@ -38,6 +38,12 @@ Add or update focused tests with code changes. Prefer deterministic unit tests f
 
 **Verification:** Record exact commands, environment, and observed outcomes; distinguish compilation, forwarding, and application connectivity.
 
+### TEST-02 — Line coverage ≥ 90% per component
+
+`tests/checks.sh` runs `tests/coverage.sh` as a gate step: it FAILS when any component measures below `COVERAGE_MIN` (default **90%**). Units: Rust counts **lines** in `src/` (instrument-coverage + llvm-cov; `#[cfg(test)]` modules excluded; spans marked `// coverage: lab-only begin`/`end` — code that only runs privileged and is exercised by the lab steps — are excluded and must be justified in the comment), Go counts **statements** with `-coverpkg=./...` so packages without tests count as uncovered, C# counts **lines** (coverlet cobertura; bootstrap glue excluded via `[ExcludeFromCodeCoverage]` where only lab runs reach it). Lower the bar only by editing this rule and the `COVERAGE_MIN` default together — never by bumping the env var on a failing run.
+
+**Verification:** `bash tests/coverage.sh` prints each component's percentage and exits non-zero below the threshold.
+
 ### DOC-01 — Keep code and ebook in sync
 
 Every implementation milestone MUST update the complete English, Spanish, and Brazilian Portuguese editions of **The Journey of my VPN** in the same change set. Keep editable sources in the repository, provide directly readable editions with tables of contents and stable chapter IDs, and make any generated EPUB, PDF, or website reproducible from those sources. Keep chapter IDs, requirements, code/test references, commands, expected results, revision notes, and exercises aligned. Preserve prior reasoning when an approach is superseded; link revisions in all editions and pin historical commands to the release or commit they describe.

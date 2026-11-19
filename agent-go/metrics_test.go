@@ -202,3 +202,142 @@ func TestMismatchedRequestIDIsRejected(t *testing.T) {
 		t.Fatalf("expected request_id mismatch error, got %v", err)
 	}
 }
+
+// ---- coverage tests: FetchMetrics error paths and PollMetrics ----
+
+// scriptedEngine answers each accepted connection by calling respond with
+// the request frame; a nil respond means "close without writing".
+func scriptedEngine(t *testing.T, respond func(req []byte) []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "engine.sock")
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				var n uint32
+				if binary.Read(c, binary.BigEndian, &n) != nil {
+					return
+				}
+				buf := make([]byte, n)
+				if _, err := io.ReadFull(c, buf); err != nil {
+					return
+				}
+				resp := respond(buf)
+				if resp == nil {
+					return
+				}
+				_ = binary.Write(c, binary.BigEndian, uint32(len(resp)))
+				_, _ = c.Write(resp)
+			}(c)
+		}
+	}()
+	return path
+}
+
+func TestDialMissingSocketFails(t *testing.T) {
+	_, err := FetchMetrics(context.Background(), filepath.Join(t.TempDir(), "none.sock"))
+	if err == nil || !strings.Contains(err.Error(), "dial") {
+		t.Fatalf("expected dial error, got %v", err)
+	}
+}
+
+func TestOversizedFrameIsRejected(t *testing.T) {
+	// The server lies about the frame size: the client must reject it
+	// before reading any payload bytes.
+	big := filepath.Join(t.TempDir(), "big.sock")
+	l, err := net.Listen("unix", big)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		c, _ := l.Accept()
+		_ = binary.Write(c, binary.BigEndian, uint32(2<<20))
+		c.Close()
+	}()
+	_, err = FetchMetrics(context.Background(), big)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected oversize rejection, got %v", err)
+	}
+}
+
+func TestGarbageEnvelopeIsRejected(t *testing.T) {
+	path := scriptedEngine(t, func(req []byte) []byte {
+		return []byte("not-json!!!")
+	})
+	_, err := FetchMetrics(context.Background(), path)
+	if err == nil || !strings.Contains(err.Error(), "envelope") {
+		t.Fatalf("expected envelope decode error, got %v", err)
+	}
+}
+
+func TestErrorStatusIsRejected(t *testing.T) {
+	path := scriptedEngine(t, func(req []byte) []byte {
+		var r struct {
+			RequestID string `json:"request_id"`
+		}
+		_ = json.Unmarshal(req, &r)
+		resp, _ := json.Marshal(map[string]any{
+			"request_id": r.RequestID, "version": 1, "status": "error",
+			"error": map[string]any{"code": "unknown_op"},
+		})
+		return resp
+	})
+	_, err := FetchMetrics(context.Background(), path)
+	if err == nil || !strings.Contains(err.Error(), `status "error"`) {
+		t.Fatalf("expected status error, got %v", err)
+	}
+}
+
+func TestUndecodableResultIsRejected(t *testing.T) {
+	path := scriptedEngine(t, func(req []byte) []byte {
+		var r struct {
+			RequestID string `json:"request_id"`
+		}
+		_ = json.Unmarshal(req, &r)
+		resp, _ := json.Marshal(map[string]any{
+			"request_id": r.RequestID, "version": 1, "status": "ok",
+			"result": "not-a-metrics-object",
+		})
+		return resp
+	})
+	_, err := FetchMetrics(context.Background(), path)
+	if err == nil || !strings.Contains(err.Error(), "decode metrics") {
+		t.Fatalf("expected result decode error, got %v", err)
+	}
+}
+
+func TestPollMetricsVisitsUntilCancelled(t *testing.T) {
+	path, stop, _ := fakeEngine(t, false)
+	defer stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	visits := 0
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		PollMetrics(ctx, path, 10*time.Millisecond, func(m Metrics, err error) {
+			visits++
+			if visits == 3 {
+				cancel()
+			}
+		})
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("PollMetrics never returned after cancel")
+	}
+	if visits < 3 {
+		t.Fatalf("only %d visits", visits)
+	}
+}

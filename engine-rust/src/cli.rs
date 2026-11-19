@@ -141,6 +141,13 @@ mod tests {
     }
 
     #[test]
+    fn cidr_zero_prefix_matches_everything() {
+        let net: Ipv4Cidr = "0.0.0.0/0".parse().unwrap();
+        assert!(net.contains(Ipv4Addr::new(1, 2, 3, 4)));
+        assert!(net.contains(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
     fn cidr_contains() {
         let c: Ipv4Cidr = "10.80.1.1/24".parse().unwrap();
         assert!(c.contains(Ipv4Addr::new(10, 80, 1, 2)));

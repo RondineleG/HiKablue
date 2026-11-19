@@ -1,3 +1,5 @@
+// coverage: lab-only begin — process bootstrap glue; exercised end-to-end
+// by the lab demos, not unit tests.
 mod cli;
 mod forward;
 mod metrics;
@@ -40,3 +42,4 @@ async fn main() {
         std::process::exit(1);
     }
 }
+// coverage: lab-only end

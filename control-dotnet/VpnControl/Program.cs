@@ -12,25 +12,8 @@ using VpnControl.Security;
 // any non-loopback URL, however the URL is configured.
 var builder = WebApplication.CreateBuilder(args);
 
-var urls = builder.Configuration["urls"]
-    ?? Environment.GetEnvironmentVariable("ASPNETCORE_URLS")
-    ?? "http://127.0.0.1:5080";
-if (LoopbackGuard.FindNonLoopback(urls) is { } bad)
-{
-    throw new InvalidOperationException(
-        $"vpn-control may only bind loopback while heartbeats are unauthenticated; refusing '{bad}'");
-}
-// Kestrel:Endpoints entries take precedence over UseUrls — guard them too,
-// or a config file could open the unauthenticated API to the network.
-foreach (var ep in builder.Configuration.GetSection("Kestrel:Endpoints").GetChildren())
-{
-    if (ep["Url"] is { } epUrl && LoopbackGuard.FindNonLoopback(epUrl) is { } badEp)
-    {
-        throw new InvalidOperationException(
-            $"vpn-control may only bind loopback while heartbeats are unauthenticated; refusing '{badEp}'");
-    }
-}
-builder.WebHost.UseUrls(urls.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+LoopbackGuard.EnforceLoopbackOnly(builder.Configuration);
+builder.WebHost.UseUrls(LoopbackGuard.ListenUrls(builder.Configuration));
 
 builder.Services.AddVpnControl();
 var app = builder.Build();
@@ -39,4 +22,6 @@ await app.MapRegisteredEndpointsAsync();
 app.Run();
 
 // Lets WebApplicationFactory-style tests reference the implicit Program.
+// Bootstrap glue is exercised end-to-end by the lab, not by unit tests.
+[System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
 public partial class Program { }

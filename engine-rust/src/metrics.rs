@@ -440,4 +440,117 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
         std::fs::remove_file(&path).unwrap();
     }
+
+    // ---- coverage tests: bind/validate_request/handle edges ----
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn missing_version_is_rejected() {
+        let path = spawn_server("cov-mv").await;
+        let res = request(
+            &path,
+            &serde_json::json!({
+                "request_id": "x", "op": "get_metrics", "payload": {}
+            }),
+        )
+        .await;
+        assert_eq!(res["status"], "error");
+        assert_eq!(res["error"]["code"], "missing_field");
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn non_string_op_is_rejected() {
+        let path = spawn_server("cov-op").await;
+        let res = request(
+            &path,
+            &serde_json::json!({
+                "request_id": "x", "version": 1, "op": 42, "payload": {}
+            }),
+        )
+        .await;
+        assert_eq!(res["error"]["code"], "invalid_op");
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn missing_op_is_rejected() {
+        let path = spawn_server("cov-mo").await;
+        let res = request(
+            &path,
+            &serde_json::json!({
+                "request_id": "x", "version": 1, "payload": {}
+            }),
+        )
+        .await;
+        assert_eq!(res["error"]["code"], "missing_field");
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_closes_the_connection() {
+        let path = spawn_server("cov-big").await;
+        let mut s = UnixStream::connect(&path).await.unwrap();
+        s.write_u32(MAX_FRAME + 1).await.unwrap();
+        let mut buf = [0u8; 4];
+        // Server drops the connection instead of reading a giant frame.
+        assert_eq!(s.read(&mut buf).await.unwrap(), 0);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn malformed_json_closes_the_connection() {
+        let path = spawn_server("cov-bad").await;
+        let mut s = UnixStream::connect(&path).await.unwrap();
+        s.write_u32(3).await.unwrap();
+        s.write_all(b"!!!").await.unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(s.read(&mut buf).await.unwrap(), 0);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn bind_recovers_a_stale_socket_file() {
+        let path = sock_path("cov-stale");
+        {
+            let _short = UnixListener::bind(&path).unwrap();
+        }
+        // File remains but nobody answers: bind must take it over.
+        assert!(bind(&path, None).is_ok());
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn bind_creates_missing_parents_and_sets_0660() {
+        let path = sock_path("cov-deep");
+        let path = path
+            .with_file_name(format!("cov-deep-{}", std::process::id()))
+            .join("a/b/metrics.sock");
+        assert!(bind(&path, None).is_ok());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o660);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn bind_with_unknown_group_fails() {
+        let path = sock_path("cov-grp-bad");
+        assert!(bind(&path, Some("hkcov-no-such-group")).is_err());
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn bind_with_own_group_succeeds() {
+        let group = String::from_utf8(
+            std::process::Command::new("id")
+                .arg("-gn")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let path = sock_path("cov-grp-own");
+        assert!(bind(&path, Some(group.trim())).is_ok());
+        cleanup(&path);
+    }
 }

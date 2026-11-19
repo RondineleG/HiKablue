@@ -58,7 +58,7 @@ Deferred inside milestone 2: IPv4 forwarding, NAT, MSS clamping, split/full-tunn
 
 ## Validate locally
 
-One command runs the whole gate — commit conventions, diff safety, shellcheck, Rust fmt + clippy + tests + release build, Go gofmt + vet + tests, .NET build + tests, book parity, a line-coverage report for all three components (`tests/coverage.sh`, report only — no threshold yet), and the lab integration tests (`--lab` also builds and runs the agent binary):
+One command runs the whole gate — commit conventions, diff safety, shellcheck, Rust fmt + clippy + tests + release build, Go gofmt + vet + tests, .NET build + tests, book parity, line coverage ≥ 90% per component (`tests/coverage.sh`, rule TEST-02 — Rust lines in `src/` excluding test code and `// coverage: lab-only` spans, Go statements via `-coverpkg=./...`, C# lines via coverlet), and the lab integration tests (`--lab` also builds and runs the agent binary):
 
 ```bash
 bash tests/checks.sh          # everything except privileged lab steps
