@@ -119,9 +119,13 @@ run_step "book parity (en / es / pt-BR)" bash tests/book/check-parity.sh
 if [ "$run_lab" -eq 1 ]; then
     run_step "lab integration: ip netns ping (sudo)" \
         sudo tests/lab/netns-ping.sh engine-rust/target/release/vpn-engine
+    run_step "lab integration: telemetry demo (end to end)" \
+        tests/lab/telemetry-demo.sh
+    run_step "lab integration: telemetry demo preserves foreign resources (sudo)" \
+        sudo tests/lab/telemetry-demo-safety.test.sh
 else
-    record_skip "lab integration: ip netns ping" \
-        "privileged — run 'tests/checks.sh --lab' or 'sudo tests/lab/netns-ping.sh engine-rust/target/release/vpn-engine' in the authorized lab"
+    record_skip "lab integration: ip netns ping + telemetry demo" \
+        "privileged — run 'tests/checks.sh --lab' in the authorized lab"
 fi
 
 echo

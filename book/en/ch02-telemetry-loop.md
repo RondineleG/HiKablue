@@ -103,8 +103,8 @@ unprivileged — and prints `telemetry-demo: PASS` only after observing:
 
 1. a 5-byte UDP datagram raises `rx_bytes` by exactly five;
 2. `GET /v1/nodes` lists the node carrying those metrics;
-3. after `SIGTERM`, the agent's fetch fails and the next heartbeat reports
-   `engineHealthy: false`;
+3. after `SIGTERM`, the agent's fetch fails and the next heartbeat the
+   script forwards reports `engineHealthy: false`;
 4. after restart, `GetMetrics` answers again.
 
 ## Reading the code
@@ -182,6 +182,15 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   POST until the gRPC channel lands in the control-plane milestone.
 
 ## Revision notes
+
+- `r3` — Review hardening: the socket enforces the envelope contract
+  (required `request_id`/`version`/`op`/`payload`, only version 1, valid
+  JSON error envelopes, responses serialized with serde_json); `bind()`
+  refuses non-socket paths and only removes stale sockets; vpn-control
+  validates its URLs and refuses any non-loopback bind while heartbeats
+  are unauthenticated; the demo keeps all run state in an exclusive
+  per-run directory, refuses occupied ports/interfaces, and documents that
+  the script — not the agent — forwards the heartbeat.
 
 - `r2` — Review fixes: the socket protocol now uses the spec's envelope
   (`request_id`, `version`, `op`, `status`/`result`/`error`, 1 MiB cap) with

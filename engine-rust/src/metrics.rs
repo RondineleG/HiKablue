@@ -16,6 +16,7 @@
 //! full or the peer disconnects.
 
 use std::io;
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -65,19 +66,51 @@ impl Metrics {
             started: Instant::now(),
         })
     }
+}
 
-    fn to_json(&self) -> String {
-        format!(
-            "{{\"rx_bytes\":{},\"rx_pkts\":{},\"tx_bytes\":{},\"tx_pkts\":{},\"dropped_pkts\":{},\"peers\":{},\"uptime_secs\":{}}}",
-            self.rx_bytes.load(Ordering::Relaxed),
-            self.rx_pkts.load(Ordering::Relaxed),
-            self.tx_bytes.load(Ordering::Relaxed),
-            self.tx_pkts.load(Ordering::Relaxed),
-            self.dropped_pkts.load(Ordering::Relaxed),
-            self.peers.load(Ordering::Relaxed),
-            self.started.elapsed().as_secs(),
-        )
+fn metrics_json(m: &Metrics) -> serde_json::Value {
+    serde_json::json!({
+        "rx_bytes": m.rx_bytes.load(Ordering::Relaxed),
+        "rx_pkts": m.rx_pkts.load(Ordering::Relaxed),
+        "tx_bytes": m.tx_bytes.load(Ordering::Relaxed),
+        "tx_pkts": m.tx_pkts.load(Ordering::Relaxed),
+        "dropped_pkts": m.dropped_pkts.load(Ordering::Relaxed),
+        "peers": m.peers.load(Ordering::Relaxed),
+        "uptime_secs": m.started.elapsed().as_secs(),
+    })
+}
+
+fn error_envelope_body(code: &str, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "status": "error",
+        "error": {"code": code, "message": message},
+    })
+}
+
+/// Envelope rules from the socket contract: `request_id`, `version`,
+/// `op` and `payload` are all required; only protocol version 1 exists.
+fn validate_request(req: &serde_json::Value) -> Result<(), (&'static str, String)> {
+    let missing = |f: &str| Err(("missing_field", format!("missing {f}")));
+    if req.get("request_id").is_none() {
+        return missing("request_id");
     }
+    match req.get("version") {
+        None => return missing("version"),
+        Some(serde_json::Value::Number(n)) if n.as_u64() == Some(1) => {}
+        Some(_) => {
+            return Err((
+                "unsupported_version",
+                "only protocol version 1 is supported".to_string(),
+            ));
+        }
+    }
+    if req.get("op").is_none() {
+        return missing("op");
+    }
+    if req.get("payload").is_none() {
+        return missing("payload");
+    }
+    Ok(())
 }
 
 /// Binds the metrics socket and returns its listener so bind failures are
@@ -91,6 +124,21 @@ pub fn bind(path: &Path, group: Option<&str>) -> io::Result<UnixListener> {
         std::fs::create_dir_all(parent)?;
     }
     if path.exists() {
+        // Only a socket file may be ours to take over — anything else
+        // (regular file, directory, FIFO) belongs to someone else and is
+        // never removed, whatever failed before.
+        let is_socket = std::fs::metadata(path)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false);
+        if !is_socket {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{}: exists and is not a socket — refusing to touch it",
+                    path.display()
+                ),
+            ));
+        }
         if std::os::unix::net::UnixStream::connect(path).is_ok() {
             return Err(io::Error::new(
                 io::ErrorKind::AddrInUse,
@@ -100,6 +148,7 @@ pub fn bind(path: &Path, group: Option<&str>) -> io::Result<UnixListener> {
                 ),
             ));
         }
+        // A socket nobody answers is a stale remnant of a crashed run.
         std::fs::remove_file(path)?;
     }
     let listener = UnixListener::bind(path)?;
@@ -163,28 +212,27 @@ async fn handle(metrics: Arc<Metrics>, mut stream: UnixStream) -> io::Result<()>
 
     let request: serde_json::Value = serde_json::from_slice(&frame)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    let request_id = request
-        .get("request_id")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "null".to_string());
-    let (status, body) = match request
-        .get("op")
-        .or_else(|| request.get("method"))
-        .and_then(|m| m.as_str())
-    {
-        Some("GetMetrics") => ("ok", format!("\"result\":{}", metrics.to_json())),
-        Some(other) => (
-            "error",
-            format!("\"error\":{{\"code\":\"unknown_op\",\"message\":\"unknown op {other}\"}}"),
-        ),
-        None => (
-            "error",
-            "\"error\":{\"code\":\"missing_op\",\"message\":\"missing op\"}".to_string(),
-        ),
-    };
 
-    let response =
-        format!("{{\"request_id\":{request_id},\"version\":1,\"status\":\"{status}\",{body}}}");
+    // Envelope contract: every field is required, version must be 1, and
+    // the response echoes request_id verbatim (any JSON type). Errors are
+    // answered with a valid error envelope, not a dropped connection.
+    let body = match validate_request(&request) {
+        Ok(()) => match request["op"].as_str() {
+            Some("GetMetrics") => {
+                serde_json::json!({"status": "ok", "result": metrics_json(&metrics)})
+            }
+            Some(other) => error_envelope_body("unknown_op", &format!("unknown op {other:?}")),
+            None => error_envelope_body("invalid_op", "op must be a string"),
+        },
+        Err((code, message)) => error_envelope_body(code, &message),
+    };
+    let mut response = body;
+    response["request_id"] = request
+        .get("request_id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    response["version"] = serde_json::json!(1);
+    let response = response.to_string();
     let write = async {
         stream.write_u32(response.len() as u32).await?;
         stream.write_all(response.as_bytes()).await
@@ -233,7 +281,7 @@ mod tests {
         let path = spawn_server("basic").await;
         let resp = request(
             &path,
-            &serde_json::json!({"request_id": "req-1", "version": 1, "op": "GetMetrics"}),
+            &serde_json::json!({"request_id": "req-1", "version": 1, "op": "GetMetrics", "payload": {}}),
         )
         .await;
         assert_eq!(resp["request_id"], "req-1");
@@ -253,7 +301,7 @@ mod tests {
         // read_exact(), the response would be a parse error, not metrics.
         let path = spawn_server("split").await;
         let mut c = UnixStream::connect(&path).await.unwrap();
-        let req = serde_json::json!({"request_id": "req-2", "op": "GetMetrics"}).to_string();
+        let req = serde_json::json!({"request_id": "req-2", "version": 1, "op": "GetMetrics", "payload": {}}).to_string();
         let half = req.len() / 2;
         c.write_u32(req.len() as u32).await.unwrap();
         c.write_all(&req.as_bytes()[..half]).await.unwrap();
@@ -271,7 +319,11 @@ mod tests {
     #[tokio::test]
     async fn unknown_op_returns_error_envelope() {
         let path = spawn_server("unknown").await;
-        let resp = request(&path, &serde_json::json!({"op": "NoSuch"})).await;
+        let resp = request(
+            &path,
+            &serde_json::json!({"request_id": "r", "version": 1, "op": "NoSuch", "payload": {}}),
+        )
+        .await;
         assert_eq!(resp["status"], "error");
         assert_eq!(resp["error"]["code"], "unknown_op");
         cleanup(&path);
@@ -286,7 +338,11 @@ mod tests {
         m.rx_bytes.store(5, Ordering::Relaxed);
         m.dropped_pkts.store(1, Ordering::Relaxed);
         tokio::spawn(serve(m, listener));
-        let resp = request(&path, &serde_json::json!({"op": "GetMetrics"})).await;
+        let resp = request(
+            &path,
+            &serde_json::json!({"request_id": "r", "version": 1, "op": "GetMetrics", "payload": {}}),
+        )
+        .await;
         assert_eq!(resp["result"]["rx_bytes"], 5);
         assert_eq!(resp["result"]["dropped_pkts"], 1);
         cleanup(&path);
@@ -302,5 +358,86 @@ mod tests {
         let err = bind(&path, None).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
         cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn unsupported_version_is_rejected() {
+        let path = spawn_server("ver").await;
+        let resp = request(
+            &path,
+            &serde_json::json!({"request_id": "r", "version": 2, "op": "GetMetrics", "payload": {}}),
+        )
+        .await;
+        assert_eq!(resp["status"], "error");
+        assert_eq!(resp["error"]["code"], "unsupported_version");
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn missing_request_id_is_rejected() {
+        let path = spawn_server("noid").await;
+        let resp = request(
+            &path,
+            &serde_json::json!({"version": 1, "op": "GetMetrics", "payload": {}}),
+        )
+        .await;
+        assert_eq!(resp["status"], "error");
+        assert_eq!(resp["error"]["code"], "missing_field");
+        assert_eq!(resp["request_id"], serde_json::Value::Null);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn missing_payload_is_rejected() {
+        let path = spawn_server("nopayload").await;
+        let resp = request(
+            &path,
+            &serde_json::json!({"request_id": "r", "version": 1, "op": "GetMetrics"}),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], "missing_field");
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn special_chars_in_request_id_echo_safely() {
+        // An op name or request_id containing quotes/backslashes must come
+        // back escaped — serde_json builds the envelope, never format!.
+        let path = spawn_server("chars").await;
+        let id = "we\"ird\\id\n";
+        let resp = request(
+            &path,
+            &serde_json::json!({"request_id": id, "version": 1, "op": "GetMetrics", "payload": {}}),
+        )
+        .await;
+        assert_eq!(resp["request_id"], id);
+        assert_eq!(resp["status"], "ok");
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn hostile_op_name_is_escaped_in_error() {
+        let path = spawn_server("evil").await;
+        let op = "x\"}{\"status\":\"ok\",\"result\":{\"rx_bytes\":999";
+        let resp = request(
+            &path,
+            &serde_json::json!({"request_id": "r", "version": 1, "op": op, "payload": {}}),
+        )
+        .await;
+        assert_eq!(resp["status"], "error");
+        assert_eq!(resp["error"]["code"], "unknown_op");
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn bind_refuses_a_regular_file() {
+        // A path that exists but is not a socket belongs to someone else;
+        // bind must refuse and leave it untouched.
+        let path = sock_path("notasock");
+        std::fs::write(&path, b"keep me").unwrap();
+        let err = bind(&path, None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
+        std::fs::remove_file(&path).unwrap();
     }
 }
