@@ -15,7 +15,10 @@
 # Defaults: merge-base of HEAD with origin/main, and HEAD.
 set -euo pipefail
 
-repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+# CHECK_DIFF_SAFETY_ROOT exists only so the self-test can point the scanner at
+# a scratch repository; production runs always use the repo containing this
+# script.
+repo_root="${CHECK_DIFF_SAFETY_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
 cd "$repo_root"
 
 base="${1:-$(git merge-base HEAD origin/main)}"
@@ -60,4 +63,4 @@ if [ "$hits" -eq 1 ]; then
     echo "check-diff-safety: FAIL — forbidden patterns outside lab-owned files" >&2
     exit 1
 fi
-echo "check-diff-safety: PASS"
+echo "check-diff-safety: PASS (pattern scan — a tripwire, not a substitute for review or a full secret scanner)"

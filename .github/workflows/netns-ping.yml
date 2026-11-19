@@ -2,6 +2,8 @@ name: TUN/UDP integration (netns)
 
 on:
   pull_request:
+    # Intentional: only PRs targeting main. Stacked PRs (base != main) are
+    # validated locally with tests/checks.sh until they are retargeted.
     branches: [main]
     paths:
       - 'engine-rust/**'
