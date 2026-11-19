@@ -8,7 +8,7 @@ HiKablue is an educational VPN project for Debian. It follows a packet from a Li
 
 | Component | Role |
 |---|---|
-| Rust · `vpngine` and `vpn-cli` | Forward packets between TUN and UDP in the lab, configure the client tunnel, and expose engine metrics. |
+| Rust · `vpn-engine` and `vpn-cli` | Forward packets between TUN and UDP in the lab, configure the client tunnel, and expose engine metrics. |
 | Go · `vpn-agent` | Configure networking on each exit node, apply peer changes, and report the applied state to the control plane. |
 | C#/.NET · `vpn-control` | Authenticate clients, allocate tunnel IPs, manage session lifecycles, and store desired state in PostgreSQL. |
 
