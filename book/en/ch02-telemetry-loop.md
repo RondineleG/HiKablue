@@ -134,7 +134,9 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   peer cannot make the engine allocate 4 GiB for a "frame".
 - The rejection builds a real error: `io::Error::new` wraps the
   `io::ErrorKind::InvalidData` kind plus a `format!` message naming the
-  offender's size — the caller sees *why* the frame was refused.
+  offender's size. The message reaches the engine's stderr — the socket
+  loop logs the failure and closes the connection without a response frame,
+  so the peer sees an EOF, not this text.
 - `read_exact` is the fix for the partial-read exercise — it keeps reading
   until `frame` is full, no matter how the kernel chunked the bytes.
 - `timeout(IO_DEADLINE, read)` is the fix for the silent-peer exercise: the

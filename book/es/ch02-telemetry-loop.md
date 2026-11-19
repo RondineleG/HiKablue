@@ -139,7 +139,9 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   no puede hacer que el motor aloje 4 GiB por un "frame".
 - El rechazo construye un error real: `io::Error::new` envuelve la
   clase `io::ErrorKind::InvalidData` más un mensaje `format!` que nombra el
-  tamaño del infractor — el llamante ve *por qué* se rechazó el frame.
+  tamaño del infractor. El mensaje llega al stderr del motor — el bucle del
+  socket registra el fallo y cierra la conexión sin frame de respuesta, así
+  que el par ve un EOF, no este texto.
 - `read_exact` es la corrección del ejercicio de lectura parcial — sigue
   leyendo hasta que `frame` esté lleno, sin importar cómo el kernel cortó
   los bytes.
