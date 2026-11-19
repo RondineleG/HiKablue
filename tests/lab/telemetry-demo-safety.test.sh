@@ -37,17 +37,18 @@ fi
 ip link show "$TUN" >/dev/null 2>&1 && { echo "SKIP: $TUN exists"; exit 0; }
 command -v python3 >/dev/null     || { echo "BLOCKED: python3 required to hold the UDP port" >&2; exit 1; }
 # Hold the port with a real UDP bind (nc -l exits on stdin EOF). The bind is
-# confirmed only when the occupier writes its ready file — kill -0 says the
-# process exists, not that bind() completed.
+# confirmed only when the occupier writes its ready marker — kill -0 says the
+# process exists, not that bind() completed. The marker file is the one
+# mktemp created (never deleted and recreated in shared /tmp: no symlink
+# window), and the path goes to Python as argv, not interpolated code.
 READY=$(mktemp)
-rm -f "$READY"
-python3 -c "import socket,time,pathlib;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('127.0.0.1',$ENGINE_PORT));pathlib.Path('$READY').write_text('ready');time.sleep(60)" &
+python3 -c "import socket,time,pathlib,sys;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('127.0.0.1',$ENGINE_PORT));pathlib.Path(sys.argv[1]).write_text('ready');time.sleep(60)" "$READY" &
 HOLD_PID=$!
 for _ in $(seq 10); do
-    [ -f "$READY" ] && break
+    grep -q ready "$READY" 2>/dev/null && break
     sleep 0.5
 done
-[ -f "$READY" ] || { echo "FAIL: port occupier never bound :$ENGINE_PORT" >&2; kill "$HOLD_PID" 2>/dev/null; exit 1; }
+grep -q ready "$READY" 2>/dev/null     || { echo "FAIL: port occupier never bound :$ENGINE_PORT" >&2; kill "$HOLD_PID" 2>/dev/null; rm -f "$READY"; exit 1; }
 kill -0 "$HOLD_PID" || { echo "FAIL: could not occupy :$ENGINE_PORT" >&2; rm -f "$READY"; exit 1; }
 rm -f "$READY"
 OUT=$(tests/lab/telemetry-demo.sh 2>&1) && {
