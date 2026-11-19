@@ -335,6 +335,7 @@ fixa `from` — o endpoint *externo* — só depois de a origem interna conferir
 | AEAD | Authenticated Encryption with Associated Data — cifragem + integridade num passo só. | O transporte da Fase 4; sua tag de 16 bytes explica o MTU 1400. |
 | `ping` | Comando que envia ecos ICMP e mostra as respostas. | O teste de aceitação de ponta a ponta do capítulo inteiro. |
 | `ip` | O canivete suíço do iproute2 para endereços, enlaces e rotas. | Ajusta MTU, endereço e estado do enlace em `configure_interface`. |
+| `--lab-owned` | Flag do `lab-node-cleanup.sh`: "afirmo que este `tun0` pertence ao laboratório". | Sem ela o script só verifica a limpeza — um `tun0` que sobreviva só é removido com a sua palavra explícita mais um endereço `10.80.x`, então uma interface que não é nossa nunca é removida. |
 | `tcpdump` | Captura de pacotes por linha de comando: imprime o que uma interface vê. | Prova os endereços internos vs. externos (`tun0` vs. `eth0`). |
 | `tcpdump -ni` | `-n` = não resolver IPs para nomes; `-i` = capturar nesta interface. | Mantém as capturas cruas (`-ni tun0`, `-ni eth0`). |
 | `tcpdump -c1` | `-c` = parar após N pacotes (aqui, 1). | Captura exatamente um pacote para o exercício. |

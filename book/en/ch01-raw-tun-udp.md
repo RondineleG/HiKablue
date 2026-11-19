@@ -305,7 +305,7 @@ and the configured `--peer`, it returns one of three outcomes. `Learn` pins
 | TUN | "network TUNnel": a Linux virtual interface whose other end is a file descriptor; it passes layer-3 (IP) packets. | Our tunnel's local end — where packets enter/leave the program. Its sibling TAP passes layer-2 Ethernet frames; we don't use it. |
 | IFF_TUN / IFF_NO_PI | Flags in the kernel request: "a TUN device" / "don't prepend the 4-byte packet-information header". | Together they make every read/write exactly one raw IP packet. |
 | ioctl | "I/O control" — the Unix syscall for device-specific commands that don't fit `read`/`write`. | Creates the interface via the `TUNSETIFF` command. |
-| fd (file descriptor) | The integer handle the kernel gives a process for an open file or device. | `vpngine`'s end of `tun0` and of the UDP socket are both fds. |
+| fd (file descriptor) | The integer handle the kernel gives a process for an open file or device. | `vpn-engine`'s end of `tun0` and of the UDP socket are both fds. |
 | /dev/net/tun | The device file that manufactures TUN/TAP descriptors. | Opening it is step one of `Tun::open`. |
 | CAP_NET_ADMIN | The Linux capability that permits network configuration. | Why the engine runs with sudo/root in the lab. |
 | UDP | User Datagram Protocol: one datagram = one message, no connection, no retransmission. | The "wire" between nodes — a VPN does not want TCP re-sending packets that are already stale. |
@@ -332,6 +332,7 @@ and the configured `--peer`, it returns one of three outcomes. `Learn` pins
 | AEAD | Authenticated Encryption with Associated Data — encryption + integrity in one step. | Phase 4's transport; its 16-byte tag is why the MTU is 1400. |
 | `ping` | Command that sends ICMP echo requests and prints the replies. | The end-to-end acceptance test of the whole chapter. |
 | `ip` | The iproute2 Swiss-army command for addresses, links and routes. | Sets MTU, address and link state in `configure_interface`. |
+| `--lab-owned` | `lab-node-cleanup.sh` flag: "I assert this `tun0` belongs to the lab". | Without it the script only verifies cleanup — a `tun0` that survives gets deleted only on your explicit word plus a `10.80.x` address, so an interface that is not ours is never removed. |
 | `tcpdump` | Command-line packet capture: prints packets as an interface sees them. | Proves inner vs. outer addresses (`tun0` vs. `eth0`). |
 | `tcpdump -ni` | `-n` = don't resolve names to hostnames; `-i` = capture on this interface. | Keeps captures raw (`-ni tun0`, `-ni eth0`). |
 | `tcpdump -c1` | `-c` = stop after N packets (here, 1). | Captures exactly one packet for the exercise. |
