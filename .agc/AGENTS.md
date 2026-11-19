@@ -9,7 +9,7 @@ Read the repository-root `AGENTS.md` and `.agc/RULES.md` before working. Choose 
 | Analyze or review | Read `.agc/CODE_REVIEW.md` and the relevant specification. Do not edit unless asked. |
 | Plan a change | Follow `.agc/PLAYBOOK.md`; list scope, acceptance criteria, and checks before implementation. |
 | Implement | Follow `.agc/PLAYBOOK.md`; read the relevant architecture section and acceptance criteria. For the initial TUN task, also follow `.agc/IMPLEMENTATION.md`. |
-| Verify or review a change | Follow `.agc/CODE_REVIEW.md`; report observed and unverified checks separately. |
+| Verify or review a change | Follow `.agc/CODE_REVIEW.md`; for security-sensitive changes also follow `docs/skills/vpn-security-review/SKILL.md`. Report observed and unverified checks separately. |
 | Update the ebook | Follow the ebook rules in `.agc/RULES.md`; keep all three editions aligned in the same milestone change. |
 
 ## Shared rules

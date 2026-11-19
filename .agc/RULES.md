@@ -58,6 +58,6 @@ Treat analysis-only requests as read-only. Keep edits limited to the approved ta
 
 ### GIT-01 — Use repository conventions
 
-Use Conventional Commits and the Git identity configured for the repository. Do not add AI attribution trailers.
+Name branches `feature/<slug>` for additive work and `fix/<slug>` for bug fixes. Use Conventional Commits and the Git identity configured for the repository. Do not add AI attribution trailers.
 
-**Verification:** Review the commit message and configured identity; do not override Git identity per commit.
+**Verification:** Review the branch prefix and commit message; use the configured Git identity without per-commit overrides.
