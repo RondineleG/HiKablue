@@ -35,11 +35,21 @@ fi
 # --- 2. occupied engine port is respected ---
 # The tun check runs first, so prove the tun is free before blaming the port.
 ip link show "$TUN" >/dev/null 2>&1 && { echo "SKIP: $TUN exists"; exit 0; }
-# Hold the port with a real UDP bind (nc -l exits on stdin EOF).
-python3 -c "import socket,time;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('127.0.0.1',$ENGINE_PORT));time.sleep(60)" &
+command -v python3 >/dev/null     || { echo "BLOCKED: python3 required to hold the UDP port" >&2; exit 1; }
+# Hold the port with a real UDP bind (nc -l exits on stdin EOF). The bind is
+# confirmed only when the occupier writes its ready file — kill -0 says the
+# process exists, not that bind() completed.
+READY=$(mktemp)
+rm -f "$READY"
+python3 -c "import socket,time,pathlib;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(('127.0.0.1',$ENGINE_PORT));pathlib.Path('$READY').write_text('ready');time.sleep(60)" &
 HOLD_PID=$!
-sleep 0.5
-kill -0 "$HOLD_PID" || { echo "FAIL: could not occupy :$ENGINE_PORT" >&2; exit 1; }
+for _ in $(seq 10); do
+    [ -f "$READY" ] && break
+    sleep 0.5
+done
+[ -f "$READY" ] || { echo "FAIL: port occupier never bound :$ENGINE_PORT" >&2; kill "$HOLD_PID" 2>/dev/null; exit 1; }
+kill -0 "$HOLD_PID" || { echo "FAIL: could not occupy :$ENGINE_PORT" >&2; rm -f "$READY"; exit 1; }
+rm -f "$READY"
 OUT=$(tests/lab/telemetry-demo.sh 2>&1) && {
     echo "FAIL: demo ran despite :$ENGINE_PORT being occupied" >&2
     kill "$HOLD_PID"; exit 1
