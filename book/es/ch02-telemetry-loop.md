@@ -156,8 +156,8 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 | `engine-rust/src/cli.rs` | Flags `--metrics-sock` (default `/run/vpn/engine.sock`) y `--metrics-group` |
 | `agent-go/metrics.go` | `FetchMetrics(ctx)` — dial, deadline + vigía de cancelación, escribe el envelope, `io.ReadFull` la respuesta, decodifica `result` |
 | `agent-go/cmd/vpn-agent/main.go` | CLI de una llamada que imprime las métricas |
-| `control-dotnet/VpnControl/NodeRegistry.cs` | Tabla de nodos en memoria: `lastSeen` y `engineHealthy` separados |
-| `control-dotnet/VpnControl/Program.cs` | `POST /internal/heartbeats`, `GET /v1/nodes` |
+| `control-dotnet/VpnControl/Services/NodeRegistry.cs` | Tabla de nodos en memoria: `lastSeen` y `engineHealthy` separados |
+| `control-dotnet/VpnControl/Program.cs` | arranque + guardia loopback; `Endpoints/Internal/HeartbeatEndpoint.cs`, `Endpoints/V1/Nodes/GetNodesEndpoint.cs` |
 | `tests/lab/telemetry-demo.sh` | Aceptación extremo a extremo: +5 bytes, caída, recuperación en socket y plano de control; rechaza `hktelem0` preexistente |
 | `io::Error::new` / `InvalidData` / `format!` | Construye un error de E/S de la clase "datos inválidos" con un mensaje formateado — usado para rechazar un frame demasiado grande. |
 

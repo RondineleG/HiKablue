@@ -1,4 +1,6 @@
-using VpnControl;
+using VpnControl.Models;
+using VpnControl.Services;
+using VpnControl.Security;
 using Xunit;
 
 namespace VpnControl.Tests;

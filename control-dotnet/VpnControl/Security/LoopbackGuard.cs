@@ -1,7 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 
-namespace VpnControl;
+namespace VpnControl.Security;
 
 /// <summary>
 /// Milestone 1 safety: the temporary HTTP heartbeat endpoint carries no

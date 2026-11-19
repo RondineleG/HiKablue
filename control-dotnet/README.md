@@ -24,3 +24,17 @@ Run: `dotnet run --project VpnControl` (binds `http://127.0.0.1:5080` by
 default; `urls` config or `ASPNETCORE_URLS` may override but must stay
 loopback) · Test: `dotnet test
 VpnControl.Tests`
+
+Layout (single project, separation by folders):
+
+```
+VpnControl/
+  Program.cs                        bootstrap + loopback guard
+  Endpoints/Internal/               lab-only intake (heartbeat)
+  Endpoints/V1/Nodes/               public node list
+  Extensions/                       MapEndpoints + AddVpnControl
+  Interfaces/Configuration/         IEndpoint contract
+  Models/                           Heartbeat, NodeView records
+  Services/                         NodeRegistry (in-memory)
+  Security/                         LoopbackGuard
+```

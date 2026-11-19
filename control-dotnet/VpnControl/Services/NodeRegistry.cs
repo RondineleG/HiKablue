@@ -1,21 +1,6 @@
-namespace VpnControl;
+using VpnControl.Models;
 
-/// One node-agent heartbeat as the agent POSTs it. Metrics arrive as opaque
-/// counters; the control plane stores them verbatim.
-public sealed record Heartbeat(
-    string NodeId,
-    bool EngineHealthy,
-    IReadOnlyDictionary<string, long>? Metrics = null);
-
-/// What GET /v1/nodes returns for one node. lastSeen and engine health are
-/// tracked separately on purpose: a node that keeps beating while its engine
-/// is down is *reachable but degraded*, not "offline" — the milestone
-/// exercise is exactly about seeing that difference.
-public sealed record NodeView(
-    string NodeId,
-    DateTimeOffset LastSeen,
-    bool EngineHealthy,
-    IReadOnlyDictionary<string, long>? Metrics);
+namespace VpnControl.Services;
 
 /// In-memory node table for the telemetry milestone. PostgreSQL arrives with
 /// the control-plane milestone; until then a ConcurrentDictionary is the
