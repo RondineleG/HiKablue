@@ -22,7 +22,7 @@ Look at the lab we will use:
    ┌──────────────────┐          ┌──────────────────┐
    │  ping            │          │  ping            │
    │  tun0 10.80.1.1  │          │  tun0 10.80.1.2  │
-   │  vpngine server  │          │  vpngine client  │
+   │  vpn-engine server  │          │  vpn-engine client  │
    │  UDP :51820 ◄────┼──UDP/51820──► UDP :51820    │
    └──────────────────┘          └──────────────────┘
       underlay: 192.168.56.0/24 · tunnel: 10.80.1.0/24
@@ -42,21 +42,21 @@ trains your eye to keep them apart.
 
 ## TUN: a network card that ends in a file
 
-`ping` does not talk to `vpngine`. It talks to the kernel's IP stack, which
+`ping` does not talk to `vpn-engine`. It talks to the kernel's IP stack, which
 routes `10.80.1.0/24` out of `tun0`. `tun0` is a **TUN** device: a virtual
 network interface whose other end is a file descriptor, `/dev/net/tun`.
-`vpngine` opens it with `IFF_TUN | IFF_NO_PI` — layer 3, and *no packet
+`vpn-engine` opens it with `IFF_TUN | IFF_NO_PI` — layer 3, and *no packet
 information* header — so every `read()` returns exactly one raw IPv4 packet
 and every `write()` injects exactly one. Creating the interface and applying
-its address and MTU need `CAP_NET_ADMIN`; that is why the lab runs `vpngine`
+its address and MTU need `CAP_NET_ADMIN`; that is why the lab runs `vpn-engine`
 with `sudo`.
 
 ## Tracing one ping, B → A
 
 1. On B, `ping 10.80.1.1` builds an ICMP echo request with source `10.80.1.2`.
-   The kernel's connected route for `10.80.1.0/24` — installed when vpngine set
+   The kernel's connected route for `10.80.1.0/24` — installed when vpn-engine set
    `--tun-cidr 10.80.1.2/24` — sends it to `tun0`, where it becomes bytes on
-   vpngine's descriptor.
+   vpn-engine's descriptor.
 2. B's loop reads the 84-byte IPv4 packet, validates it (version, IHL, total
    length, header checksum, size ≤ MTU), and sends it as the payload of one
    UDP datagram to the fixed remote `192.168.56.11:51820`. The client socket is
@@ -117,6 +117,133 @@ the TUN address: `10.80.1.0/24 dev tun0`. Two consequences:
   For the same reason, the engine refuses to open a TUN name that already
   exists instead of reconfiguring someone else's interface.
 
+## Reading the code
+
+Four excerpts — the exact code shipped in `engine-rust/src/` — with what each
+line does. Rust reaches the kernel through C interfaces here, so the strange
+names (`ifreq`, `ioctl`, `MSG_TRUNC`) are Linux's, not ours.
+
+**1. Asking the kernel for a TUN** — `src/tun.rs`, `Tun::open`
+
+```rust
+let mut req: Ifreq = std::mem::zeroed();
+for (slot, byte) in req.ifr_name.iter_mut().zip(name.bytes()) {
+    *slot = byte as libc::c_char;
+}
+req.ifr_flags = IFF_TUN | IFF_NO_PI;
+if libc::ioctl(fd, TUNSETIFF, &req as *const Ifreq) < 0 {
+    return Err(io::Error::last_os_error());
+}
+```
+
+- `Ifreq` ("interface request") is the fixed-size struct the kernel expects for
+  interface ioctls: a 16-byte field for the name plus the flags. `zeroed()`
+  fills it with zeros — a C struct must be fully initialized — and the loop
+  copies our name (`tun0`) in byte by byte.
+- `ifr_flags = IFF_TUN | IFF_NO_PI` *is* the request: a layer-3 device, no
+  extra header.
+- `ioctl(fd, TUNSETIFF, &req)` performs the call: `ioctl` means "I/O control",
+  the generic syscall for device-specific commands, and `TUNSETIFF` is the
+  command number for "attach this descriptor to a TUN interface with these
+  flags". A return value below 0 means the kernel refused (no `CAP_NET_ADMIN`,
+  bad flags…) and we turn the kernel's error into a Rust `Err`.
+
+**2. Deciding what counts as a packet** — `src/packet.rs`, `validate_ipv4`
+
+```rust
+if packet.len() < MIN_IPV4_HEADER_LEN { return Err(PacketError::Truncated); }
+if packet[0] >> 4 != IPV4_VERSION    { return Err(PacketError::NotIpv4); }
+let ihl = (packet[0] & 0x0f) as usize;
+if ihl < 5 { return Err(PacketError::BadHeaderLength); }
+let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+if total_len < header_len || total_len != packet.len() {
+    return Err(PacketError::BadTotalLength);
+}
+```
+
+Byte 0 of an IPv4 header carries two fields: the **version** in its high nibble
+(`packet[0] >> 4`, must be 4) and the **IHL** in its low nibble (`& 0x0f`), the
+header length in 32-bit words — `5` means 20 bytes. Bytes 2–3 are the *total
+length* in big-endian order (`from_be_bytes` swaps them to host order). The
+kernel hands us whole packets, so `total_len` must equal the number of bytes we
+actually hold; anything else is corruption and dropped. The checksum check that
+follows (see the file) folds the header into 16-bit sums — a valid header
+always sums to `0xffff`.
+
+**3. The heart of the program** — `src/forward.rs`, `run`
+
+```rust
+loop {
+    tokio::select! {
+        biased;
+        result = tokio::signal::ctrl_c() => { result?; break; }
+        _ = sigterm.recv() => { break; }
+        result = tun.read(&mut tun_buf) => { /* validate → send as UDP */ }
+        result = recv_datagram(&socket, &mut udp_buf) => { /* validate → write to TUN */ }
+    }
+}
+```
+
+`tokio::select!` waits on all four branches **at once** in a single thread:
+whichever produces a value first runs its arm, then the loop starts over.
+`biased` makes the branches be tried in order, so a pending `Ctrl+C` or
+SIGTERM always wins over more traffic — the tunnel dies when asked, not when
+idle. `tun_buf` and `udp_buf` are allocated once *before* the loop and reused
+every iteration, which is why no packet ever triggers a heap allocation.
+
+**4. Learning the one peer** — `src/forward.rs`, inside the UDP arm
+
+```rust
+match classify_server_packet(learned_peer, from, source_ip(packet), peer_vip) {
+    ServerInbound::Learn => {
+        learned_peer = Some(from);
+        eprintln!("vpn-engine: learned peer endpoint {from}");
+    }
+    ServerInbound::Forward => {}
+    ServerInbound::Drop => continue,
+}
+```
+
+The decision is a pure function (no I/O) so it is unit-testable: given the
+currently pinned peer, this datagram's sender, the packet's *inner* source IP
+and the configured `--peer`, it returns one of three outcomes. `Learn` pins
+`from` — the *outer* endpoint — only after the inner source matched;
+`Forward` is "peer already pinned, proceed"; `Drop` discards everything else.
+
+## Every acronym, decoded
+
+| Term | What it is | Why it is here |
+|---|---|---|
+| VPN | Virtual Private Network — software that makes remote machines behave as if they shared one private network. | The thing this book builds, piece by piece. |
+| TUN | "network TUNnel": a Linux virtual interface whose other end is a file descriptor; it passes layer-3 (IP) packets. | Our tunnel's local end — where packets enter/leave the program. Its sibling TAP passes layer-2 Ethernet frames; we don't use it. |
+| IFF_TUN / IFF_NO_PI | Flags in the kernel request: "a TUN device" / "don't prepend the 4-byte packet-information header". | Together they make every read/write exactly one raw IP packet. |
+| ioctl | "I/O control" — the Unix syscall for device-specific commands that don't fit `read`/`write`. | Creates the interface via the `TUNSETIFF` command. |
+| fd (file descriptor) | The integer handle the kernel gives a process for an open file or device. | `vpngine`'s end of `tun0` and of the UDP socket are both fds. |
+| /dev/net/tun | The device file that manufactures TUN/TAP descriptors. | Opening it is step one of `Tun::open`. |
+| CAP_NET_ADMIN | The Linux capability that permits network configuration. | Why the engine runs with sudo/root in the lab. |
+| UDP | User Datagram Protocol: one datagram = one message, no connection, no retransmission. | The "wire" between nodes — a VPN does not want TCP re-sending packets that are already stale. |
+| IPv4 | Internet Protocol version 4: the 32-bit-address packet format (`10.80.1.2`). | The format carried *inside* the tunnel in Phase 1. |
+| IHL | Internet Header Length — IPv4 field giving the header size in 32-bit words (5 = 20 bytes). | One of the fields `validate_ipv4` checks. |
+| MTU | Maximum Transmission Unit — largest packet an interface accepts. | Set to 1400 so later headers still fit a 1500-byte path. |
+| CIDR | Classless Inter-Domain Routing — the `A.B.C.D/N` notation; `/24` = first 24 bits fixed. | `10.80.1.1/24` is how you tell the interface its address *and* its subnet. |
+| ICMP | Internet Control Message Protocol — control/error messages inside IP. | `ping` is ICMP echo request + echo reply. |
+| checksum | A small arithmetic digest in the IPv4 header that exposes corruption. | Recomputed on every packet by `header_checksum_ok`. |
+| endpoint | An `IP:port` pair naming a UDP sender or receiver (`192.168.56.12:51820`). | What the server learns and pins as its peer. |
+| peer | The single node on the other side of the tunnel in Phase 1. | `--peer` on the server, `--remote` on the client. |
+| underlay / overlay | The real network carrying the tunnel (`192.168.56.0/24`) / the virtual network inside it (`10.80.1.0/24`). | The inner-vs-outer distinction the chapter trains. |
+| NIC | Network Interface Card — the physical interface (`eth0`). | Carries only the *outer* datagrams; the inner packet is invisible to it. |
+| SIGINT / SIGTERM | Unix signals: `Ctrl+C` and the polite "terminate" request. | Both break `select!` so the transient interface is removed. |
+| Rust | The compiled, memory-safe language the engine is written in. | `engine-rust/` is the first of the project's three implementations. |
+| Tokio | Rust's async runtime: lets one thread wait on socket + TUN + signals without blocking. | Powers the whole forwarding loop. |
+| async / await | Rust syntax for "pause this task until the I/O is ready". | `tun.read(...)`, `socket.send(...)` are async calls. |
+| select! | Tokio macro: wait on several async sources, run the first that is ready. | The loop's structure — two directions plus two shutdown signals. |
+| libc | Rust's bindings to the C standard library. | How we reach `ioctl`, `recvmsg` and other kernel calls. |
+| syscall | A call from a user program into the kernel (`read`, `write`, `ioctl`, `recvmsg`). | Everything interesting the engine does is a handful of syscalls. |
+| recvmsg / MSG_TRUNC | Receive a datagram *with metadata*; `MSG_TRUNC` returns the datagram's true length even when it exceeded our buffer. | Detects oversized datagrams instead of injecting a truncated packet. |
+| ECONNREFUSED | The error a connected UDP socket reports after an ICMP "port unreachable" (peer is down). | Logged and skipped — one dead peer must not kill the tunnel. |
+| NAT | Network Address Translation — rewriting packet addresses. | Deferred: not needed for node-to-node ping. |
+| AEAD | Authenticated Encryption with Associated Data — encryption + integrity in one step. | Phase 4's transport; its 16-byte tag is why the MTU is 1400. |
+
 ## Run it yourself
 
 Build and run the two-node lab exactly as in `engine-rust/README.md`
@@ -156,7 +283,7 @@ addresses (`172.30.0.11/12` instead of `192.168.56.11/12`).
 | `tcpdump` on `eth0` | Debian 13 node A | `172.30.0.12.51820 > 172.30.0.11.51820: UDP, length 84` |
 | `tcpdump` on `tun0` | Debian 13 node A | `10.80.1.2 > 10.80.1.1: ICMP echo request` |
 | Ping while server down, then server returns | Debian 13 node B | client stayed up (per-datagram error dropped); ping recovered |
-| `vpngine` on existing `tun0` | Debian 13 node B | refused (`already exists`); foreign interface untouched |
+| `vpn-engine` on existing `tun0` | Debian 13 node B | refused (`already exists`); foreign interface untouched |
 | 2500-byte datagram, forged header TL=2048 | Debian 13 node A | dropped by real length; nothing on `tun0` |
 
 Everything in the Phase 1 scope was verified. Application-level connectivity
@@ -188,3 +315,6 @@ One `ping -c1` yields two datagrams — request out, reply back.
   When the protected transport (14-byte header + AEAD, spec §6) lands, this
   chapter gains a historical note pointing at the chapter that supersedes raw
   UDP; the commands here will then be pinned to this change set.
+- `r2` — The binary was renamed `vpngine` → `vpn-engine`, and the chapter
+  gained the *Reading the code* walkthrough and the acronym glossary required
+  by `.agc/RULES.md` DOC-03 for this and every later chapter.

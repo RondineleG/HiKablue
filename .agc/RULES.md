@@ -50,6 +50,12 @@ For each implemented requirement, map it to code, tests, and chapter sections. E
 
 **Verification:** Review the milestone's code/test/book map and reproduce documented commands where prerequisites are available.
 
+### DOC-03 — Decode every term and walk the code
+
+The ebook teaches readers who have never seen these APIs. Each chapter MUST include a glossary decoding every acronym, command, flag, syscall, and identifier the chapter introduces — what it is, what it is for, and why it is used there. Each chapter MUST also walk through real excerpts copied from the shipped code (not pseudocode), each followed by a line-by-line explanation. Keep glossary entries and excerpts aligned across the three editions.
+
+**Verification:** Review each chapter for undefined terms and check that quoted excerpts still match the files they cite.
+
 ### CHANGE-01 — Honor the requested scope
 
 Treat analysis-only requests as read-only. Keep edits limited to the approved task; do not add speculative scaffolds, commands, or dependencies. If an additional file is necessary, explain why in the change summary.
