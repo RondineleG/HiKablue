@@ -27,6 +27,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	sock := fs.String("metrics-sock", "/run/vpn/engine.sock", "engine metrics Unix socket")
 	timeout := fs.Duration("timeout", 2*time.Second, "collection deadline")
 	if err := fs.Parse(args); err != nil {
+		// -h/-help prints usage and reports flag.ErrHelp — help is a
+		// successful run, not a bad-argument failure.
+		if err == flag.ErrHelp {
+			return 0
+		}
 		return 2
 	}
 

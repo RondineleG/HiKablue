@@ -260,9 +260,21 @@ func TestOversizedFrameIsRejected(t *testing.T) {
 	}
 	defer l.Close()
 	go func() {
-		c, _ := l.Accept()
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		// Read the request first: if we closed before the client finished
+		// writing, its error would be about the connection, not the size.
+		var n uint32
+		if binary.Read(c, binary.BigEndian, &n) != nil {
+			return
+		}
+		if _, err := io.ReadFull(c, make([]byte, n)); err != nil {
+			return
+		}
 		_ = binary.Write(c, binary.BigEndian, uint32(2<<20))
-		c.Close()
 	}()
 	_, err = FetchMetrics(context.Background(), big)
 	if err == nil || !strings.Contains(err.Error(), "exceeds") {

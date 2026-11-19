@@ -89,3 +89,10 @@ func TestRunRejectsBadFlags(t *testing.T) {
 		t.Fatalf("exit %d", code)
 	}
 }
+
+func TestRunHelpExitsZero(t *testing.T) {
+	var out, stderr bytes.Buffer
+	if code := run([]string{"-h"}, &out, &stderr); code != 0 {
+		t.Fatalf("help exit %d", code)
+	}
+}
