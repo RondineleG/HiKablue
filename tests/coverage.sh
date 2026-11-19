@@ -17,9 +17,9 @@ fail=0
 
 line() { printf '%-10s %s\n' "$1" "$2"; }
 
-below() { # below NAME PCT — records a threshold violation
-  pct_int=${2%.*}
-  if [ "$pct_int" -lt "$COVERAGE_MIN" ]; then
+below() { # below NAME PCT — records a threshold violation (float compare:
+  # the displayed percentage is rounded, the check must use the raw value)
+  if [ "$(awk -v p="$2" -v m="$COVERAGE_MIN" 'BEGIN{print (p+0 < m+0) ? 1 : 0}')" = "1" ]; then
     echo "coverage: $1 ${2}% < ${COVERAGE_MIN}% threshold"
     fail=1
   fi
@@ -33,7 +33,8 @@ mkdir -p "$PROFRAW_DIR"
 # LLVM tools must come from the toolchain that compiled the tests — the
 # profile format can differ across Rust versions.
 SYSROOT="$(cd "$RUST_DIR" && rustc --print sysroot 2>/dev/null)"
-LLVM_BIN="$SYSROOT/lib/rustlib/x86_64-unknown-linux-gnu/bin"
+RUST_HOST="$(cd "$RUST_DIR" && rustc -vV 2>/dev/null | awk '/^host:/{print $2}')"
+LLVM_BIN="$SYSROOT/lib/rustlib/$RUST_HOST/bin"
 LLVM_PROFDATA="${LLVM_PROFDATA:-$LLVM_BIN/llvm-profdata}"
 LLVM_COV="${LLVM_COV:-$LLVM_BIN/llvm-cov}"
 CARGO_BIN="${CARGO_BIN:-cargo}"
@@ -98,7 +99,7 @@ for ln in sys.argv[1].splitlines():
         if cnt > 0:
             covered += 1
 if total:
-    print(f"{covered/total*100:.1f}")
+    print(f"{covered/total*100:.2f}")
 else:
     print("0.0")
 PY
