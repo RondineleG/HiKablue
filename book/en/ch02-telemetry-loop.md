@@ -159,6 +159,9 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 - **`AF_UNIX` socket** — an address family for same-host IPC: the endpoint is
   a filesystem path, not an IP:port.
+- **`AddVpnControl` / `MapEndpoints`** — the two extension methods
+  `Program.cs` calls: one registers `NodeRegistry` in the DI container,
+  the other iterates the `IEndpoint` classes and maps their routes.
 - **`AtomicU64` / relaxed ordering** — a 64-bit counter that can be updated
   concurrently without locks; `Relaxed` means "no extra synchronization
   guarantees", which is all independent counters need.
@@ -166,12 +169,18 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   TUN interface; why the engine runs under `sudo` while the agent does not.
 - **`ctx` / context deadline** — Go's way of carrying "give up after T" into
   blocking calls; here applied to socket reads/writes.
+- **`IEndpoint`** — the small interface every route class implements
+  (`void Map(IEndpointRouteBuilder)`), keeping route registration out of
+  `Program.cs`.
 - **`io.ReadFull` / `read_exact`** — read-until-buffer-full helpers that turn
   stream semantics into frame semantics.
 - **`lastSeen`** — timestamp of the last heartbeat, kept separate from the
   node's last *reported* engine health.
 - **Length-prefixed frame** — message framing that sends the byte count
   before the payload, so the reader knows how much to assemble.
+- **`LoopbackGuard`** — the startup check that inspects the configured
+  URLs and refuses to boot on a non-loopback bind while heartbeats are
+  unauthenticated.
 - **`0660` + dedicated group** — Unix socket mode that gives the owner and
   the named group access; the lab procedure's way of sharing the engine
   socket with the unprivileged agent without opening it to every local user.
@@ -180,9 +189,16 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   result-or-error back, so replies can be matched to requests.
 - **Heartbeat** — a periodic "I'm here" signal from a node; temporary HTTP
   POST until the gRPC channel lands in the control-plane milestone.
+- **`HeartbeatEndpoint` / `GetNodesEndpoint`** — the classes that hold
+  `POST /internal/heartbeats` and `GET /v1/nodes`, so `Program.cs` stays
+  a bootstrap file.
 
 ## Revision notes
 
+- `r4` — Reorganization: `VpnControl` split into MinimalTemplate-style
+  folders (`Endpoints/`, `Extensions/`, `Interfaces/`, `Models/`,
+  `Services/`, `Security/`); `Program.cs` is now only bootstrap and routes
+  live in `IEndpoint` classes; glossary extended for the new terms.
 - `r3` — Review hardening: the socket enforces the envelope contract
   (required `request_id`/`version`/`op`/`payload`, only version 1, valid
   JSON error envelopes, responses serialized with serde_json); `bind()`

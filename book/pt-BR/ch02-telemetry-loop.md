@@ -164,6 +164,9 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 - **Socket `AF_UNIX`** — família de endereços para IPC no mesmo host: o
   endpoint é um caminho no filesystem, não um IP:porta.
+- **`AddVpnControl` / `MapEndpoints`** — os dois métodos de extensão que o
+  `Program.cs` chama: um registra o `NodeRegistry` no contêiner de DI, o
+  outro percorre as classes `IEndpoint` e mapeia suas rotas.
 - **`AtomicU64` / ordenamento relaxed** — contador de 64 bits atualizável
   concorrentemente sem locks; `Relaxed` significa "sem garantias extras de
   sincronização", que é tudo que contadores independentes precisam.
@@ -172,12 +175,18 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 - **`ctx` / deadline de contexto** — a forma do Go de carregar "desistir
   depois de T" para chamadas bloqueantes; aqui aplicado a reads/writes do
   socket.
+- **`IEndpoint`** — a pequena interface que toda classe de rota implementa
+  (`void Map(IEndpointRouteBuilder)`), mantendo o registro de rotas fora
+  do `Program.cs`.
 - **`io.ReadFull` / `read_exact`** — helpers ler-até-encher-o-buffer que
   transformam semântica de stream em semântica de frames.
 - **`lastSeen`** — timestamp do último heartbeat, separado do último
   *estado reportado* do motor do nó.
 - **Frame com prefixo de comprimento** — framing que envia a contagem de
   bytes antes do payload, para o leitor saber quanto montar.
+- **`LoopbackGuard`** — a verificação de arranque que inspeciona as URLs
+  configuradas e recusa subir num bind fora do loopback enquanto os
+  heartbeats não se autenticam.
 - **`0660` + grupo dedicado** — modo do socket Unix que dá acesso ao dono e
   ao grupo nomeado; a forma do procedimento de laboratório de compartilhar o
   socket do motor com o agente sem privilégio sem abri-lo a todo usuário
@@ -187,9 +196,16 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   result-ou-erro na volta, para casar respostas com requisições.
 - **Heartbeat** — sinal periódico "estou aqui" de um nó; POST HTTP
   temporário até o canal gRPC chegar no marco do plano de controle.
+- **`HeartbeatEndpoint` / `GetNodesEndpoint`** — as classes que abrigam
+  `POST /internal/heartbeats` e `GET /v1/nodes`, para o `Program.cs`
+  continuar sendo só bootstrap.
 
 ## Notas de revisão
 
+- `r4` — Reorganização: `VpnControl` dividido em pastas no estilo do
+  MinimalTemplate (`Endpoints/`, `Extensions/`, `Interfaces/`, `Models/`,
+  `Services/`, `Security/`); `Program.cs` virou só bootstrap e as rotas
+  moram em classes `IEndpoint`; glossário ampliado com os novos termos.
 - `r3` — Endurecimento de revisão: o socket exige o contrato do
   envelope (`request_id`/`version`/`op`/`payload` obrigatórios, só versão
   1, envelopes de erro JSON válidos, respostas serializadas com
