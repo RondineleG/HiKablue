@@ -101,12 +101,18 @@ pub async fn run(cfg: Config) -> io::Result<()> {
                 if validate_ipv4(&tun_buf[..n], cfg.mtu as usize).is_err() {
                     continue;
                 }
-                if is_server {
-                    if let Some(peer) = learned_peer {
-                        socket.send_to(&tun_buf[..n], peer).await?;
+                // A failed send for one datagram (e.g. ECONNREFUSED while the
+                // peer is down, or EMSGSIZE) must not kill the tunnel.
+                let sent = if is_server {
+                    match learned_peer {
+                        Some(peer) => Some(socket.send_to(&tun_buf[..n], peer).await),
+                        None => None,
                     }
                 } else {
-                    socket.send(&tun_buf[..n]).await?;
+                    Some(socket.send(&tun_buf[..n]).await)
+                };
+                if let Some(Err(err)) = sent {
+                    eprintln!("vpngine: dropping outbound datagram: {err}");
                 }
             }
             result = async {
@@ -120,7 +126,16 @@ pub async fn run(cfg: Config) -> io::Result<()> {
                     })
                 }
             } => {
-                let (n, from) = result?;
+                // Per-datagram receive errors (e.g. a queued ICMP
+                // port-unreachable on a connected socket) are not fatal
+                // either.
+                let (n, from) = match result {
+                    Ok(v) => v,
+                    Err(err) => {
+                        eprintln!("vpngine: dropping inbound datagram: {err}");
+                        continue;
+                    }
+                };
                 let packet = &udp_buf[..n];
                 if validate_ipv4(packet, cfg.mtu as usize).is_err() {
                     continue;
