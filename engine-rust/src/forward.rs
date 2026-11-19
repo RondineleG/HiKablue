@@ -62,6 +62,35 @@ fn invalid(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
 
+/// What the server does with one inbound UDP datagram: it has already passed
+/// structural validation, so only the endpoint rules remain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerInbound {
+    /// Pin the sender's outer endpoint as the lab peer.
+    Learn,
+    /// Sender is the pinned peer: forward to TUN.
+    Forward,
+    /// Wrong inner source or a different endpoint: drop.
+    Drop,
+}
+
+/// Server-side peer selection, kept pure so it can be tested without sockets.
+/// Learning requires the inner source IP to equal the configured peer virtual
+/// IP — input validation, not authentication.
+fn classify_server_packet(
+    learned: Option<SocketAddr>,
+    from: SocketAddr,
+    inner_src: Ipv4Addr,
+    peer_vip: Ipv4Addr,
+) -> ServerInbound {
+    match learned {
+        None if inner_src == peer_vip => ServerInbound::Learn,
+        None => ServerInbound::Drop,
+        Some(peer) if peer == from => ServerInbound::Forward,
+        Some(_) => ServerInbound::Drop,
+    }
+}
+
 /// Receives one UDP datagram through `recvmsg(MSG_TRUNC)` so the return value
 /// is the *real* datagram length even when it exceeds `buf`. Without this, a
 /// truncated datagram could present a valid-looking prefix and be injected
@@ -185,18 +214,18 @@ pub async fn run(cfg: Config) -> io::Result<()> {
                     continue;
                 }
                 if is_server {
-                    match learned_peer {
+                    let peer_vip = cfg.peer_vip.expect("server sets peer_vip");
+                    match classify_server_packet(learned_peer, from, source_ip(packet), peer_vip) {
                         // Learn the endpoint only after structural validation
                         // and an inner source-IP match. This pins the peer but
                         // is not authentication: any sender that can reach this
                         // UDP port and spoof the peer's virtual IP would pass.
-                        None if source_ip(packet) == cfg.peer_vip.expect("server sets peer_vip") => {
+                        ServerInbound::Learn => {
                             learned_peer = Some(from);
                             eprintln!("vpngine: learned peer endpoint {from}");
                         }
-                        None => continue,
-                        Some(peer) if peer != from => continue,
-                        _ => {}
+                        ServerInbound::Forward => {}
+                        ServerInbound::Drop => continue,
                     }
                 }
                 tun.write(packet).await?;
@@ -251,5 +280,46 @@ mod tests {
         let mut cfg = base();
         cfg.peer_vip = Some(Ipv4Addr::new(10, 80, 1, 1));
         assert!(cfg.validate().is_err());
+    }
+
+    const PEER_VIP: Ipv4Addr = Ipv4Addr::new(10, 80, 1, 2);
+    const OTHER_VIP: Ipv4Addr = Ipv4Addr::new(10, 80, 1, 99);
+    const EP_A: SocketAddr =
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 56, 12), 51820));
+    const EP_B: SocketAddr =
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 56, 77), 9999));
+
+    #[test]
+    fn first_valid_packet_with_peer_source_learns() {
+        assert_eq!(
+            classify_server_packet(None, EP_A, PEER_VIP, PEER_VIP),
+            ServerInbound::Learn
+        );
+    }
+
+    #[test]
+    fn divergent_inner_source_is_dropped_not_learned() {
+        assert_eq!(
+            classify_server_packet(None, EP_A, OTHER_VIP, PEER_VIP),
+            ServerInbound::Drop
+        );
+    }
+
+    #[test]
+    fn learned_endpoint_forwards() {
+        assert_eq!(
+            classify_server_packet(Some(EP_A), EP_A, PEER_VIP, PEER_VIP),
+            ServerInbound::Forward
+        );
+    }
+
+    #[test]
+    fn other_endpoint_after_pinning_is_dropped() {
+        // Even with a spoofed matching inner source, a different outer
+        // endpoint cannot take over the pinned peer.
+        assert_eq!(
+            classify_server_packet(Some(EP_A), EP_B, PEER_VIP, PEER_VIP),
+            ServerInbound::Drop
+        );
     }
 }
