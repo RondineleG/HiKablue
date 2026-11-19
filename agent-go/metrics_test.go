@@ -42,7 +42,10 @@ func fakeEngine(t *testing.T, silent bool) (string, func()) {
 				if _, err := io.ReadFull(c, buf); err != nil {
 					return
 				}
-				resp, _ := json.Marshal(Metrics{RxBytes: 5, RxPkts: 0, Peers: 1})
+				resp, _ := json.Marshal(map[string]any{
+					"request_id": "fake-1", "version": 1, "status": "ok",
+					"result": Metrics{RxBytes: 5, RxPkts: 0, Peers: 1},
+				})
 				_ = binary.Write(c, binary.BigEndian, uint32(len(resp)))
 				_, _ = c.Write(resp)
 			}(c)
@@ -89,7 +92,10 @@ func TestDeadlineStopsSilentEngineAndNextPollRuns(t *testing.T) {
 		_ = binary.Read(c, binary.BigEndian, &n)
 		buf := make([]byte, n)
 		_, _ = io.ReadFull(c, buf)
-		resp, _ := json.Marshal(Metrics{RxBytes: 10})
+		resp, _ := json.Marshal(map[string]any{
+			"request_id": "fake-2", "version": 1, "status": "ok",
+			"result": Metrics{RxBytes: 10},
+		})
 		_ = binary.Write(c, binary.BigEndian, uint32(len(resp)))
 		_, _ = c.Write(resp)
 		c.Close()

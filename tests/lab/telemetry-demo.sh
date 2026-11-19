@@ -22,11 +22,19 @@ CTRL_URL=http://127.0.0.1:5080
 ENGINE=engine-rust/target/release/vpn-engine
 AGENT=/tmp/hk-vpn-agent
 
+# LAB-02: refuse to disturb anything we did not create — a preexisting
+# $TUN interface or socket path belongs to someone else.
+if ip link show "$TUN" >/dev/null 2>&1; then
+    echo "$TUN already exists; refusing to proceed" >&2
+    exit 1
+fi
+CREATED_TUN=0
+
 cleanup() {
     [ -n "${ENGINE_PID:-}" ] && sudo kill "$ENGINE_PID" 2>/dev/null || true
     [ -n "${CTRL_PID:-}" ] && kill "$CTRL_PID" 2>/dev/null || true
     sudo rm -f "$SOCK" /tmp/hk-telemetry.pid
-    sudo ip link del "$TUN" 2>/dev/null || true
+    [ "$CREATED_TUN" -eq 1 ] && sudo ip link del "$TUN" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -38,12 +46,15 @@ dotnet build control-dotnet/VpnControl/VpnControl.csproj -v q --nologo >/dev/nul
 start_engine() {
     # Write the engine's own PID before exec: killing the sudo wrapper would
     # orphan the engine and `wait` would block on a live child.
+    # --metrics-group gives the unprivileged agent's group access to the
+    # 0660 socket, per the lab procedure (dedicated group + traversal).
     sudo sh -c "echo \$\$ >/tmp/hk-telemetry.pid; exec '$ENGINE' server \
         --bind 127.0.0.1:51821 --tun-cidr 10.80.9.1/24 --peer 10.80.9.2 \
-        --tun-name $TUN --metrics-sock $SOCK" &
+        --tun-name $TUN --metrics-sock $SOCK --metrics-group $(id -gn)" &
     sleep 1
     ENGINE_PID=$(sudo cat /tmp/hk-telemetry.pid)
     sudo kill -0 "$ENGINE_PID" || { echo "engine failed to start" >&2; exit 1; }
+    CREATED_TUN=1
 }
 
 echo "== control plane up (unprivileged)"
@@ -91,5 +102,13 @@ M=$("$AGENT" --metrics-sock "$SOCK")
 echo "  $M"
 echo "$M" | grep -q '"rx_bytes"' || exit 1
 echo "  OBSERVED: GetMetrics answers again"
+
+# Recovery must also reach the control plane: the next heartbeat reports the
+# engine healthy again and GET /v1/nodes reflects it.
+curl -sf -X POST "$CTRL_URL/internal/heartbeats" -H 'Content-Type: application/json' \
+    -d '{"nodeId":"lab-node","engineHealthy":true}' >/dev/null
+curl -sf "$CTRL_URL/v1/nodes" | grep -q '"engineHealthy":true' \
+    || { echo "control plane did not reflect recovery" >&2; exit 1; }
+echo "  OBSERVED: node reports engineHealthy=true again"
 
 echo "telemetry-demo: PASS"

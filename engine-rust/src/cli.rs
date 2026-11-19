@@ -70,6 +70,10 @@ pub struct CommonArgs {
     /// Unix socket that answers GetMetrics (u32-BE length + JSON frame).
     #[arg(long, default_value = DEFAULT_METRICS_SOCK)]
     pub metrics_sock: std::path::PathBuf,
+    /// Group that owns the metrics socket file (mode is 0660); without it
+    /// the socket is limited to the engine's own user/group.
+    #[arg(long)]
+    pub metrics_group: Option<String>,
 }
 
 /// An IPv4 address with prefix length, written `A.B.C.D/N`.

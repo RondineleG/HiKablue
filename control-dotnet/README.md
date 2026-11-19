@@ -13,4 +13,4 @@ intake, deliberately in-memory:
 - `VpnControl.Tests` — xunit tests for the registry, including the
   missing-heartbeat-vs-engine-failure exercise.
 
-Run: `dotnet run --project VpnControl` · Test: `dotnet test`
+Run: `dotnet run --project VpnControl` · Test: `dotnet test VpnControl.Tests`

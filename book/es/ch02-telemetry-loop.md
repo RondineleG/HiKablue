@@ -42,21 +42,27 @@ El protocolo en `/run/vpn/engine.sock` es lo mínimo que funciona:
 
 ```text
 ┌───────────────┬──────────────────────┐
-│ u32 big-endian│  UTF-8 JSON payload  │
-│ frame length  │  {"method":"..."}    │
+│ u32 big-endian│  UTF-8 JSON envelope │
+│ frame length  │  (max 1 MiB)         │
 └───────────────┴──────────────────────┘
 ```
 
-La petición `{"method":"GetMetrics"}` recibe un frame de respuesta con los
-contadores:
+La petición `{"request_id":"req-1","version":1,"op":"GetMetrics"}` recibe un
+envelope: el `request_id` eco, un `status` de `"ok"` más un objeto `result`,
+o `"error"` más `code`/`message`:
 
 ```json
-{"rx_bytes":5,"rx_pkts":0,"tx_bytes":0,"tx_pkts":0,"dropped_pkts":2,"peers":0,"uptime_secs":2}
+{"request_id":"req-1","version":1,"status":"ok",
+ "result":{"rx_bytes":5,"rx_pkts":0,"tx_bytes":0,"tx_pkts":0,
+           "dropped_pkts":2,"peers":0,"uptime_secs":2}}
 ```
 
 `AddPeer`/`RemovePeer`/`SyncPeers` comparten este socket en la especificación;
-solo `GetMetrics` está implementado ahora — los métodos desconocidos reciben
-un frame de error.
+solo `GetMetrics` está implementado ahora — las ops desconocidas reciben un
+envelope `status:"error"`. El archivo del socket es modo `0660` compartido
+por un grupo dedicado (`--metrics-group`), así usuarios fuera de él no
+conectan, y cada conexión tiene deadline de lectura/escritura más un tope de
+conexiones simultáneas — un par mudo u ocioso no agota descriptores.
 
 ## Ejercicio — por qué una lectura puede devolver medio frame
 
@@ -69,10 +75,11 @@ La solución siempre tiene la misma forma: leer la longitud de 4 bytes con
 `tokio::io::AsyncReadExt::read_exact` itera hasta llenar el buffer; en Go,
 `io.ReadFull` hace lo mismo.
 
-`engine-rust/src/metrics.rs` reproduce la patología en un test: escribe la
-respuesta en dos mitades con una pausa entre ellas, y el cliente igual arma
-el frame completo. Borra los `read_exact` y el test falla exactamente como
-fallaría producción.
+`engine-rust/src/metrics.rs` reproduce la patología en un test: el cliente
+escribe la *petición* en dos mitades con una pausa entre ellas, y el motor
+igual arma el frame completo antes de responder. Borra los `read_exact` y el
+test falla exactamente como fallaría producción. La respuesta sale con
+`write_u32` + `write_all`, y ambas direcciones tienen deadline.
 
 ## Ejercicio — el motor silencioso
 
@@ -106,16 +113,41 @@ sin privilegios — e imprime `telemetry-demo: PASS` solo después de observar:
 
 ## Leyendo el código
 
+El corazón de `handle()` son tres líneas que parecen triviales y cargan toda
+la lección de este capítulo:
+
+```rust
+let read = async {
+    let len = stream.read_u32().await?;          // 4-byte length, big-endian
+    if len > MAX_FRAME { /* reject before alloc */ }
+    let mut frame = vec![0u8; len as usize];     // allocate exactly the frame
+    stream.read_exact(&mut frame).await?;        // loop until it is complete
+    Ok::<_, io::Error>(frame)
+};
+let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
+```
+
+- `read_u32` es `AsyncReadExt::read_u32`: cuatro bytes, big-endian — la
+  misma longitud que el agente Go escribe con
+  `binary.Write(..., binary.BigEndian, ...)`.
+- La longitud se verifica *antes* de que `vec!` aloje: un par hostil o roto
+  no puede hacer que el motor aloje 4 GiB por un "frame".
+- `read_exact` es la corrección del ejercicio de lectura parcial — sigue
+  leyendo hasta que `frame` esté lleno, sin importar cómo el kernel cortó
+  los bytes.
+- `timeout(IO_DEADLINE, read)` es la corrección del par silencioso: a los 10
+  segundos del último byte, la conexión se cae y su descriptor se libera.
+
 | Archivo | Qué hace |
 |---|---|
-| `engine-rust/src/metrics.rs` | Contadores `Metrics` + `serve()` — listener Unix, tarea por conexión, framing `read_u32`/`read_exact`/`write_u32`/`write_all` |
-| `engine-rust/src/forward.rs` | Incrementa contadores en cada ruta del dataplane (`rx_bytes` antes de validar, `dropped_pkts` en cada descarte) |
-| `engine-rust/src/cli.rs` | Flag `--metrics-sock`, default `/run/vpn/engine.sock` |
-| `agent-go/metrics.go` | `FetchMetrics(ctx)` — dial, deadline, escribe petición, `io.ReadFull` la respuesta, decodifica JSON |
+| `engine-rust/src/metrics.rs` | Contadores `Metrics`; `bind()` prueba ruta obsoleta-vs-viva, fija `0660`, `chgrp` opcional; `serve()` acepta con tope de conexiones + deadline de I/O; `handle()` lee/escribe el envelope JSON |
+| `engine-rust/src/forward.rs` | Incrementa contadores en cada ruta del dataplane (`rx_bytes` antes de validar, `dropped_pkts` en cada descarte — incluso paquetes salientes sin par aprendido); el cliente fija `peers=1` para su remoto |
+| `engine-rust/src/cli.rs` | Flags `--metrics-sock` (default `/run/vpn/engine.sock`) y `--metrics-group` |
+| `agent-go/metrics.go` | `FetchMetrics(ctx)` — dial, deadline + vigía de cancelación, escribe el envelope, `io.ReadFull` la respuesta, decodifica `result` |
 | `agent-go/cmd/vpn-agent/main.go` | CLI de una llamada que imprime las métricas |
 | `control-dotnet/VpnControl/NodeRegistry.cs` | Tabla de nodos en memoria: `lastSeen` y `engineHealthy` separados |
 | `control-dotnet/VpnControl/Program.cs` | `POST /internal/heartbeats`, `GET /v1/nodes` |
-| `tests/lab/telemetry-demo.sh` | Aceptación extremo a extremo: +5 bytes, caída, recuperación |
+| `tests/lab/telemetry-demo.sh` | Aceptación extremo a extremo: +5 bytes, caída, recuperación en socket y plano de control; rechaza `hktelem0` preexistente |
 
 ## Glosario
 
@@ -135,11 +167,26 @@ sin privilegios — e imprime `telemetry-demo: PASS` solo después de observar:
   *estado reportado* del motor del nodo.
 - **Frame con prefijo de longitud** — framing que envía el conteo de bytes
   antes del payload, para que el lector sepa cuánto ensamblar.
+- **`0660` + grupo dedicado** — modo del socket Unix que da acceso al dueño
+  y al grupo nombrado; la forma del procedimiento de laboratorio de
+  compartir el socket del motor con el agente sin privilegios sin abrirlo a
+  todo usuario local.
+- **`request_id` / envelope** — el envoltorio JSON que exige el contrato del
+  socket: id de petición + versión + op + payload de ida, id eco + status +
+  result-o-error de vuelta, para casar respuestas con peticiones.
 - **Heartbeat** — señal periódica "estoy aquí" de un nodo; HTTP POST
   temporal hasta que el canal gRPC llegue en el hito del plano de control.
 
 ## Notas de revisión
 
+- `r2` — Correcciones de revisión: el protocolo del socket ahora usa el
+  envelope de la especificación (`request_id`, `version`, `op`,
+  `status`/`result`/`error`, tope de 1 MiB) con deadlines de lectura/
+  escritura y tope de conexiones; el archivo del socket es `0660` con
+  `--metrics-group`; `bind()` rechaza reemplazar un socket vivo; el cliente
+  reporta su par configurado; los descartes sin par cuentan; el demo
+  verifica la recuperación del plano de control y rechaza interfaces
+  preexistentes.
 - `r1` — Telemetría del hito 1 entregada y verificada por
   `tests/lab/telemetry-demo.sh` en un laboratorio local: contador +5 bytes,
   caída y recuperación observadas; 32 tests de Rust, 3 de Go, 3 de C#. El

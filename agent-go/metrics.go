@@ -47,7 +47,24 @@ func FetchMetrics(ctx context.Context, socketPath string) (Metrics, error) {
 		}
 	}
 
-	req, err := json.Marshal(map[string]string{"method": "GetMetrics"})
+	// Cancelling ctx mid-read does not unblock a blocking socket call by
+	// itself; this watcher forces the deadline to expire immediately.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.SetDeadline(time.Now())
+		case <-done:
+		}
+	}()
+
+	reqID := fmt.Sprintf("vpn-agent-%d", time.Now().UnixNano())
+	req, err := json.Marshal(map[string]any{
+		"request_id": reqID,
+		"version":    1,
+		"op":         "GetMetrics",
+	})
 	if err != nil {
 		return m, err
 	}
@@ -69,7 +86,20 @@ func FetchMetrics(ctx context.Context, socketPath string) (Metrics, error) {
 	if _, err := io.ReadFull(conn, frame); err != nil {
 		return m, fmt.Errorf("read frame: %w", err)
 	}
-	if err := json.Unmarshal(frame, &m); err != nil {
+
+	var env struct {
+		RequestID string           `json:"request_id"`
+		Status    string           `json:"status"`
+		Result    json.RawMessage  `json:"result"`
+		Error     *json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(frame, &env); err != nil {
+		return m, fmt.Errorf("decode response envelope: %w", err)
+	}
+	if env.Status != "ok" {
+		return m, fmt.Errorf("engine returned status %q: %s", env.Status, string(frame))
+	}
+	if err := json.Unmarshal(env.Result, &m); err != nil {
 		return m, fmt.Errorf("decode metrics: %w", err)
 	}
 	return m, nil

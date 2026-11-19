@@ -35,6 +35,7 @@ pub struct Config {
     pub mtu: u16,
     /// Unix socket that answers GetMetrics.
     pub metrics_sock: PathBuf,
+    pub metrics_group: Option<String>,
 }
 
 impl Config {
@@ -190,7 +191,16 @@ pub async fn run(cfg: Config) -> io::Result<()> {
     // relaxed atomics, and the Unix listener is a separate task that never
     // blocks the packet path.
     let metrics = Metrics::new();
-    let metrics_task = tokio::spawn(metrics::serve(metrics.clone(), cfg.metrics_sock.clone()));
+    // Bind eagerly so a socket failure (path in use, bad group, permissions)
+    // fails the engine with a clear error instead of leaving a dead task
+    // that nobody observes.
+    let metrics_listener = metrics::bind(&cfg.metrics_sock, cfg.metrics_group.as_deref())?;
+    let metrics_task = tokio::spawn(metrics::serve(metrics.clone(), metrics_listener));
+    if !is_server {
+        // The client connects to its configured remote: it has one peer
+        // from the start, no learning needed.
+        metrics.peers.store(1, Ordering::Relaxed);
+    }
 
     let mut learned_peer: Option<SocketAddr> = None;
     let mut tun_buf = [0u8; BUFFER_SIZE];
@@ -232,7 +242,11 @@ pub async fn run(cfg: Config) -> io::Result<()> {
                         metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
                         eprintln!("vpn-engine: dropping outbound datagram: {err}");
                     }
-                    None => {}
+                    None => {
+                        // Server before learning the peer: the packet has
+                        // nowhere to go — count it as dropped.
+                        metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             result = recv_datagram(&socket, &mut udp_buf) => {
@@ -316,6 +330,7 @@ mod tests {
             tun_name: "tun0".into(),
             mtu: 1400,
             metrics_sock: PathBuf::from("/tmp/test.sock"),
+            metrics_group: None,
         }
     }
 
