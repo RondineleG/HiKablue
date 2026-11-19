@@ -5,8 +5,10 @@
 //! configurable inner MTU to what those buffers can carry.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::os::unix::io::AsRawFd;
 
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::signal::unix::{signal, SignalKind};
 
@@ -58,6 +60,54 @@ impl Config {
 
 fn invalid(msg: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
+
+/// Receives one UDP datagram through `recvmsg(MSG_TRUNC)` so the return value
+/// is the *real* datagram length even when it exceeds `buf`. Without this, a
+/// truncated datagram could present a valid-looking prefix and be injected
+/// into TUN as if it were a complete packet.
+async fn recv_datagram(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    socket
+        .async_io(Interest::READABLE, || unsafe {
+            let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+            let mut iov = libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            };
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_name = &mut storage as *mut _ as *mut libc::c_void;
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            let n = libc::recvmsg(socket.as_raw_fd(), &mut msg, libc::MSG_TRUNC);
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let addr = sockaddr_to_std(&storage, msg.msg_namelen)?;
+            Ok((n as usize, addr))
+        })
+        .await
+}
+
+fn sockaddr_to_std(
+    storage: &libc::sockaddr_storage,
+    len: libc::socklen_t,
+) -> io::Result<SocketAddr> {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            if (len as usize) < std::mem::size_of::<libc::sockaddr_in>() {
+                return Err(invalid("short IPv4 source address".into()));
+            }
+            let sa: &libc::sockaddr_in = unsafe { &*(storage as *const _ as *const _) };
+            // s_addr is stored in network byte order; from_be yields the
+            // host-order value Ipv4Addr::from expects.
+            let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+            Ok(SocketAddr::V4(SocketAddrV4::new(ip, u16::from_be(
+                sa.sin_port,
+            ))))
+        }
+        family => Err(invalid(format!("unexpected address family {family}"))),
+    }
 }
 
 /// Runs the forwarding loop until SIGINT or SIGTERM. The TUN descriptor is
@@ -115,28 +165,22 @@ pub async fn run(cfg: Config) -> io::Result<()> {
                     eprintln!("vpngine: dropping outbound datagram: {err}");
                 }
             }
-            result = async {
-                if is_server {
-                    socket.recv_from(&mut udp_buf).await
-                } else {
-                    // The connected socket already filters to the remote
-                    // endpoint; report it as the source for uniformity.
-                    socket.recv(&mut udp_buf).await.map(|n| {
-                        (n, cfg.remote.expect("client mode sets remote"))
-                    })
-                }
-            } => {
+            result = recv_datagram(&socket, &mut udp_buf) => {
                 // Per-datagram receive errors (e.g. a queued ICMP
                 // port-unreachable on a connected socket) are not fatal
                 // either.
-                let (n, from) = match result {
+                let (real_len, from) = match result {
                     Ok(v) => v,
                     Err(err) => {
                         eprintln!("vpngine: dropping inbound datagram: {err}");
                         continue;
                     }
                 };
-                let packet = &udp_buf[..n];
+                if real_len > udp_buf.len() {
+                    // Truncated by the buffer: not a complete packet.
+                    continue;
+                }
+                let packet = &udp_buf[..real_len];
                 if validate_ipv4(packet, cfg.mtu as usize).is_err() {
                     continue;
                 }
