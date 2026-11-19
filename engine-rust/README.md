@@ -86,6 +86,13 @@ sudo deploy/debian/lab-node-cleanup.sh
   `--mtu` is bounded to 2048 and defaults to 1400.
 - Packets failing structural validation (truncated, wrong version, bad IHL,
   total-length mismatch, bad header checksum, oversized) are dropped.
+  Inbound datagrams are read via `recvmsg(MSG_TRUNC)`, so a datagram larger
+  than the buffer is detected by its real length and dropped rather than
+  injected as a truncated packet.
+- Per-datagram UDP errors (e.g. `ECONNREFUSED` while the peer is down) are
+  logged and dropped — they do not tear down the tunnel.
+- The engine refuses to reuse a TUN interface that already exists, so a
+  foreign or persistent `tun0` is never reconfigured.
 - `SIGINT`/`SIGTERM` break the `tokio::select!` loop, drop the TUN descriptor
   (removing the transient interface), and exit 0.
 - Routes: assigning `--tun-cidr` installs only the connected route for the lab
@@ -95,10 +102,13 @@ sudo deploy/debian/lab-node-cleanup.sh
 
 | Check | Where | Result |
 |---|---|---|
-| `cargo check` / `cargo test` / `cargo build --release` | Ubuntu 22.04 host, Rust 1.99.1 | 0 warnings, 19 tests pass |
+| `cargo check` / `cargo test` / `cargo build --release` | Ubuntu 22.04 host, Rust 1.99.1 | 0 warnings, 23 tests pass |
 | Ping both directions | Debian 13 (trixie) containers on a private Docker net | 3/3 replies each way |
 | Ping both directions | Debian 12 (bookworm) containers, same topology | 3/3 replies each way |
 | SIGINT / SIGTERM exit 0 + TUN cleanup | Debian 13 containers | observed |
+| Client survives ping while server is down, then recovers | Debian 13 containers | process stayed up, ping resumed |
+| Second `vpngine` on an existing `tun0` | Debian 13 container | refused with `already exists` error |
+| 2500-byte datagram, forged IPv4 header TL=2048 | Debian 13 server | dropped; nothing written to `tun0` |
 
 Unverified: nothing in the Phase 1 scope. The documented VM walkthrough is
 equivalent to the container lab; only the underlay addresses differ.

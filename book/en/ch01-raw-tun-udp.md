@@ -81,7 +81,12 @@ with `sudo`.
 The TUN MTU defaults to 1400 (`--mtu`), bounded by the two fixed 2048-byte
 buffers the loop allocates once and reuses forever — the hot path does no
 per-packet heap allocation. A malformed read can never exceed the buffer, and
-any packet larger than the configured MTU is dropped as oversized. Why 1400 and
+any packet larger than the configured MTU is dropped as oversized. Two
+hardening details live here: inbound datagrams are read with
+`recvmsg(MSG_TRUNC)` so a datagram bigger than the buffer is detected by its
+real length and dropped instead of injected as a truncated prefix, and a
+per-datagram send/receive error (like `ECONNREFUSED` while the peer is down)
+is logged and skipped rather than tearing down the tunnel. Why 1400 and
 not the usual 1500? Later phases wrap the inner packet in a 14-byte header and
 a 16-byte AEAD tag inside the outer UDP/IPv4 datagram (58 bytes of overhead);
 1400 was chosen so the *outer* packet still fits a 1500-byte path. Phase 1 omits
@@ -107,8 +112,10 @@ the TUN address: `10.80.1.0/24 dev tun0`. Two consequences:
 - `SIGINT` and `SIGTERM` break the `tokio::select!` loop, drop the TUN
   descriptor — which removes the transient interface — and exit with code 0.
 - `deploy/debian/lab-node-setup.sh` prepares a node idempotently (tun module,
-  `iproute2`); `lab-node-cleanup.sh` deletes a lingering `tun0` if one survives.
-  Neither touches any other route or rule.
+  `iproute2`); `lab-node-cleanup.sh` deletes `tun0` only when it carries a
+  `10.80.0.0/16` lab address, so another VPN's interface is never removed.
+  For the same reason, the engine refuses to open a TUN name that already
+  exists instead of reconfiguring someone else's interface.
 
 ## Run it yourself
 
@@ -134,20 +141,23 @@ addresses (`172.30.0.11/12` instead of `192.168.56.11/12`).
 | `IFF_TUN \| IFF_NO_PI`, configurable CIDR, MTU 1400 default | `src/tun.rs` (`Tun::open`, `configure_interface`) | `ip addr show tun0` in lab; CLI defaults in `src/cli.rs` |
 | Forward IPv4 both directions, fixed peer per node | `src/forward.rs` `run()` | ping both ways (verified, below) |
 | Reusable buffers, bound MTU | `src/forward.rs` `BUFFER_SIZE`, `MAX_MTU` | `rejects_zero_and_huge_mtu` |
-| Drop malformed IPv4 | `src/packet.rs` `validate_ipv4` | 8 unit tests: truncation, version, IHL, length, checksum, oversize |
-| Server peer learning by inner source IP | `src/forward.rs` learn branch | `peer_must_be_inside_tunnel_subnet`; observed `learned peer endpoint` log |
+| Drop malformed IPv4 | `src/packet.rs` `validate_ipv4`; `src/forward.rs` `recv_datagram` (MSG_TRUNC) | 8 unit tests: truncation, version, IHL, length, checksum, oversize; forged oversized datagram dropped in lab |
+| Server peer learning by inner source IP | `src/forward.rs` `classify_server_packet` | 4 deterministic cases: learn on match, drop divergent source, forward pinned peer, drop other endpoint; observed `learned peer endpoint` log |
 | Clean shutdown on SIGINT/SIGTERM | `src/forward.rs` signal arms | observed exit 0 on Debian 13 |
 
 ## Observed results vs. expectations
 
 | Check | Environment | Observed |
 |---|---|---|
-| `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 warnings; 19/19 tests pass |
+| `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 warnings; 23/23 tests pass |
 | Ping `10.80.1.1` from B and `10.80.1.2` from A | Debian 13 (trixie) containers, `hikablue-lab` net | 3/3 replies each direction |
 | Same pings | Debian 12 (bookworm) containers | 3/3 replies each direction |
 | SIGINT / `docker stop` (SIGTERM) | Debian 13 containers | exit code 0; `tun0` gone with the process |
 | `tcpdump` on `eth0` | Debian 13 node A | `172.30.0.12.51820 > 172.30.0.11.51820: UDP, length 84` |
 | `tcpdump` on `tun0` | Debian 13 node A | `10.80.1.2 > 10.80.1.1: ICMP echo request` |
+| Ping while server down, then server returns | Debian 13 node B | client stayed up (per-datagram error dropped); ping recovered |
+| `vpngine` on existing `tun0` | Debian 13 node B | refused (`already exists`); foreign interface untouched |
+| 2500-byte datagram, forged header TL=2048 | Debian 13 node A | dropped by real length; nothing on `tun0` |
 
 Everything in the Phase 1 scope was verified. Application-level connectivity
 through a node (e.g. HTTP to a third host) is *out of scope*: it needs

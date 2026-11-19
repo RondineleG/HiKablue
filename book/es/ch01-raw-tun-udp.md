@@ -84,7 +84,12 @@ La MTU del TUN es 1400 por defecto (`--mtu`), limitada por los dos búferes
 fijos de 2048 bytes que el bucle asigna una vez y reutiliza siempre: la ruta
 crítica no hace asignaciones de memoria por paquete. Una lectura malformada
 jamás puede exceder el búfer, y cualquier paquete mayor que la MTU configurada
-se descarta como sobredimensionado. ¿Por qué 1400 y no los habituales 1500?
+se descarta como sobredimensionado. Aquí viven dos detalles de robustez: los
+datagramas entrantes se leen con `recvmsg(MSG_TRUNC)`, de modo que un datagrama
+mayor que el búfer se detecta por su longitud real y se descarta en vez de
+inyectarse como prefijo truncado, y un error de envío/recepción por datagrama
+(como `ECONNREFUSED` mientras el par está caído) se registra y se omite en vez
+de derribar el túnel. ¿Por qué 1400 y no los habituales 1500?
 Fases posteriores envolverán el paquete interno en una cabecera de 14 bytes y
 una etiqueta AEAD de 16 bytes dentro del datagrama UDP/IPv4 externo (58 bytes
 de sobrecarga); se eligió 1400 para que el paquete *externo* siga cabiendo en
@@ -114,8 +119,10 @@ consecuencias:
 - `SIGINT` y `SIGTERM` rompen el bucle `tokio::select!`, liberan el descriptor
   del TUN — lo que elimina la interfaz transitoria — y salen con código 0.
 - `deploy/debian/lab-node-setup.sh` prepara un nodo de forma idempotente
-  (módulo tun, `iproute2`); `lab-node-cleanup.sh` borra un `tun0` persistente
-  si llegara a quedar. Ninguno toca otra ruta ni otra regla.
+  (módulo tun, `iproute2`); `lab-node-cleanup.sh` borra `tun0` solo cuando
+  lleva una dirección del laboratorio `10.80.0.0/16`, así que la interfaz de
+  otra VPN nunca se elimina. Por la misma razón, el motor se niega a abrir un
+  nombre de TUN que ya existe en lugar de reconfigurar la interfaz ajena.
 
 ## Ejecútalo tú mismo
 
@@ -141,20 +148,23 @@ del underlay (`172.30.0.11/12` en lugar de `192.168.56.11/12`).
 | `IFF_TUN \| IFF_NO_PI`, CIDR configurable, MTU 1400 por defecto | `src/tun.rs` (`Tun::open`, `configure_interface`) | `ip addr show tun0` en el lab; valores por defecto en `src/cli.rs` |
 | Reenviar IPv4 en ambas direcciones, un par fijo por nodo | `src/forward.rs` `run()` | ping en ambos sentidos (verificado abajo) |
 | Búferes reutilizables, MTU acotada | `src/forward.rs` `BUFFER_SIZE`, `MAX_MTU` | `rejects_zero_and_huge_mtu` |
-| Descartar IPv4 malformado | `src/packet.rs` `validate_ipv4` | 8 pruebas unitarias: truncado, versión, IHL, longitud, suma, tamaño |
-| Aprendizaje del par por IP de origen interna | `src/forward.rs` rama de aprendizaje | `peer_must_be_inside_tunnel_subnet`; log `learned peer endpoint` observado |
+| Descartar IPv4 malformado | `src/packet.rs` `validate_ipv4`; `src/forward.rs` `recv_datagram` (MSG_TRUNC) | 8 pruebas unitarias: truncado, versión, IHL, longitud, suma, tamaño; datagrama sobredimensionado falsificado descartado en el lab |
+| Aprendizaje del par por IP de origen interna | `src/forward.rs` `classify_server_packet` | 4 casos deterministas: aprende si coincide, descarta origen divergente, reenvía par fijado, descarta otro extremo; log `learned peer endpoint` observado |
 | Apagado limpio con SIGINT/SIGTERM | `src/forward.rs` ramas de señal | salida 0 observada en Debian 13 |
 
 ## Resultados observados frente a esperados
 
 | Verificación | Entorno | Observado |
 |---|---|---|
-| `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 avisos; 19/19 pruebas pasan |
+| `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 avisos; 23/23 pruebas pasan |
 | Ping `10.80.1.1` desde B y `10.80.1.2` desde A | Contenedores Debian 13 (trixie), red `hikablue-lab` | 3/3 respuestas en cada dirección |
 | Mismos pings | Contenedores Debian 12 (bookworm) | 3/3 respuestas en cada dirección |
 | SIGINT / `docker stop` (SIGTERM) | Contenedores Debian 13 | código de salida 0; `tun0` desaparece con el proceso |
 | `tcpdump` en `eth0` | Nodo A Debian 13 | `172.30.0.12.51820 > 172.30.0.11.51820: UDP, length 84` |
 | `tcpdump` en `tun0` | Nodo A Debian 13 | `10.80.1.2 > 10.80.1.1: ICMP echo request` |
+| Ping con servidor caído y luego recuperado | Nodo B Debian 13 | cliente siguió vivo (error por datagrama descartado); el ping se recuperó |
+| `vpngine` sobre un `tun0` existente | Nodo B Debian 13 | rechazado (`already exists`); interfaz ajena intacta |
+| Datagrama de 2500 bytes, cabecera falsificada TL=2048 | Nodo A Debian 13 | descartado por longitud real; nada en `tun0` |
 
 Todo lo del alcance de la Fase 1 quedó verificado. La conectividad a nivel de
 aplicación a través de un nodo (p. ej. HTTP a un tercer equipo) está *fuera de
