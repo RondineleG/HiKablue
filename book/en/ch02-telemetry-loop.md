@@ -199,6 +199,10 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   result pattern the API is organized around: a use case returns a
   `RequestResult<T>` carrying an `EResultStatus`, and `BaseEndPoint` maps
   that status to the HTTP code plus the `ApiResponse` envelope.
+- **`HttpContractTests` / `WebApplicationFactory`** — the HTTP contract
+  suite and the host it runs on: `WebApplicationFactory` hosts the real
+  app in memory (no port, no Kestrel), so tests exercise routing and
+  JSON exactly as a client sees them.
 
 ## Revision notes
 
@@ -206,14 +210,16 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   verifies the `ApiResponse` envelope end to end — `202` + node under
   `data` for a valid heartbeat, `422` for a blank `nodeId`, node list
   under `data` on `GET /v1/nodes`. The 202 body now carries the envelope
-  too, so *every* response shares one shape.
+  too, so every response *our handlers produce* shares one shape — a
+  malformed body is still answered by the framework's `ProblemDetails`
+  before our code runs.
 - `r5` — Reorganization, second pass: the API now mirrors the
   MinimalTemplate layout — endpoint classes are
   `BaseEndPoint<Node>, IEndpointAsync` with `RegisterAsync`, DI registers
   endpoints/use cases/services by convention, use cases live in
-  `UseCases/`, `NodeService` wraps `NodeRegistry`, and every response goes
-  through the OnForkHub `RequestResult`/`EResultStatus`/`ApiResponse`
-  result pattern.
+  `UseCases/`, `NodeService` wraps `NodeRegistry`, and every handler-produced
+  response goes through the OnForkHub `RequestResult`/`EResultStatus`/
+  `ApiResponse` result pattern.
 - `r4` — Reorganization: `VpnControl` split into MinimalTemplate-style
   folders (`Endpoints/`, `Extensions/`, `Interfaces/`, `Models/`,
   `Services/`, `Security/`); `Program.cs` is now only bootstrap and routes

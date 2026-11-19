@@ -208,6 +208,10 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   de OnForkHub alrededor del cual se organiza la API: un caso de uso
   devuelve un `RequestResult<T>` con un `EResultStatus`, y `BaseEndPoint`
   mapea ese status al código HTTP más el envoltorio `ApiResponse`.
+- **`HttpContractTests` / `WebApplicationFactory`** — la suite de
+  contrato HTTP y el host en que corre: `WebApplicationFactory` hospeda
+  la aplicación real en memoria (sin puerto, sin Kestrel), así que los
+  tests ejercitan rutas y JSON exactamente como un cliente los ve.
 
 ## Notas de revisión
 
@@ -215,15 +219,17 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   (WebApplicationFactory) prueba el envoltorio `ApiResponse` de punta a
   punta — `202` + nodo en `data` para heartbeat válido, `422` para
   `nodeId` en blanco, lista de nodos en `data` en `GET /v1/nodes`. El
-  cuerpo del 202 también lleva el envoltorio, así que *toda* respuesta
-  comparte la misma forma.
+  cuerpo del 202 también lleva el envoltorio, así que toda respuesta
+  *que nuestros handlers producen* comparte la misma forma — un cuerpo
+  malformado aún lo responde el `ProblemDetails` del framework antes de
+  que nuestro código corra.
 - `r5` — Reorganización, segunda pasada: la API ahora refleja el layout
   de MinimalTemplate — las clases de endpoint son
   `BaseEndPoint<Node>, IEndpointAsync` con `RegisterAsync`, la DI registra
   endpoints/casos de uso/servicios por convención, los casos de uso viven
   en `UseCases/`, `NodeService` envuelve `NodeRegistry`, y toda respuesta
-  pasa por el result pattern `RequestResult`/`EResultStatus`/`ApiResponse`
-  de OnForkHub.
+  producida por handler pasa por el result pattern
+  `RequestResult`/`EResultStatus`/`ApiResponse` de OnForkHub.
 - `r4` — Reorganización: `VpnControl` dividido en carpetas al estilo de
   MinimalTemplate (`Endpoints/`, `Extensions/`, `Interfaces/`, `Models/`,
   `Services/`, `Security/`); `Program.cs` quedó solo como arranque y las
