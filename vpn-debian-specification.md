@@ -128,10 +128,15 @@ are preserved rather than renumbered:
   milestone, IPv4 forwarding, NAT, TCP MSS clamping, split/full-tunnel
   selection, route restoration, and the HTTP-through-the-node check remain
   deferred to the full-tunnel phase (recorded in `.agc/IMPLEMENTATION.md`).
-- **1 · Telemetry — pending.** Not started; its acceptance must not be
-  inferred from the TUN delivery.
+- **1 · Telemetry — implemented on `feat/telemetry` (PR #6), merge
+  pending.** The engine counts datagrams and answers `GetMetrics` on a
+  Unix socket, the Go agent fetches them with a deadline, and the C#
+  control plane records loopback-only heartbeats; the local gate observes
+  the 5-byte increment, the outage, and the recovery. Integration into
+  `main` awaits the PR #6 merge — not yet delivered there.
 - **0 · Foundation — partially exercised.** The monorepo layout and the
-  Rust toolchain are in use; the Go and C# toolchains remain placeholders.
+  Rust, Go, and C# toolchains are in use; `proto/` and PostgreSQL remain
+  placeholders until the control-plane milestone.
 - **3–6 — pending**, with dependencies: control plane and sessions build on
   telemetry plumbing and the engine's control socket; full tunneling and
   the HTTP check depend on the deferred forwarding/NAT work above.
