@@ -103,6 +103,11 @@ run_step "rust: fmt, clippy, test, release build" step_rust
 
 step_go() {
     command -v go >/dev/null 2>&1 || return 1
+    # The go CLI does not read .go-version; enforce the pinned toolchain here.
+    local want have
+    want=$(cat agent-go/.go-version)
+    have=$(go version | awk '{sub(/^go/, "", $3); print $3}')
+    [ "$have" = "$want" ] || { echo "go $want required by agent-go/.go-version (have $have)" >&2; return 1; }
     (cd agent-go && gofmt -l . | grep -q . && return 1; go vet ./... && go test ./...)
 }
 run_step "go: gofmt, vet, test" step_go
