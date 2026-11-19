@@ -42,8 +42,14 @@ func fakeEngine(t *testing.T, silent bool) (string, func()) {
 				if _, err := io.ReadFull(c, buf); err != nil {
 					return
 				}
+				// Echo the request's request_id: the envelope protocol
+				// correlates responses to requests.
+				var req struct {
+					RequestID string `json:"request_id"`
+				}
+				_ = json.Unmarshal(buf, &req)
 				resp, _ := json.Marshal(map[string]any{
-					"request_id": "fake-1", "version": 1, "status": "ok",
+					"request_id": req.RequestID, "version": 1, "status": "ok",
 					"result": Metrics{RxBytes: 5, RxPkts: 0, Peers: 1},
 				})
 				_ = binary.Write(c, binary.BigEndian, uint32(len(resp)))
@@ -63,6 +69,30 @@ func TestFetchMetricsDecodesResponse(t *testing.T) {
 	}
 	if m.RxBytes != 5 || m.Peers != 1 {
 		t.Fatalf("unexpected metrics: %+v", m)
+	}
+}
+
+// A plain cancel (no deadline in the context) must also interrupt a read
+// already in flight — the watcher forces the socket deadline to expire.
+func TestCancelWithoutDeadlineStopsSilentEngine(t *testing.T) {
+	path, stop := fakeEngine(t, true)
+	defer stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := FetchMetrics(ctx, path)
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond) // let the read block
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected error after cancel")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancel did not interrupt the read")
 	}
 }
 
@@ -92,8 +122,12 @@ func TestDeadlineStopsSilentEngineAndNextPollRuns(t *testing.T) {
 		_ = binary.Read(c, binary.BigEndian, &n)
 		buf := make([]byte, n)
 		_, _ = io.ReadFull(c, buf)
+		var req struct {
+			RequestID string `json:"request_id"`
+		}
+		_ = json.Unmarshal(buf, &req)
 		resp, _ := json.Marshal(map[string]any{
-			"request_id": "fake-2", "version": 1, "status": "ok",
+			"request_id": req.RequestID, "version": 1, "status": "ok",
 			"result": Metrics{RxBytes: 10},
 		})
 		_ = binary.Write(c, binary.BigEndian, uint32(len(resp)))

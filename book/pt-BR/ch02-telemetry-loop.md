@@ -118,7 +118,9 @@ a lição deste capítulo:
 ```rust
 let read = async {
     let len = stream.read_u32().await?;          // 4-byte length, big-endian
-    if len > MAX_FRAME { /* reject before alloc */ }
+    if len > MAX_FRAME {
+        return Err(/* reject before allocating */)
+    }
     let mut frame = vec![0u8; len as usize];     // allocate exactly the frame
     stream.read_exact(&mut frame).await?;        // loop until it is complete
     Ok::<_, io::Error>(frame)
@@ -133,8 +135,9 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   quebrado não consegue fazer o motor alocar 4 GiB por um "frame".
 - `read_exact` é a correção do exercício de leitura parcial — continua
   lendo até `frame` encher, não importa como o kernel picou os bytes.
-- `timeout(IO_DEADLINE, read)` é a correção do par silencioso: 10 segundos
-  após o último byte, a conexão cai e o descritor é liberado.
+- `timeout(IO_DEADLINE, read)` é a correção do par silencioso: o prazo
+  cobre a leitura *inteira* — dez segundos para o frame completar, não dez
+  segundos entre bytes.
 
 | Arquivo | O que faz |
 |---|---|

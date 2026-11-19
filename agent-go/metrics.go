@@ -64,6 +64,7 @@ func FetchMetrics(ctx context.Context, socketPath string) (Metrics, error) {
 		"request_id": reqID,
 		"version":    1,
 		"op":         "GetMetrics",
+		"payload":    map[string]any{},
 	})
 	if err != nil {
 		return m, err
@@ -95,6 +96,9 @@ func FetchMetrics(ctx context.Context, socketPath string) (Metrics, error) {
 	}
 	if err := json.Unmarshal(frame, &env); err != nil {
 		return m, fmt.Errorf("decode response envelope: %w", err)
+	}
+	if env.RequestID != reqID {
+		return m, fmt.Errorf("response request_id %q does not match request %q", env.RequestID, reqID)
 	}
 	if env.Status != "ok" {
 		return m, fmt.Errorf("engine returned status %q: %s", env.Status, string(frame))

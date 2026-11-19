@@ -115,7 +115,9 @@ lesson of this chapter:
 ```rust
 let read = async {
     let len = stream.read_u32().await?;          // 4-byte length, big-endian
-    if len > MAX_FRAME { /* reject before alloc */ }
+    if len > MAX_FRAME {
+        return Err(/* reject before allocating */)
+    }
     let mut frame = vec![0u8; len as usize];     // allocate exactly the frame
     stream.read_exact(&mut frame).await?;        // loop until it is complete
     Ok::<_, io::Error>(frame)
@@ -129,9 +131,9 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   peer cannot make the engine allocate 4 GiB for a "frame".
 - `read_exact` is the fix for the partial-read exercise — it keeps reading
   until `frame` is full, no matter how the kernel chunked the bytes.
-- `timeout(IO_DEADLINE, read)` is the fix for the silent-peer exercise:
-  10 seconds after the last byte, the connection is dropped and its file
-  descriptor freed.
+- `timeout(IO_DEADLINE, read)` is the fix for the silent-peer exercise: the
+  deadline covers the *whole* read — ten seconds for the frame to complete,
+  not ten seconds between bytes.
 
 | File | What it does |
 |---|---|

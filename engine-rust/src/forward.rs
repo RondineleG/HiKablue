@@ -194,7 +194,13 @@ pub async fn run(cfg: Config) -> io::Result<()> {
     // Bind eagerly so a socket failure (path in use, bad group, permissions)
     // fails the engine with a clear error instead of leaving a dead task
     // that nobody observes.
-    let metrics_listener = metrics::bind(&cfg.metrics_sock, cfg.metrics_group.as_deref())?;
+    let metrics_listener =
+        metrics::bind(&cfg.metrics_sock, cfg.metrics_group.as_deref()).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("{e} (use --metrics-sock to pick a writable path)"),
+            )
+        })?;
     let metrics_task = tokio::spawn(metrics::serve(metrics.clone(), metrics_listener));
     if !is_server {
         // The client connects to its configured remote: it has one peer
