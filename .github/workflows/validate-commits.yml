@@ -25,6 +25,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Test commit validator
+        run: bash tests/validate-commits.sh
+
       - name: Validate branch and commit subjects
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
