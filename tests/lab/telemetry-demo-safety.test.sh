@@ -48,15 +48,15 @@ for _ in $(seq 10); do
     grep -q ready "$READY" 2>/dev/null && break
     sleep 0.5
 done
-grep -q ready "$READY" 2>/dev/null     || { echo "FAIL: port occupier never bound :$ENGINE_PORT" >&2; kill "$HOLD_PID" 2>/dev/null; rm -f "$READY"; exit 1; }
+grep -q ready "$READY" 2>/dev/null     || { echo "FAIL: port occupier never bound :$ENGINE_PORT" >&2; kill "$HOLD_PID" 2>/dev/null || true; rm -f "$READY"; exit 1; }
 kill -0 "$HOLD_PID" || { echo "FAIL: could not occupy :$ENGINE_PORT" >&2; rm -f "$READY"; exit 1; }
 rm -f "$READY"
 OUT=$(tests/lab/telemetry-demo.sh 2>&1) && {
     echo "FAIL: demo ran despite :$ENGINE_PORT being occupied" >&2
-    kill "$HOLD_PID"; exit 1
+    kill "$HOLD_PID" 2>/dev/null || true; exit 1
 }
 # A generic failure is not a pass: it must be the port refusal specifically.
-echo "$OUT" | grep -q "already in use"     || { echo "FAIL: demo failed for another reason: $OUT" >&2; kill "$HOLD_PID"; exit 1; }
+echo "$OUT" | grep -q "already in use"     || { echo "FAIL: demo failed for another reason: $OUT" >&2; kill "$HOLD_PID" 2>/dev/null || true; exit 1; }
 kill -0 "$HOLD_PID" || { echo "FAIL: demo killed the port occupier" >&2; exit 1; }
 kill "$HOLD_PID" 2>/dev/null || true
 echo "PASS: occupied port refused, occupier preserved"
