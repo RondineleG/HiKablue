@@ -47,7 +47,11 @@ case_run() {
 case_run "iptables in shell script is blocked"        1 "net.sh"              "iptables -F"
 case_run "default route change is blocked"            1 "route.sh"            "ip route add default via 10.0.0.1"
 case_run "forwarding sysctl is blocked"               1 "fwd.sh"              "sysctl -w net.ipv4.ip_forward=1"
-case_run "private key anywhere is blocked"            1 "k.txt"               "-----BEGIN PRIVATE KEY-----"
+# The marker is concatenated so the literal never sits in this source file —
+# the scanner scans every file, this one included.
+pk_marker='-----BEGIN '
+pk_marker+='PRIVATE KEY-----'
+case_run "private key anywhere is blocked"            1 "k.txt"               "$pk_marker"
 case_run "credential in markdown is blocked"          1 "README.md"           "api_key = \"sk-test\""
 case_run "credential in lab file is still blocked"    1 "tests/lab/x.sh"      "password = \"hunter2\""
 case_run "iptables in markdown doc is allowed"        0 "doc.md"              "Next phase will use iptables for NAT"
