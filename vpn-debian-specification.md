@@ -117,6 +117,25 @@ The header is **14 bytes**, all used as AAD. Minimum outer overhead is **58 byte
 | 5 · Deployment and recovery | Automate Debian installation and test process restarts, stream loss, and network restoration. | Installation is repeatable. Engine restart requires a new session. Revocation takes effect after reconnect, and route changes roll back. | Which process owns each setting and how to trace failures. |
 | 6 · WireGuard | Implement the agent backend and client configuration. Verify split tunneling. Address DNS and IPv6 before enabling full tunneling. | Repeat provisioning, traffic forwarding, and revocation with WireGuard on two machines. Verify that the client's private key stays local. | Which responsibilities belong to your code and which WireGuard handles. |
 
+**Execution status.** The table above is the planned order; the actual
+execution diverged once, by explicit request, and the milestone identifiers
+are preserved rather than renumbered:
+
+- **2 · TUN — delivered out of order (verified).** The raw IPv4 TUN ↔ UDP
+  forwarding loop (`vpn-engine`, PR #4) was implemented and lab-verified
+  ahead of milestone 1: ping works both ways between virtual IPs on Debian
+  12 and 13, with packet captures on the expected interfaces. Within the
+  milestone, IPv4 forwarding, NAT, TCP MSS clamping, split/full-tunnel
+  selection, route restoration, and the HTTP-through-the-node check remain
+  deferred to the full-tunnel phase (recorded in `.agc/IMPLEMENTATION.md`).
+- **1 · Telemetry — pending.** Not started; its acceptance must not be
+  inferred from the TUN delivery.
+- **0 · Foundation — partially exercised.** The monorepo layout and the
+  Rust toolchain are in use; the Go and C# toolchains remain placeholders.
+- **3–6 — pending**, with dependencies: control plane and sessions build on
+  telemetry plumbing and the engine's control socket; full tunneling and
+  the HTTP check depend on the deferred forwarding/NAT work above.
+
 ### First implementation session
 
 1. **Rust.** Make the UDP receiver listen on loopback and accumulate `rx_bytes`. Send a datagram of known size. Then expose `GetMetrics` over the Unix socket. Exercise — explain why a single socket read can return only part of a frame, and write a test that reproduces it.

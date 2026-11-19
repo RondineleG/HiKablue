@@ -131,3 +131,8 @@ sudo deploy/debian/lab-node-cleanup.sh --lab-owned   # remove a leftover
 
 Unverified: nothing in the Phase 1 scope. The documented VM walkthrough is
 equivalent to the container lab; only the underlay addresses differ.
+
+Deferred acceptance: an HTTP request through the exit node stays unchecked —
+it needs kernel forwarding and NAT, postponed to the full-tunnel phase
+(recorded in `.agc/IMPLEMENTATION.md`). The ping checks above are the
+delivered verification for this phase.

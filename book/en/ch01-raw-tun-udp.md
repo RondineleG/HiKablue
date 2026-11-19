@@ -468,3 +468,8 @@ One `ping -c1` yields two datagrams — request out, reply back.
   selection, and the HTTP endpoint check to the full-tunnel phase. The chapter
   text is unchanged: the deferral it already described is now written where
   the requirement lives.
+- `r4` — Roadmap documents aligned with reality: the spec §8 gained an
+  explicit *Execution status* (milestone 2 delivered out of order, milestone
+  1 still pending, identifiers preserved), and the root README now separates
+  the verified ICMP ping from the deferred HTTP check. No chapter content
+  changed.

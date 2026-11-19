@@ -481,3 +481,8 @@ de ida y la respuesta de vuelta.
   selección split vs. full tunnel y la verificación HTTP a la fase de túnel
   completo. El texto del capítulo no cambia: el aplazamiento que ya describía
   ahora queda escrito donde vive el requisito.
+- `r4` — Documentos del roadmap alineados con la realidad: la spec §8 ganó un
+  *Execution status* explícito (hito 2 entregado fuera de orden, hito 1 aún
+  pendiente, identificadores preservados), y el README raíz ahora separa el
+  ping ICMP verificado de la verificación HTTP aplazada. Ningún contenido del
+  capítulo cambió.

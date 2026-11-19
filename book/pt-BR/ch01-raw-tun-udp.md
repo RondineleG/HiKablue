@@ -471,3 +471,8 @@ resposta de volta.
   full tunnel e da verificação HTTP para a fase de túnel completo. O texto do
   capítulo não muda: o adiamento que ele já descrevia agora está escrito onde
   vive o requisito.
+- `r4` — Documentos do roadmap alinhados à realidade: a spec §8 ganhou um
+  *Execution status* explícito (marco 2 entregue fora da ordem, marco 1 ainda
+  pendente, identificadores preservados), e o README raiz agora separa o ping
+  ICMP verificado da verificação HTTP adiada. Nenhum conteúdo do capítulo
+  mudou.
