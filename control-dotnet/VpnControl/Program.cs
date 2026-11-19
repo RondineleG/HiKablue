@@ -22,6 +22,4 @@ await app.MapRegisteredEndpointsAsync();
 app.Run();
 
 // Lets WebApplicationFactory-style tests reference the implicit Program.
-// Bootstrap glue is exercised end-to-end by the lab, not by unit tests.
-[System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
 public partial class Program { }
