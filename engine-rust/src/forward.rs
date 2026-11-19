@@ -7,12 +7,15 @@
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::cli::Ipv4Cidr;
+use crate::metrics::{self, Metrics};
 use crate::packet::{destination_ip, source_ip, validate_ipv4};
 use crate::tun::{configure_interface, Tun};
 
@@ -30,6 +33,8 @@ pub struct Config {
     pub tun_cidr: Ipv4Cidr,
     pub tun_name: String,
     pub mtu: u16,
+    /// Unix socket that answers GetMetrics.
+    pub metrics_sock: PathBuf,
 }
 
 impl Config {
@@ -181,6 +186,12 @@ pub async fn run(cfg: Config) -> io::Result<()> {
         socket.local_addr()?,
     );
 
+    // Telemetry lives beside the dataplane: the forwarding loop only touches
+    // relaxed atomics, and the Unix listener is a separate task that never
+    // blocks the packet path.
+    let metrics = Metrics::new();
+    let metrics_task = tokio::spawn(metrics::serve(metrics.clone(), cfg.metrics_sock.clone()));
+
     let mut learned_peer: Option<SocketAddr> = None;
     let mut tun_buf = [0u8; BUFFER_SIZE];
     let mut udp_buf = [0u8; BUFFER_SIZE];
@@ -199,6 +210,7 @@ pub async fn run(cfg: Config) -> io::Result<()> {
             result = tun.read(&mut tun_buf) => {
                 let n = result?;
                 if validate_ipv4(&tun_buf[..n], cfg.mtu as usize).is_err() {
+                    metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 // A failed send for one datagram (e.g. ECONNREFUSED while the
@@ -211,8 +223,16 @@ pub async fn run(cfg: Config) -> io::Result<()> {
                 } else {
                     Some(socket.send(&tun_buf[..n]).await)
                 };
-                if let Some(Err(err)) = sent {
-                    eprintln!("vpn-engine: dropping outbound datagram: {err}");
+                match sent {
+                    Some(Ok(sent_n)) => {
+                        metrics.tx_pkts.fetch_add(1, Ordering::Relaxed);
+                        metrics.tx_bytes.fetch_add(sent_n as u64, Ordering::Relaxed);
+                    }
+                    Some(Err(err)) => {
+                        metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("vpn-engine: dropping outbound datagram: {err}");
+                    }
+                    None => {}
                 }
             }
             result = recv_datagram(&socket, &mut udp_buf) => {
@@ -226,12 +246,17 @@ pub async fn run(cfg: Config) -> io::Result<()> {
                         continue;
                     }
                 };
+                // Count every received datagram — even the ones validation
+                // drops next — so a 5-byte datagram moves rx_bytes by five.
+                metrics.rx_bytes.fetch_add(real_len as u64, Ordering::Relaxed);
                 if real_len > udp_buf.len() {
                     // Truncated by the buffer: not a complete packet.
+                    metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 let packet = &udp_buf[..real_len];
                 if validate_ipv4(packet, cfg.mtu as usize).is_err() {
+                    metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 if is_server {
@@ -250,22 +275,30 @@ pub async fn run(cfg: Config) -> io::Result<()> {
                         // UDP port and spoof the peer's virtual IP would pass.
                         ServerInbound::Learn => {
                             learned_peer = Some(from);
+                            metrics.peers.store(1, Ordering::Relaxed);
                             eprintln!("vpn-engine: learned peer endpoint {from}");
                         }
                         ServerInbound::Forward => {}
-                        ServerInbound::Drop => continue,
+                        ServerInbound::Drop => {
+                            metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                     }
                 } else if destination_ip(packet) != cfg.tun_cidr.addr {
                     // Client: the connected socket already pins the remote,
                     // but the peer must not inject packets addressed to
                     // other tunnel IPs.
+                    metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 tun.write(packet).await?;
+                metrics.rx_pkts.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
 
+    metrics_task.abort();
+    metrics::cleanup(&cfg.metrics_sock);
     eprintln!("vpn-engine: shutting down");
     Ok(())
 }
@@ -282,6 +315,7 @@ mod tests {
             tun_cidr: "10.80.1.1/24".parse().unwrap(),
             tun_name: "tun0".into(),
             mtu: 1400,
+            metrics_sock: PathBuf::from("/tmp/test.sock"),
         }
     }
 

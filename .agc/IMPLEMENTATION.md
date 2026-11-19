@@ -2,7 +2,7 @@
 
 This checklist preserves the repository's initial raw-tunnel task. It maps to the TUN milestone in `vpn-debian-specification.md`; the telemetry milestone remains separate. The task is not authorized by this document alone: proceed only when the user explicitly requests this implementation scope.
 
-**Status: delivered (verified).** This task ran ahead of milestone 1 (Telemetry) by explicit request — an out-of-order execution, not a reordering; milestone identifiers are unchanged and Telemetry remains pending. The raw TUN ↔ UDP loop is lab-verified on Debian 12/13. Within-scope deferrals are recorded inline below.
+**Status: delivered (verified).** This task ran ahead of milestone 1 (Telemetry) by explicit request — an out-of-order execution, not a reordering; milestone identifiers are unchanged. Milestone 1 is delivered and lab-verified on `feat/telemetry` (`tests/lab/telemetry-demo.sh`). The raw TUN ↔ UDP loop is lab-verified on Debian 12/13. Within-scope deferrals are recorded inline below.
 
 The specification's milestone table and first-implementation-session text currently describe an earlier telemetry sequence. Do not silently treat that sequence as equivalent to this TUN task or reorder the roadmap; surface the conflict if the requested work depends on which milestone comes first.
 

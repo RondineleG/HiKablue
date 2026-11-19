@@ -101,6 +101,19 @@ step_rust() {
 }
 run_step "rust: fmt, clippy, test, release build" step_rust
 
+step_go() {
+    command -v go >/dev/null 2>&1 || return 1
+    (cd agent-go && gofmt -l . | grep -q . && return 1; go vet ./... && go test ./...)
+}
+run_step "go: gofmt, vet, test" step_go
+
+step_dotnet() {
+    command -v dotnet >/dev/null 2>&1 || return 1
+    dotnet build control-dotnet/VpnControl/VpnControl.csproj -v q --nologo >/dev/null &&
+        dotnet test control-dotnet/VpnControl.Tests -v q --nologo
+}
+run_step "dotnet: build + test vpn-control" step_dotnet
+
 run_step "book parity (en / es / pt-BR)" bash tests/book/check-parity.sh
 
 if [ "$run_lab" -eq 1 ]; then

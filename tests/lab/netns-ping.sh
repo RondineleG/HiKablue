@@ -69,11 +69,15 @@ ip netns exec "$NS_A" ip link set hkl-a up
 ip netns exec "$NS_B" ip addr add "$OUTER_B/24" dev hkl-b
 ip netns exec "$NS_B" ip link set hkl-b up
 
+# Namespaces share the host filesystem, so each engine gets its own metrics
+# socket path (default /run/vpn/engine.sock would collide).
 ip netns exec "$NS_A" "$ENGINE" server \
-    --bind "0.0.0.0:$PORT" --tun-cidr "$VIP_A/24" --peer "$VIP_B" &
+    --bind "0.0.0.0:$PORT" --tun-cidr "$VIP_A/24" --peer "$VIP_B" \
+    --metrics-sock /tmp/hik-lab-a.sock &
 PID_A=$!
 ip netns exec "$NS_B" "$ENGINE" client \
-    --bind 0.0.0.0:0 --remote "$OUTER_A:$PORT" --tun-cidr "$VIP_B/24" &
+    --bind 0.0.0.0:0 --remote "$OUTER_A:$PORT" --tun-cidr "$VIP_B/24" \
+    --metrics-sock /tmp/hik-lab-b.sock &
 PID_B=$!
 sleep 1
 

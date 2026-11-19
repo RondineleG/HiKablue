@@ -1,5 +1,6 @@
 mod cli;
 mod forward;
+mod metrics;
 mod packet;
 mod tun;
 
@@ -19,6 +20,7 @@ async fn main() {
             tun_cidr: args.tun_cidr,
             tun_name: args.common.tun_name,
             mtu: args.common.mtu,
+            metrics_sock: args.common.metrics_sock,
         },
         Mode::Client(args) => Config {
             bind: args.bind,
@@ -27,6 +29,7 @@ async fn main() {
             tun_cidr: args.tun_cidr,
             tun_name: args.common.tun_name,
             mtu: args.common.mtu,
+            metrics_sock: args.common.metrics_sock,
         },
     };
 
