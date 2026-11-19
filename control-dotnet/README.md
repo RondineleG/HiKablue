@@ -30,11 +30,15 @@ Layout (single project, separation by folders):
 ```
 VpnControl/
   Program.cs                        bootstrap + loopback guard
+  Endpoints/Base/                   BaseEndPoint<TEntity> (UseCase → HTTP mapping)
   Endpoints/Internal/               lab-only intake (heartbeat)
   Endpoints/V1/Nodes/               public node list
-  Extensions/                       MapEndpoints + AddVpnControl
-  Interfaces/Configuration/         IEndpoint contract
-  Models/                           Heartbeat, NodeView records
-  Services/                         NodeRegistry (in-memory)
+  UseCases/Nodes/                   IUseCase<TRequest, TResponse> implementations
+  Services/                         NodeService over NodeRegistry (in-memory)
+  Entities/                         Node (+ Base/BaseEntity)
+  Interfaces/                       IEndpointAsync, IUseCase, INodeService
+  Requests/                         RequestResult / EResultStatus (OnForkHub result pattern)
+  Extensions/                       MapRegisteredEndpointsAsync + AddVpnControl (convention DI)
+  Models/                           Heartbeat, NodeView, ApiResponse records
   Security/                         LoopbackGuard
 ```

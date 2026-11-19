@@ -1,24 +1,18 @@
-using VpnControl.Endpoints.Internal;
-using VpnControl.Endpoints.V1.Nodes;
 using VpnControl.Interfaces.Configuration;
 
 namespace VpnControl.Extensions;
 
-/// Maps every endpoint group. Adding a route means adding one endpoint class,
-/// not editing Program.cs.
+/// Maps every registered endpoint group: resolves the IEndpointAsync
+/// implementations from DI and lets each one register its own route.
 public static class EndpointMappingExtensions
 {
-    public static WebApplication MapEndpoints(this WebApplication app)
+    public static async Task MapRegisteredEndpointsAsync(this WebApplication app)
     {
-        IEndpoint[] endpoints =
-        [
-            new HeartbeatEndpoint(),
-            new GetNodesEndpoint(),
-        ];
+        using var scope = app.Services.CreateScope();
+        var endpoints = scope.ServiceProvider.GetServices<IEndpointAsync>().DistinctBy(e => e.GetType());
         foreach (var endpoint in endpoints)
         {
-            endpoint.Map(app);
+            await endpoint.RegisterAsync(app);
         }
-        return app;
     }
 }

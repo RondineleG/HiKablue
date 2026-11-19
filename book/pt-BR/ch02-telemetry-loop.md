@@ -155,8 +155,10 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 | `engine-rust/src/cli.rs` | Flags `--metrics-sock` (default `/run/vpn/engine.sock`) e `--metrics-group` |
 | `agent-go/metrics.go` | `FetchMetrics(ctx)` — dial, deadline + vigia de cancelamento, escreve o envelope, `io.ReadFull` a resposta, decodifica `result` |
 | `agent-go/cmd/vpn-agent/main.go` | CLI de uma chamada que imprime as métricas |
-| `control-dotnet/VpnControl/Services/NodeRegistry.cs` | Tabela de nós em memória: `lastSeen` e `engineHealthy` separados |
-| `control-dotnet/VpnControl/Program.cs` | bootstrap + guarda loopback; `Endpoints/Internal/HeartbeatEndpoint.cs`, `Endpoints/V1/Nodes/GetNodesEndpoint.cs` |
+| `control-dotnet/VpnControl/Services/NodeRegistry.cs` + `Services/NodeService.cs` | Tabela de nós em memória: `lastSeen` e `engineHealthy` separados; `NodeService` responde em `RequestResult` |
+| `control-dotnet/VpnControl/UseCases/Nodes/` | `RegisterNodeHeartbeatUseCase` e `GetNodesUseCase` — implementações de `IUseCase<TRequest, TResponse>` |
+| `control-dotnet/VpnControl/Requests/` + `Endpoints/Base/` | `RequestResult`/`EResultStatus` (result pattern do OnForkHub) e `BaseEndPoint<Node>` — status → `ApiResponse` + código HTTP |
+| `control-dotnet/VpnControl/Program.cs` | bootstrap + guarda loopback + DI por convenção; classes de endpoint `BaseEndPoint<Node>, IEndpointAsync` em `Endpoints/` |
 | `tests/lab/telemetry-demo.sh` | Aceitação ponta a ponta: +5 bytes, queda, recuperação no socket e no plano de controle; recusa `hktelem0` pré-existente |
 | `io::Error::new` / `InvalidData` / `format!` | Constrói um erro de E/S da classe "dados inválidos" com uma mensagem formatada — usado para rejeitar um frame grande demais. |
 
@@ -164,9 +166,10 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 - **Socket `AF_UNIX`** — família de endereços para IPC no mesmo host: o
   endpoint é um caminho no filesystem, não um IP:porta.
-- **`AddVpnControl` / `MapEndpoints`** — os dois métodos de extensão que o
-  `Program.cs` chama: um registra o `NodeRegistry` no contêiner de DI, o
-  outro percorre as classes `IEndpoint` e mapeia suas rotas.
+- **`AddVpnControl` / `MapRegisteredEndpointsAsync`** — os dois métodos
+  de extensão que o `Program.cs` chama: um registra `NodeRegistry`,
+  endpoints, use cases e services no contêiner de DI por convenção, o
+  outro deixa cada classe `IEndpointAsync` mapear sua própria rota.
 - **`AtomicU64` / ordenamento relaxed** — contador de 64 bits atualizável
   concorrentemente sem locks; `Relaxed` significa "sem garantias extras de
   sincronização", que é tudo que contadores independentes precisam.
@@ -175,9 +178,9 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 - **`ctx` / deadline de contexto** — a forma do Go de carregar "desistir
   depois de T" para chamadas bloqueantes; aqui aplicado a reads/writes do
   socket.
-- **`IEndpoint`** — a pequena interface que toda classe de rota implementa
-  (`void Map(IEndpointRouteBuilder)`), mantendo o registro de rotas fora
-  do `Program.cs`.
+- **`IEndpointAsync`** — a pequena interface que toda classe de endpoint
+  implementa (`Task<RequestResult> RegisterAsync(WebApplication)`),
+  mantendo o registro de rotas fora do `Program.cs`.
 - **`io.ReadFull` / `read_exact`** — helpers ler-até-encher-o-buffer que
   transformam semântica de stream em semântica de frames.
 - **`lastSeen`** — timestamp do último heartbeat, separado do último
@@ -199,9 +202,20 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 - **`HeartbeatEndpoint` / `GetNodesEndpoint`** — as classes que abrigam
   `POST /internal/heartbeats` e `GET /v1/nodes`, para o `Program.cs`
   continuar sendo só bootstrap.
+- **`RequestResult` / `IUseCase` / `BaseEndPoint<T>`** — o result pattern
+  do OnForkHub em torno do qual a API se organiza: um use case devolve um
+  `RequestResult<T>` com um `EResultStatus`, e o `BaseEndPoint` mapeia esse
+  status para o código HTTP mais o envelope `ApiResponse`.
 
 ## Notas de revisão
 
+- `r5` — Reorganização, segunda passada: a API agora espelha o layout do
+  MinimalTemplate — as classes de endpoint são
+  `BaseEndPoint<Node>, IEndpointAsync` com `RegisterAsync`, a DI registra
+  endpoints/use cases/services por convenção, os use cases moram em
+  `UseCases/`, `NodeService` envolve o `NodeRegistry`, e toda resposta
+  passa pelo result pattern `RequestResult`/`EResultStatus`/`ApiResponse`
+  do OnForkHub.
 - `r4` — Reorganização: `VpnControl` dividido em pastas no estilo do
   MinimalTemplate (`Endpoints/`, `Extensions/`, `Interfaces/`, `Models/`,
   `Services/`, `Security/`); `Program.cs` virou só bootstrap e as rotas

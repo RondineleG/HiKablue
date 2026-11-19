@@ -35,7 +35,7 @@ builder.WebHost.UseUrls(urls.Split(';', StringSplitOptions.RemoveEmptyEntries | 
 builder.Services.AddVpnControl();
 var app = builder.Build();
 
-app.MapEndpoints();
+await app.MapRegisteredEndpointsAsync();
 app.Run();
 
 // Lets WebApplicationFactory-style tests reference the implicit Program.

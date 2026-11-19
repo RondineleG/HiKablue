@@ -1,6 +1,10 @@
+using Microsoft.AspNetCore.Mvc;
+using VpnControl.Endpoints.Base;
+using VpnControl.Entities;
 using VpnControl.Interfaces.Configuration;
 using VpnControl.Models;
-using VpnControl.Services;
+using VpnControl.Requests;
+using VpnControl.UseCases.Nodes;
 
 namespace VpnControl.Endpoints.Internal;
 
@@ -8,16 +12,25 @@ namespace VpnControl.Endpoints.Internal;
 /// of the public /v1 surface: it is replaced by the gRPC NodeChannel stream
 /// (with mTLS identity) in the control-plane milestone. Unauthenticated by
 /// design; the service refuses non-loopback binds at startup.
-public sealed class HeartbeatEndpoint : IEndpoint
+public sealed class HeartbeatEndpoint : BaseEndPoint<Node>, IEndpointAsync
 {
-    public void Map(IEndpointRouteBuilder app) =>
-        app.MapPost("/internal/heartbeats", (Heartbeat hb, NodeRegistry registry) =>
-        {
-            if (string.IsNullOrWhiteSpace(hb.NodeId))
-            {
-                return Results.BadRequest(new { error = "node_id is required" });
-            }
-            var view = registry.Record(hb);
-            return Results.Accepted(value: view);
-        });
+    private const string Route = "/internal/heartbeats";
+
+    public Task<RequestResult> RegisterAsync(WebApplication app)
+    {
+        app.MapPost(Route, HandleAsync)
+            .WithName("RegisterNodeHeartbeat")
+            .WithSummary("Register node heartbeat")
+            .Produces(StatusCodes.Status202Accepted)
+            .Produces(StatusCodes.Status422UnprocessableEntity);
+
+        return Task.FromResult(RequestResult.Success());
+    }
+
+    private static Task<IResult> HandleAsync(
+        [FromBody] Heartbeat request,
+        [FromServices] IRegisterNodeHeartbeatUseCase useCase) =>
+        HandleUseCaseAsync(useCase, request,
+            result => Results.Accepted(value: result.Data),
+            "Heartbeat registration failed");
 }
