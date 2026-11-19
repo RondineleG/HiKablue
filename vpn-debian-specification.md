@@ -134,8 +134,9 @@ are preserved rather than renumbered:
   control plane records loopback-only heartbeats; the local gate observes
   the 5-byte increment, the outage, and the recovery. Integration into
   `main` awaits the PR #6 merge — not yet delivered there.
-- **0 · Foundation — delivered.** The monorepo layout is established and
-  the Rust, Go, and C# toolchains are exercised by real components.
+- **0 · Foundation — delivered.** The monorepo layout is established,
+  toolchain versions are pinned (`rust-toolchain.toml`, `global.json`,
+  `go.mod` + `.go-version`), and all three languages run real components.
   `proto/` contracts and PostgreSQL are milestone-3 scope, not leftover
   foundation work.
 - **3–6 — pending**, with dependencies: control plane and sessions build on
