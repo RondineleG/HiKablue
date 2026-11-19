@@ -49,7 +49,7 @@ fi
 for obj in "netns:$NS_A" "netns:$NS_B" "link:hkl-a" "link:hkl-b"; do
     kind="${obj%%:*}"; name="${obj#*:}"
     case "$kind" in
-        netns) ip netns list | grep -qx "$name" 2>/dev/null && taken=1 || taken=0 ;;
+        netns) ip netns list | awk '{print $1}' | grep -qx "$name" 2>/dev/null && taken=1 || taken=0 ;;
         link)  ip link show "$name" >/dev/null 2>&1 && taken=1 || taken=0 ;;
     esac
     if [ "$taken" -eq 1 ]; then
@@ -59,8 +59,8 @@ for obj in "netns:$NS_A" "netns:$NS_B" "link:hkl-a" "link:hkl-b"; do
 done
 
 ip netns add "$NS_A"
+CREATED=1 # from here on hik-lab-a is ours; cleanup must remove it on any failure
 ip netns add "$NS_B"
-CREATED=1
 ip link add hkl-a type veth peer name hkl-b
 ip link set hkl-a netns "$NS_A"
 ip link set hkl-b netns "$NS_B"
