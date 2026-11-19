@@ -182,7 +182,8 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   socket.
 - **`DescribeLastMapped` / `IEndpointNameMetadata` / `RoutePattern` /
   `IHttpMethodMetadata`** — cómo un registro se reporta con honestidad:
-  tras `MapGet`/`MapPost`, `DescribeLastMapped` lee el registro que el
+  tras `MapGet`/`MapPost` (las llamadas que registran la ruta HTTP de
+  GET/POST), `DescribeLastMapped` lee el registro que el
   framework acaba de montar — `IEndpointNameMetadata` guarda el nombre
   dado por `WithName`, `RoutePattern` el texto de la ruta,
   `IHttpMethodMetadata` los verbos HTTP — en vez de repetirlos a mano.
