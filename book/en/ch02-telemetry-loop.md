@@ -172,6 +172,12 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   TUN interface; why the engine runs under `sudo` while the agent does not.
 - **`ctx` / context deadline** — Go's way of carrying "give up after T" into
   blocking calls; here applied to socket reads/writes.
+- **`DescribeLastMapped` / `IEndpointNameMetadata` / `RoutePattern` /
+  `IHttpMethodMetadata`** — how a registration reports itself honestly:
+  after `MapGet`/`MapPost`, `DescribeLastMapped` reads the endpoint record
+  the framework just built — `IEndpointNameMetadata` holds the name set by
+  `WithName`, `RoutePattern` the raw route text, `IHttpMethodMetadata` the
+  HTTP verbs — instead of restating them by hand.
 - **`IEndpointAsync`** — the small interface every endpoint class
   implements (`Task<RequestResult<EndpointRegistrationResponse>>
   RegisterAsync(WebApplication)`), keeping route registration out of

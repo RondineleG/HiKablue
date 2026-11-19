@@ -68,4 +68,25 @@ public class EndpointMappingTests
         Assert.Equal("Probe",
             mapped.Metadata.GetMetadata<IEndpointNameMetadata>()?.EndpointName);
     }
+
+    [Fact]
+    public async Task RealRegistrantsReportTheirMappedRoutes()
+    {
+        var builder = WebApplication.CreateBuilder();
+        await using var app = builder.Build();
+
+        var nodes = await new VpnControl.Endpoints.V1.Nodes.GetNodesEndpoint()
+            .RegisterAsync(app);
+        Assert.True(nodes.IsSuccess);
+        Assert.Equal("GetNodesV1", nodes.Data!.Name);
+        Assert.Equal("/v1/nodes", nodes.Data.Route);
+        Assert.Equal("GET", nodes.Data.Method);
+
+        var heartbeat = await new VpnControl.Endpoints.Internal.HeartbeatEndpoint()
+            .RegisterAsync(app);
+        Assert.True(heartbeat.IsSuccess);
+        Assert.Equal("RegisterNodeHeartbeat", heartbeat.Data!.Name);
+        Assert.Equal("/internal/heartbeats", heartbeat.Data.Route);
+        Assert.Equal("POST", heartbeat.Data.Method);
+    }
 }

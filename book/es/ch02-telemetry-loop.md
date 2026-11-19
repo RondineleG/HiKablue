@@ -180,6 +180,12 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 - **`ctx` / deadline de contexto** — la forma de Go de llevar "rendirse
   después de T" a llamadas bloqueantes; aquí aplicado a reads/writes del
   socket.
+- **`DescribeLastMapped` / `IEndpointNameMetadata` / `RoutePattern` /
+  `IHttpMethodMetadata`** — cómo un registro se reporta con honestidad:
+  tras `MapGet`/`MapPost`, `DescribeLastMapped` lee el registro que el
+  framework acaba de montar — `IEndpointNameMetadata` guarda el nombre
+  dado por `WithName`, `RoutePattern` el texto de la ruta,
+  `IHttpMethodMetadata` los verbos HTTP — en vez de repetirlos a mano.
 - **`IEndpointAsync`** — la pequeña interfaz que implementa cada clase de
   endpoint (`Task<RequestResult<EndpointRegistrationResponse>>
   RegisterAsync(WebApplication)`), manteniendo el registro de rutas fuera
