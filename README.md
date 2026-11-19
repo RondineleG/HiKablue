@@ -19,7 +19,7 @@ The custom UDP transport is for isolated lab exercises with test traffic. The ro
 ## Implementation roadmap
 
 1. Establish the monorepo and verify the toolchains. Use telemetry to practice integrating Rust, Go, and C#.
-2. Build the raw TUN/UDP tunnel and verify a ping between virtual IPs and an HTTP request through the exit node. This is the **Phase 1 implementation task**, which maps to the TUN milestone in the specification.
+2. Build the raw TUN/UDP tunnel and verify a ping between virtual IPs and an HTTP request through the exit node. This is the **initial TUN implementation task**, which maps to the TUN milestone in the specification; it is separate from the telemetry milestone.
 3. Add node registration, IP allocation, and session provisioning. Confirm that retrying a command leaves the same applied state.
 4. Integrate the protected lab transport and verify two concurrent clients, individual session revocation, and fresh keys after a restart.
 5. Verify deployment and recovery on Debian, then implement and test the WireGuard profile.
@@ -34,4 +34,6 @@ Chapter 1 will trace a ping through TUN and UDP, explain the routing and privile
 
 - [Architecture specification and learning roadmap](vpn-debian-specification.md)
 - [Repository instructions and ebook requirements](AGENTS.md)
+- [Agent workflow and project rules](.agc/README.md)
+- [Reusable agent skills](docs/skills/README.md)
 - [License](LICENSE)
