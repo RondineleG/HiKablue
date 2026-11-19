@@ -173,8 +173,9 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 - **`ctx` / context deadline** — Go's way of carrying "give up after T" into
   blocking calls; here applied to socket reads/writes.
 - **`IEndpointAsync`** — the small interface every endpoint class
-  implements (`Task<RequestResult> RegisterAsync(WebApplication)`),
-  keeping route registration out of `Program.cs`.
+  implements (`Task<RequestResult<EndpointRegistrationResponse>>
+  RegisterAsync(WebApplication)`), keeping route registration out of
+  `Program.cs` and reporting each mapped route as a typed result.
 - **`io.ReadFull` / `read_exact`** — read-until-buffer-full helpers that turn
   stream semantics into frame semantics.
 - **`lastSeen`** — timestamp of the last heartbeat, kept separate from the
@@ -206,6 +207,10 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Revision notes
 
+- `r7` — Typed registration: `RegisterAsync` now returns
+  `RequestResult<EndpointRegistrationResponse>` — the route it mapped as
+  a typed object — and `MapRegisteredEndpointsAsync` consumes it (throws
+  on failure, logs each `METHOD /route` it registered).
 - `r6` — Contract check: `HttpContractTests` (WebApplicationFactory)
   verifies the `ApiResponse` envelope end to end — `202` + node under
   `data` for a valid heartbeat, `422` for a blank `nodeId`, node list

@@ -14,7 +14,7 @@ public sealed class GetNodesEndpoint : BaseEndPoint<Node>, IEndpointAsync
     private const int V1 = 1;
     private static readonly string Route = GetVersionedRoute(V1, "nodes");
 
-    public Task<RequestResult> RegisterAsync(WebApplication app)
+    public Task<RequestResult<EndpointRegistrationResponse>> RegisterAsync(WebApplication app)
     {
         ConfigureEndpoint(app.MapGet(Route, HandleAsync))
             .WithName("GetNodesV1")
@@ -22,7 +22,8 @@ public sealed class GetNodesEndpoint : BaseEndPoint<Node>, IEndpointAsync
             .WithDescription("Lists every node that ever sent a heartbeat")
             .Produces(StatusCodes.Status200OK);
 
-        return Task.FromResult(RequestResult.Success());
+        return Task.FromResult(RequestResult<EndpointRegistrationResponse>.Success(
+            new EndpointRegistrationResponse("GetNodesV1", Route, "GET")));
     }
 
     private static Task<IResult> HandleAsync(

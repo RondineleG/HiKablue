@@ -179,8 +179,9 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   depois de T" para chamadas bloqueantes; aqui aplicado a reads/writes do
   socket.
 - **`IEndpointAsync`** — a pequena interface que toda classe de endpoint
-  implementa (`Task<RequestResult> RegisterAsync(WebApplication)`),
-  mantendo o registro de rotas fora do `Program.cs`.
+  implementa (`Task<RequestResult<EndpointRegistrationResponse>>
+  RegisterAsync(WebApplication)`), mantendo o registro de rotas fora do
+  `Program.cs` e reportando cada rota mapeada como resultado tipado.
 - **`io.ReadFull` / `read_exact`** — helpers ler-até-encher-o-buffer que
   transformam semântica de stream em semântica de frames.
 - **`lastSeen`** — timestamp do último heartbeat, separado do último
@@ -213,6 +214,10 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Notas de revisão
 
+- `r7` — Registro tipado: `RegisterAsync` agora devolve
+  `RequestResult<EndpointRegistrationResponse>` — a rota mapeada como
+  objeto tipado — e o `MapRegisteredEndpointsAsync` consome o resultado
+  (lança em falha, loga cada `METHOD /rota` registrada).
 - `r6` — Verificação de contrato: `HttpContractTests`
   (WebApplicationFactory) prova o envelope `ApiResponse` de ponta a
   ponta — `202` + nó em `data` para heartbeat válido, `422` para

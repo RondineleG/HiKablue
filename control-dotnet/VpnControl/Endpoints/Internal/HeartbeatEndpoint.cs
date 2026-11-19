@@ -16,7 +16,7 @@ public sealed class HeartbeatEndpoint : BaseEndPoint<Node>, IEndpointAsync
 {
     private const string Route = "/internal/heartbeats";
 
-    public Task<RequestResult> RegisterAsync(WebApplication app)
+    public Task<RequestResult<EndpointRegistrationResponse>> RegisterAsync(WebApplication app)
     {
         app.MapPost(Route, HandleAsync)
             .WithName("RegisterNodeHeartbeat")
@@ -24,7 +24,8 @@ public sealed class HeartbeatEndpoint : BaseEndPoint<Node>, IEndpointAsync
             .Produces(StatusCodes.Status202Accepted)
             .Produces(StatusCodes.Status422UnprocessableEntity);
 
-        return Task.FromResult(RequestResult.Success());
+        return Task.FromResult(RequestResult<EndpointRegistrationResponse>.Success(
+            new EndpointRegistrationResponse("RegisterNodeHeartbeat", Route, "POST")));
     }
 
     private static Task<IResult> HandleAsync(
