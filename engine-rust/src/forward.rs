@@ -171,6 +171,7 @@ fn sockaddr_to_std(
 // coverage: lab-only begin — opens /dev/net/tun and configures the
 // interface; needs CAP_NET_ADMIN, exercised by the lab steps.
 pub async fn run(cfg: Config) -> io::Result<()> {
+    cfg.validate()?;
     let tun = Tun::open(&cfg.tun_name)?;
     configure_interface(&cfg.tun_name, &cfg.tun_cidr.to_string(), cfg.mtu)?;
     run_loop(cfg, tun).await
@@ -640,7 +641,6 @@ mod tests {
         let cfg = cfg_for(bind, Some(remote_addr), None, "cli");
         let bind_addr = cfg.bind;
         let engine = tokio::spawn(run_loop(cfg, tun));
-        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
         // TUN -> UDP: a valid packet reaches the remote endpoint.
         peer.send(&ipv4_packet(LOCAL_VIP, OTHER_VIP, b"out"))
@@ -655,11 +655,13 @@ mod tests {
             ipv4_packet(LOCAL_VIP, OTHER_VIP, b"out").as_slice()
         );
 
-        // UDP -> TUN: a packet addressed to our virtual IP lands on TUN.
-        // The first send may race the engine's bind, so retry briefly.
+        // UDP -> TUN: the engine's socket is connected to `remote`, so only
+        // datagrams from that address are delivered — send from it. A packet
+        // addressed to our virtual IP lands on TUN. The first send may race
+        // the engine's bind, so retry briefly.
         let mut tb = [0u8; 64];
         for _ in 0..40 {
-            probe
+            remote
                 .send_to(&ipv4_packet(OTHER_VIP, LOCAL_VIP, b"in"), bind_addr)
                 .await
                 .unwrap();
@@ -675,12 +677,12 @@ mod tests {
 
         // Drops: foreign inner destination, malformed frame, oversized frame
         // — none may reach TUN.
-        probe
+        remote
             .send_to(&ipv4_packet(OTHER_VIP, OTHER_VIP, b"zz"), bind_addr)
             .await
             .unwrap();
-        probe.send_to(&[1, 2, 3, 4, 5], bind_addr).await.unwrap();
-        probe.send_to(&vec![0u8; 2100], bind_addr).await.unwrap();
+        remote.send_to(&[1, 2, 3, 4, 5], bind_addr).await.unwrap();
+        remote.send_to(&vec![0u8; 2100], bind_addr).await.unwrap();
         assert!(peer.recv(&mut tb).is_err(), "dropped packet reached TUN");
 
         // TUN garbage never reaches the remote either (counts as dropped).
