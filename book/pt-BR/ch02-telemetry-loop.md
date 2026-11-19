@@ -136,6 +136,9 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   `binary.Write(..., binary.BigEndian, ...)`.
 - O comprimento é verificado *antes* do `vec!` alocar: um par hostil ou
   quebrado não consegue fazer o motor alocar 4 GiB por um "frame".
+- A rejeição constrói um erro real: `io::Error::new` embrulha a
+  classe `io::ErrorKind::InvalidData` mais uma mensagem `format!` que nomeia
+  o tamanho do infrator — o chamador vê *por que* o frame foi recusado.
 - `read_exact` é a correção do exercício de leitura parcial — continua
   lendo até `frame` encher, não importa como o kernel picou os bytes.
 - `timeout(IO_DEADLINE, read)` é a correção do par silencioso: o prazo
@@ -152,6 +155,7 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 | `control-dotnet/VpnControl/NodeRegistry.cs` | Tabela de nós em memória: `lastSeen` e `engineHealthy` separados |
 | `control-dotnet/VpnControl/Program.cs` | `POST /internal/heartbeats`, `GET /v1/nodes` |
 | `tests/lab/telemetry-demo.sh` | Aceitação ponta a ponta: +5 bytes, queda, recuperação no socket e no plano de controle; recusa `hktelem0` pré-existente |
+| `io::Error::new` / `InvalidData` / `format!` | Constrói um erro de E/S da classe "dados inválidos" com uma mensagem formatada — usado para rejeitar um frame grande demais. |
 
 ## Glossário
 

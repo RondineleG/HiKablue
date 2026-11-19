@@ -132,6 +132,9 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   length the Go agent writes with `binary.Write(..., binary.BigEndian, ...)`.
 - The length is checked *before* the `vec!` allocates: a hostile or broken
   peer cannot make the engine allocate 4 GiB for a "frame".
+- The rejection builds a real error: `io::Error::new` wraps the
+  `io::ErrorKind::InvalidData` kind plus a `format!` message naming the
+  offender's size — the caller sees *why* the frame was refused.
 - `read_exact` is the fix for the partial-read exercise — it keeps reading
   until `frame` is full, no matter how the kernel chunked the bytes.
 - `timeout(IO_DEADLINE, read)` is the fix for the silent-peer exercise: the
@@ -148,6 +151,7 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 | `control-dotnet/VpnControl/NodeRegistry.cs` | In-memory node table: `lastSeen` and `engineHealthy` kept apart |
 | `control-dotnet/VpnControl/Program.cs` | `POST /internal/heartbeats`, `GET /v1/nodes` |
 | `tests/lab/telemetry-demo.sh` | End-to-end acceptance: +5 bytes, outage, recovery on both socket and control plane; refuses preexisting `hktelem0` |
+| `io::Error::new` / `InvalidData` / `format!` | Constructs an I/O error of the "invalid data" kind with a formatted message — used to reject an oversized frame. |
 
 ## Glossary
 

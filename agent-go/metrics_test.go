@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -15,9 +16,7 @@ import (
 // silent is true — accepts the connection and never writes. The silent case
 // is the milestone exercise: without the context deadline the read would
 // hang forever and stall every later collection.
-var readCh = make(chan struct{}, 8)
-
-func fakeEngine(t *testing.T, silent bool) (string, func()) {
+func fakeEngine(t *testing.T, silent bool) (string, func(), <-chan struct{}) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "engine.sock")
@@ -25,6 +24,8 @@ func fakeEngine(t *testing.T, silent bool) (string, func()) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	readCh := make(chan struct{}, 8)
+	stopCh := make(chan struct{})
 	go func() {
 		for {
 			c, err := l.Accept()
@@ -33,6 +34,7 @@ func fakeEngine(t *testing.T, silent bool) (string, func()) {
 			}
 			if silent {
 				go func(c net.Conn) {
+					defer c.Close()
 					var n uint32
 					if err := binary.Read(c, binary.BigEndian, &n); err != nil {
 						return
@@ -45,7 +47,13 @@ func fakeEngine(t *testing.T, silent bool) (string, func()) {
 					case readCh <- struct{}{}:
 					default:
 					}
-					select {} // read the frame, then stay silent forever
+					// Read the frame, signal it, then hold the conn until the
+					// client hangs up or the test ends — never a parked goroutine.
+					select {
+					case <-stopCh:
+					default:
+						_, _ = io.Copy(io.Discard, c)
+					}
 				}(c)
 				continue
 			}
@@ -74,11 +82,11 @@ func fakeEngine(t *testing.T, silent bool) (string, func()) {
 			}(c)
 		}
 	}()
-	return path, func() { _ = l.Close() }
+	return path, func() { close(stopCh); l.Close() }, readCh
 }
 
 func TestFetchMetricsDecodesResponse(t *testing.T) {
-	path, stop := fakeEngine(t, false)
+	path, stop, _ := fakeEngine(t, false)
 	defer stop()
 	m, err := FetchMetrics(context.Background(), path)
 	if err != nil {
@@ -92,7 +100,7 @@ func TestFetchMetricsDecodesResponse(t *testing.T) {
 // A plain cancel (no deadline in the context) must also interrupt a read
 // already in flight — the watcher forces the socket deadline to expire.
 func TestCancelWithoutDeadlineStopsSilentEngine(t *testing.T) {
-	path, stop := fakeEngine(t, true)
+	path, stop, readCh := fakeEngine(t, true)
 	defer stop()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -120,7 +128,7 @@ func TestCancelWithoutDeadlineStopsSilentEngine(t *testing.T) {
 }
 
 func TestDeadlineStopsSilentEngineAndNextPollRuns(t *testing.T) {
-	path, stop := fakeEngine(t, true)
+	path, stop, _ := fakeEngine(t, true)
 	defer stop()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
@@ -189,7 +197,8 @@ func TestMismatchedRequestIDIsRejected(t *testing.T) {
 		_, _ = c.Write(resp)
 		c.Close()
 	}()
-	if _, err := FetchMetrics(context.Background(), path); err == nil {
-		t.Fatal("expected mismatched request_id to be rejected")
+	_, err = FetchMetrics(context.Background(), path)
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("expected request_id mismatch error, got %v", err)
 	}
 }
