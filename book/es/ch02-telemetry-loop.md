@@ -216,6 +216,8 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Notas de revisión
 
+- `r8` — `EndpointMappingTests` prueba que un registrante que falla
+  aborta el arranque con el nombre del endpoint + error en la excepción.
 - `r7` — Registro tipado: `RegisterAsync` ahora devuelve
   `RequestResult<EndpointRegistrationResponse>` — la ruta mapeada como
   objeto tipado — y `MapRegisteredEndpointsAsync` consume el resultado
