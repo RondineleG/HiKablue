@@ -128,12 +128,11 @@ are preserved rather than renumbered:
   milestone, IPv4 forwarding, NAT, TCP MSS clamping, split/full-tunnel
   selection, route restoration, and the HTTP-through-the-node check remain
   deferred to the full-tunnel phase (recorded in `.agc/IMPLEMENTATION.md`).
-- **1 · Telemetry — implemented on `feat/telemetry` (PR #6), merge
-  pending.** The engine counts datagrams and answers `GetMetrics` on a
-  Unix socket, the Go agent fetches them with a deadline, and the C#
-  control plane records loopback-only heartbeats; the local gate observes
-  the 5-byte increment, the outage, and the recovery. Integration into
-  `main` awaits the PR #6 merge — not yet delivered there.
+- **1 · Telemetry — delivered (PR #6, merged into `main`).** The engine
+  counts datagrams and answers `GetMetrics` on a Unix socket, the Go
+  agent fetches them with a deadline, and the C# control plane records
+  loopback-only heartbeats; the local gate observes the 5-byte
+  increment, the outage, and the recovery.
 - **0 · Foundation — delivered.** The monorepo layout is established,
   toolchain versions are pinned (`rust-toolchain.toml`, `global.json`,
   `go.mod` + `.go-version`), and all three languages run real components.
