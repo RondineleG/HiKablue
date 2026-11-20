@@ -38,6 +38,7 @@ async fn main() {
             metrics_group: args.common.metrics_group,
             key: parse_key_arg(args.common.key),
             sender_index: args.common.sender_index,
+            peer_index: args.common.peer_index,
             keepalive_interval: std::time::Duration::from_secs(args.common.keepalive_secs),
         },
         Mode::Client(args) => Config {
@@ -51,6 +52,7 @@ async fn main() {
             metrics_group: args.common.metrics_group,
             key: parse_key_arg(args.common.key),
             sender_index: args.common.sender_index,
+            peer_index: args.common.peer_index,
             keepalive_interval: std::time::Duration::from_secs(args.common.keepalive_secs),
         },
     };
