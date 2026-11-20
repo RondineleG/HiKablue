@@ -270,11 +270,20 @@ public sealed class NodeChannelService(
     /// count/length/sha256 (proto contract, spec §5 snapshot validation).
     public async Task EnqueueSyncStateAsync(string nodeId, CancellationToken ct)
     {
+        // Serialize against provisioning: session creation locks this same
+        // row FOR UPDATE, so the peer set and the bumped revision always
+        // describe one consistent point in time.
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await db.Database.ExecuteSqlAsync(
+            $"SELECT node_id FROM nodes WHERE node_id = {nodeId} FOR UPDATE", ct);
+
+        // Revoking sessions are intentionally absent: the RevokePeer command
+        // already enqueued is what removes them — including them here would
+        // reinstall a peer that was just torn down (SEC review).
         var peers = await db.Sessions
             .Where(s => s.NodeId == nodeId &&
                         (s.Status == SessionStatus.Pending ||
-                         s.Status == SessionStatus.Active ||
-                         s.Status == SessionStatus.Revoking))
+                         s.Status == SessionStatus.Active))
             .OrderBy(s => s.LabSessionId)
             .ToListAsync(ct);
 
@@ -302,6 +311,9 @@ public sealed class NodeChannelService(
         };
 
         var node = await db.Nodes.FirstAsync(n => n.NodeId == nodeId, ct);
+        // The row is locked but the tracked entity may be stale — refresh
+        // so the revision stays monotonic per node.
+        await db.Entry(node).ReloadAsync(ct);
         node.DesiredRevision += 1;
         var now = DateTimeOffset.UtcNow;
         db.Outbox.Add(new OutboxRow
@@ -322,5 +334,6 @@ public sealed class NodeChannelService(
             })
         });
         await db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
     }
 }
