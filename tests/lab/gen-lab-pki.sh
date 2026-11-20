@@ -15,6 +15,7 @@
 # identity to a registered node. Rotation = re-issue the same node-id
 # (new serial, same identity) and restart the agent.
 set -euo pipefail
+umask 077   # private keys must never be world/group-readable, even transiently
 
 readonly CA_SUBJECT="/CN=HiKablue Lab CA/O=HiKablue lab-only"
 readonly SAN_PREFIX="spiffe://lab.hikablue/node"
@@ -33,7 +34,10 @@ init_ca() {
     openssl ecparam -name prime256v1 -genkey -noout -out "$dir/ca/ca.key"
     chmod 600 "$dir/ca/ca.key"
     openssl req -x509 -new -nodes -key "$dir/ca/ca.key" -sha256 \
-        -days "$VALID_DAYS" -subj "$CA_SUBJECT" -out "$dir/ca/ca.crt"
+        -days "$VALID_DAYS" -subj "$CA_SUBJECT" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign" \
+        -out "$dir/ca/ca.crt"
     echo "lab CA created at $dir/ca"
 }
 
@@ -60,7 +64,7 @@ issue_node() {
     openssl x509 -req -in "$nd/node.csr" \
         -CA "$dir/ca/ca.crt" -CAkey "$dir/ca/ca.key" -CAcreateserial \
         -days "$VALID_DAYS" -sha256 \
-        -extfile <(printf 'subjectAltName=URI:%s/%s\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth,serverAuth\nbasicConstraints=critical,CA:FALSE\n' \
+        -extfile <(printf 'subjectAltName=URI:%s/%s\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\nbasicConstraints=critical,CA:FALSE\n' \
             "$SAN_PREFIX" "$node_id") \
         -out "$nd/node.crt"
     rm -f "$nd/node.csr"

@@ -30,7 +30,7 @@ nodes (
 sessions (
     session_id         uuid        primary key,
     idempotency_key    text        unique,        -- nullable; set by POST /v1/sessions
-    status             text        not null,      -- pending|active|revoking|revoked|failed
+    status             text        not null,      -- pending|active|revoking|revoked|failed|quarantined
     virtual_ip         inet        not null,      -- audit trail; uniqueness enforced by ip_leases
     node_id            text        not null references nodes(node_id),
     lab_session_id     integer     not null,      -- unique among ACTIVE rows per node
@@ -120,3 +120,31 @@ Key mechanics:
 - Spec constraint honored verbatim: "at minimum the entities needed for
   session creation, uniqueness, delivery tracking, and cleanup" — the four
   tables above cover exactly that.
+
+### Invariants & Concurrency Rules (Milestone 3 Hardening)
+
+1. **Subnet Sizing vs Registry Cap:** the `NodeRegistry` caps at 1024 nodes
+   (PR #10). The IPAM pool CIDR must be at least a /22 (1022 usable hosts)
+   or several /24 blocks, and the `ip_leases` budget must count both active
+   and pending sessions.
+2. **Session Allocation Race Prevention (`lab_session_id`):** provisioning
+   transactions take an exclusive lock on the parent node row
+   (`SELECT id FROM nodes WHERE id = $1 FOR UPDATE;`) before computing
+   `MAX(lab_session_id) + 1`, with a bounded exponential retry loop
+   (max 3 attempts, 10–50 ms jitter) to absorb error 23505
+   (unique_violation).
+3. **IP Probing Dispersion:** linear probing from index 0 under
+   concurrency is forbidden; probe order is a pseudo-random seed from
+   `hash(node_id + stream_epoch)` or
+   `SELECT candidate FROM available_ips ORDER BY random() LIMIT 1`
+   inside the reservation attempt.
+4. **Stale Lease Reclamation (Reaper Policy):** normally `ip_leases` rows
+   are deleted only after a valid `RevokePeer` `CommandAck` with matching
+   `stream_epoch` and `backend_instance_id`. For dead/unresponsive nodes a
+   background reaper runs every 60 s, moves sessions whose `expires_at <
+   NOW()` without heartbeat/ACK for more than 2× the quarantine window
+   (default 300 s) to `QUARANTINED`, force-releases the lease writing an
+   audit record (`FORCED_REAPER_RELEASE`), and increments
+   `ipam_reaped_leases_total`. A late ACK for an expired session is
+   rejected with `ACK_ERROR_DEADLINE_EXCEEDED` and triggers an immediate
+   agent resync.
