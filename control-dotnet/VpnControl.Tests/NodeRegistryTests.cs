@@ -193,4 +193,90 @@ public class NodeRegistryTests
         Assert.Equal("node-a", Assert.Single(registry.List()).NodeId);
         Assert.False(rejoined.EngineHealthy);
     }
+
+    // ---------- Expiry also runs on the heartbeat path ----------
+
+    [Fact]
+    public void RecordSweepsExpiredNodesWithoutAnyListCall()
+    {
+        // If heartbeats keep arriving but nobody calls List(), the registry
+        // must still reap stale entries — otherwise the dictionary grows
+        // unbounded behind a write-only service.
+        var t0 = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var clock = t0;
+        var registry = new NodeRegistry(() => clock, TimeSpan.FromMinutes(10));
+        registry.Record(new Heartbeat("stale-node", EngineHealthy: true));
+
+        clock = t0.AddMinutes(11);
+        registry.Record(new Heartbeat("fresh-node", EngineHealthy: true));
+
+        var node = Assert.Single(registry.List());
+        Assert.Equal("fresh-node", node.NodeId);
+    }
+
+    [Fact]
+    public void RecordSweepsOnceTheConfiguredIntervalElapsed()
+    {
+        // With a small sweepEvery, the heartbeat that arrives after the
+        // interval performs the reaping itself — no List() needed.
+        var t0 = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var clock = t0;
+        var registry = new NodeRegistry(() => clock, TimeSpan.FromMinutes(10),
+            TimeSpan.FromSeconds(30));
+        registry.Record(new Heartbeat("node-a", EngineHealthy: true));
+
+        clock = t0.AddMinutes(11);
+        registry.Record(new Heartbeat("node-b", EngineHealthy: true));
+        // (_lastSweep was t0, so 11 min > 30 s → this heartbeat swept.)
+
+        Assert.Single(registry.List(), n => n.NodeId == "node-b");
+        Assert.DoesNotContain(registry.List(), n => n.NodeId == "node-a");
+    }
+
+    [Fact]
+    public void SweepKeepsActiveNodesAndRenewsLastSeen()
+    {
+        var t0 = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var clock = t0;
+        var registry = new NodeRegistry(() => clock, TimeSpan.FromMinutes(10),
+            TimeSpan.FromMinutes(1));
+        var first = registry.Record(new Heartbeat("active", EngineHealthy: true));
+
+        for (var beat = 1; beat <= 15; beat++)
+        {
+            clock = t0.AddMinutes(beat);
+            registry.Record(new Heartbeat("active", EngineHealthy: true));
+        }
+
+        var node = Assert.Single(registry.List());
+        Assert.Equal(t0.AddMinutes(15), node.LastSeen);
+        Assert.Equal(first.Id, node.Id);
+        Assert.Equal(first.CreatedAt, node.CreatedAt);
+    }
+
+    [Fact]
+    public void MemoryDoesNotGrowWhenOnlyExpiringNodesBeat()
+    {
+        // Worst case for the bug: a stream of distinct node ids, each beating
+        // once and going quiet, with no List() calls. With the write-path
+        // sweep, registry size stays bounded by activity within one TTL
+        // window instead of accumulating every dead id forever.
+        var t0 = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var clock = t0;
+        var registry = new NodeRegistry(() => clock, TimeSpan.FromMinutes(10),
+            TimeSpan.FromMinutes(1));
+
+        for (var batch = 0; batch < 5; batch++)
+        {
+            clock = t0.AddMinutes(batch * 15);
+            for (var i = 0; i < 100; i++)
+            {
+                registry.Record(new Heartbeat($"ephemeral-{batch}-{i}", EngineHealthy: true));
+            }
+        }
+
+        var surviving = registry.List();
+        Assert.True(surviving.Count <= 100,
+            $"expected at most the last batch of 100, found {surviving.Count}");
+    }
 }
