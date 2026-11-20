@@ -50,7 +50,7 @@ Keep this table current: every milestone change set updates the status and links
 | 1 | **Telemetry** — metrics socket, Go fetcher, C# heartbeat registry | **Delivered** — [PR #6](https://github.com/RondineleG/HiKablue/pull/6); hardened in [PR #8](https://github.com/RondineleG/HiKablue/pull/8) (registry snapshots, heartbeat token auth, payload limits, node expiry, coverage-gate self-tests) |
 | 2 | Raw TUN ↔ UDP tunnel | **Delivered** in [PR #4](https://github.com/RondineleG/HiKablue/pull/4) — ping verified both ways on Debian 12/13 (delivered out of order, ahead of milestone 1) |
 | 3 | Control plane — PostgreSQL, IPAM, session states, outbox; gRPC `NodeChannel` over mTLS replaces the HTTP heartbeat | **Delivered** — contracts + lab CA + IPAM design in [PR #11](https://github.com/RondineleG/HiKablue/pull/11); EF Core persistence, IPAM and `/v1/sessions` in [PR #12](https://github.com/RondineleG/HiKablue/pull/12); `NodeChannel` with SPIFFE mTLS, outbox dispatcher, lease reaper and the Go `pkg/orchestrator` client in [PR #13](https://github.com/RondineleG/HiKablue/pull/13) |
-| 4 | End-to-end session — encrypted Rust backend, CLI, peer operations, local expiration, reconciliation | Pending |
+| 4 | End-to-end session — encrypted Rust backend, CLI, peer operations, local expiration, reconciliation | **In progress** — Phase 2 data-plane crypto: ChaCha20-Poly1305 AEAD wire format (14B header + 16B tag), 2048-packet replay window, nonce-exhaustion latch, lab `--key` mode |
 | 5 | Deployment and recovery — Debian install automation, restarts, stream loss, route rollback | Pending |
 | 6 | WireGuard — agent backend + client configuration, split tunneling | Pending |
 

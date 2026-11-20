@@ -55,13 +55,21 @@ pub struct ClientArgs {
     /// Virtual IPv4 address and prefix for the TUN interface, e.g. 10.80.1.2/24.
     #[arg(long)]
     pub tun_cidr: Ipv4Cidr,
+    /// Virtual IPv4 address of the server inside the tunnel, e.g. 10.80.1.1.
+    /// Authenticated packets whose inner source differs are dropped:
+    /// cryptographic peer authentication does not authorize inner IPs.
+    #[arg(long)]
+    pub peer: Ipv4Addr,
     #[command(flatten)]
     pub common: CommonArgs,
 }
 
 #[derive(Debug, Args)]
 pub struct CommonArgs {
-    /// Inner MTU applied to the TUN interface (max 2048).
+    /// Inner MTU applied to the TUN interface. Capped at 1442 over IPv4
+    /// or 1422 over IPv6 when --key is set (1500-byte path minus outer
+    /// overhead), 2018 otherwise (the 2048-byte buffer carries 30 bytes
+    /// of wire overhead).
     #[arg(long, default_value_t = DEFAULT_MTU)]
     pub mtu: u16,
     /// Name of the TUN interface to create.
@@ -74,6 +82,53 @@ pub struct CommonArgs {
     /// the socket is limited to the engine's own user/group.
     #[arg(long)]
     pub metrics_group: Option<String>,
+    /// 32-byte ChaCha20-Poly1305 session key as 64 hex chars. Lab-only
+    /// pre-shared key: real key delivery arrives via the control plane in a
+    /// later phase. Without it the engine speaks the M2 plaintext format.
+    #[arg(long)]
+    pub key: Option<String>,
+    /// Session index stamped on outbound packets; also selects this
+    /// side's derived direction key. Defaults to 1.
+    #[arg(long, default_value_t = 1)]
+    pub sender_index: u32,
+    /// Session index the peer stamps on its packets. Required when --key
+    /// is set and must differ from --sender-index: the two indexes pick
+    /// the two direction keys.
+    #[arg(long, default_value_t = 0)]
+    pub peer_index: u32,
+    /// Idle seconds before a KEEPALIVE datagram is sent (encrypted mode
+    /// only). Defaults to 25.
+    #[arg(long, default_value_t = 25)]
+    pub keepalive_secs: u64,
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parses a 64-hex-char string into a 32-byte key. Works on bytes so a
+/// multibyte UTF-8 char is a parse error, never a slice panic.
+pub fn parse_key_hex(s: &str) -> Result<[u8; 32], String> {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() != 64 {
+        return Err(format!("key must be 64 hex chars, got {}", s.len()));
+    }
+    let mut key = [0u8; 32];
+    for (i, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        let hi = hex_val(pair[0]);
+        let lo = hex_val(pair[1]);
+        key[i] = match (hi, lo) {
+            (Some(h), Some(l)) => (h << 4) | l,
+            _ => return Err(format!("key has a non-hex byte at offset {}", i * 2)),
+        };
+    }
+    Ok(key)
 }
 
 /// An IPv4 address with prefix length, written `A.B.C.D/N`.
@@ -124,6 +179,30 @@ impl std::fmt::Display for Ipv4Cidr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_key_hex_accepts_64_hex_chars() {
+        let key = parse_key_hex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+            .unwrap();
+        assert_eq!(key[0], 0x00);
+        assert_eq!(key[1], 0x11);
+        assert_eq!(key[31], 0xff);
+    }
+
+    #[test]
+    fn parse_key_hex_rejects_wrong_length_and_non_hex() {
+        assert!(parse_key_hex("abcd").is_err());
+        assert!(parse_key_hex(&"00".repeat(33)).is_err());
+        assert!(parse_key_hex(&format!("{}zz", "00".repeat(31))).is_err());
+        // Surrounding whitespace is trimmed before the length check.
+        assert!(parse_key_hex(&format!("  {}  ", "ab".repeat(32))).is_ok());
+        // Multibyte UTF-8 inside a 64-byte string is a parse error — the
+        // parser works on bytes and never splits a char boundary.
+        let mut unicode = "00".repeat(31);
+        unicode.push('é'); // 2 bytes: brings the byte length to 64
+        assert_eq!(unicode.len(), 64);
+        assert!(parse_key_hex(&unicode).is_err());
+    }
 
     #[test]
     fn parses_cidr() {

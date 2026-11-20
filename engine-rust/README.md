@@ -52,7 +52,8 @@ Node B (client — fixed remote endpoint):
 sudo ./vpn-engine client \
   --bind 192.168.56.12:51820 \
   --remote 192.168.56.11:51820 \
-  --tun-cidr 10.80.1.2/24
+  --tun-cidr 10.80.1.2/24 \
+  --peer 10.80.1.1
 ```
 
 Acceptance check — ping the virtual IPs in **both** directions. Ping the

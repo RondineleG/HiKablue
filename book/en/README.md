@@ -10,4 +10,6 @@ Editions: [Español](../es/README.md) · [Português (Brasil)](../pt-BR/README.m
 
 | 3 | `ch03-control-plane` | [Who May Speak: The Control Plane Learns to Remember](ch03-control-plane.md) |
 
+| 4 | `ch04-data-plane-crypto` | [The Sealed Wire: AEAD, Replay, and the Unforgiving Window](ch04-data-plane-crypto.md) |
+
 Parity across editions is checked by `tests/book/check-parity.sh`.

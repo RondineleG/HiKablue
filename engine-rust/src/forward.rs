@@ -1,34 +1,52 @@
-//! The Phase 1 forwarding loop: raw IPv4 between a TUN device and UDP.
+//! The forwarding loop: IPv4 between a TUN device and UDP.
 //!
 //! Two 2048-byte buffers are allocated once and reused for every packet, so
 //! the hot path performs no per-packet heap allocation. `MAX_MTU` bounds the
-//! configurable inner MTU to what those buffers can carry.
+//! configurable inner MTU to what those buffers can carry after the 30-byte
+//! crypto overhead (14-byte header headroom + 16-byte tag tailroom).
+//!
+//! Phase 2 adds the optional AEAD wire format: with `--key`, every datagram
+//! carries the 14-byte cleartext prefix (type, sender_index, nonce) and a
+//! 16-byte Poly1305 tag; without it the M2 plaintext format is kept so old
+//! lab runs still work.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::signal::unix::{signal, SignalKind};
 
 use crate::cli::Ipv4Cidr;
+use crate::crypto::{CryptoError, SessionState};
 use crate::metrics::{self, Metrics};
 use crate::packet::{destination_ip, source_ip, validate_ipv4};
 use crate::tun::{configure_interface, Tun};
+use crate::wire::{HEADER_LEN, MSG_DATA, MSG_KEEPALIVE, TOTAL_OVERHEAD};
 
-/// Fixed reusable buffer size; also the largest supported inner MTU.
+/// Fixed reusable buffer size.
 pub const BUFFER_SIZE: usize = 2048;
-pub const MAX_MTU: u16 = BUFFER_SIZE as u16;
+/// Largest supported inner MTU: the buffer must also fit the 14-byte
+/// cleartext prefix (headroom) and the 16-byte tag (tailroom).
+pub const MAX_MTU: u16 = (BUFFER_SIZE - TOTAL_OVERHEAD) as u16;
+/// Largest inner MTU that keeps the encrypted outer datagram inside a
+/// 1500-byte path: 1500 minus 58 bytes of overhead (20 IPv4 + 8 UDP +
+/// 14 header + 16 tag).
+pub const MAX_MTU_ENCRYPTED: u16 = 1500 - 58;
+/// Same ceiling over an IPv6 outer: 40 IPv6 + 8 UDP + 30 = 78 bytes.
+pub const MAX_MTU_ENCRYPTED_V6: u16 = 1500 - 78;
 
 #[derive(Debug)]
 pub struct Config {
     pub bind: SocketAddr,
     /// Client only: the fixed remote endpoint.
     pub remote: Option<SocketAddr>,
-    /// Server only: the virtual IP the learned peer must present.
+    /// Virtual IP the peer must present inside the tunnel — the learned
+    /// endpoint on the server, the server's VIP on the client.
     pub peer_vip: Option<Ipv4Addr>,
     pub tun_cidr: Ipv4Cidr,
     pub tun_name: String,
@@ -36,6 +54,17 @@ pub struct Config {
     /// Unix socket that answers GetMetrics.
     pub metrics_sock: PathBuf,
     pub metrics_group: Option<String>,
+    /// Optional 32-byte session key enabling the AEAD wire format.
+    pub key: Option<[u8; 32]>,
+    /// Session index stamped on outbound packets; selects this side's
+    /// derived direction key.
+    pub sender_index: u32,
+    /// Session index the peer stamps on its packets; selects the receive
+    /// direction key. Must differ from `sender_index` when keyed.
+    pub peer_index: u32,
+    /// Idle time before a KEEPALIVE datagram is emitted (only when a
+    /// session key is configured).
+    pub keepalive_interval: Duration,
 }
 
 impl Config {
@@ -45,6 +74,21 @@ impl Config {
                 "mtu {} outside 1..={MAX_MTU} (fixed {BUFFER_SIZE}-byte buffers)",
                 self.mtu
             )));
+        }
+        // A client can never reach a remote of the other family: a v4
+        // socket cannot send to v6 and vice versa. Reject at startup
+        // instead of failing the first connect.
+        if let Some(remote) = self.remote {
+            if remote.is_ipv6() != self.bind.is_ipv6() {
+                return Err(invalid(
+                    "bind and remote address families must match".into(),
+                ));
+            }
+        }
+        // Client mode drops anything the peer did not send: without an
+        // expected peer VIP the ingress check could never run.
+        if self.remote.is_some() && self.peer_vip.is_none() {
+            return Err(invalid("client mode requires a peer vip".into()));
         }
         if let Some(peer) = self.peer_vip {
             if !self.tun_cidr.contains(peer) {
@@ -60,7 +104,50 @@ impl Config {
                 )));
             }
         }
+        if let Some(_key) = self.key {
+            if self.sender_index == 0 || self.peer_index == 0 {
+                return Err(invalid(
+                    "sender_index and peer_index must both be nonzero when --key is set".into(),
+                ));
+            }
+            // The indexes select the derived direction keys; identical
+            // indexes would collapse both directions onto one key.
+            if self.sender_index == self.peer_index {
+                return Err(invalid("sender_index and peer_index must differ".into()));
+            }
+            // A zero interval re-arms instantly and wins every biased
+            // select! round — the loop would emit keepalives forever and
+            // starve TUN and UDP reads.
+            if self.keepalive_interval.is_zero() {
+                return Err(invalid(
+                    "keepalive interval must be greater than zero".into(),
+                ));
+            }
+            let max_mtu = if self.outer_is_ipv6() {
+                MAX_MTU_ENCRYPTED_V6
+            } else {
+                MAX_MTU_ENCRYPTED
+            };
+            if self.mtu > max_mtu {
+                return Err(invalid(format!(
+                    "mtu {} above {max_mtu} (1500-byte path minus {}-byte outer overhead)",
+                    self.mtu,
+                    if self.outer_is_ipv6() { 78 } else { 58 }
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// Outer transport family the socket will actually use. For the client
+    /// the connected remote decides; for the server it's the bind address
+    /// — `[::]` binds dual-stack and IPv4 peers arrive as IPv4-mapped, so
+    /// the conservative IPv6 overhead applies there too.
+    fn outer_is_ipv6(&self) -> bool {
+        match self.remote {
+            Some(remote) => remote.is_ipv6(),
+            None => self.bind.is_ipv6(),
+        }
     }
 }
 
@@ -182,7 +269,8 @@ pub async fn run(cfg: Config) -> io::Result<()> {
 /// TUN (a socketpair end) and real loopback UDP sockets.
 async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
     cfg.validate()?;
-    let is_server = cfg.peer_vip.is_some();
+    // Server mode has no fixed remote; the client always connects one.
+    let is_server = cfg.remote.is_none();
 
     let socket = UdpSocket::bind(cfg.bind).await?;
     if let Some(remote) = cfg.remote {
@@ -224,9 +312,18 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
     }
 
     let mut learned_peer: Option<SocketAddr> = None;
+    // TUN reads land past HEADER_LEN of headroom so sealing needs no copy;
+    // decrypted UDP payloads are consumed in place at the same offset.
     let mut tun_buf = [0u8; BUFFER_SIZE];
     let mut udp_buf = [0u8; BUFFER_SIZE];
     let mut sigterm = signal(SignalKind::terminate())?;
+
+    let session = cfg
+        .key
+        .map(|key| SessionState::new(key, cfg.sender_index, cfg.peer_index));
+    // A datagram send of any kind resets the keepalive deadline — it only
+    // fires while the stream is otherwise idle.
+    let mut next_keepalive = tokio::time::Instant::now() + cfg.keepalive_interval;
 
     loop {
         tokio::select! {
@@ -238,26 +335,77 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
             _ = sigterm.recv() => {
                 break;
             }
-            result = tun.read(&mut tun_buf) => {
+            _ = tokio::time::sleep_until(next_keepalive), if session.is_some() => {
+                next_keepalive = tokio::time::Instant::now() + cfg.keepalive_interval;
+                let session = session.as_ref().unwrap();
+                let wire_len = match session.seal(&mut tun_buf, 0, MSG_KEEPALIVE) {
+                    Ok(n) => n,
+                    Err(err) => {
+                        metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("vpn-engine: cannot seal keepalive: {err}");
+                        continue;
+                    }
+                };
+                let sent = if is_server {
+                    match learned_peer {
+                        Some(peer) => Some(socket.send_to(&tun_buf[..wire_len], peer).await),
+                        // Before the peer is learned there is nowhere to send
+                        // keepalives — the deadline simply re-arms.
+                        None => None,
+                    }
+                } else {
+                    Some(socket.send(&tun_buf[..wire_len]).await)
+                };
+                if let Some(Ok(sent_n)) = sent {
+                    metrics.tx_bytes.fetch_add(sent_n as u64, Ordering::Relaxed);
+                }
+            }
+            result = tun.read(&mut tun_buf[HEADER_LEN..]) => {
                 let n = result?;
-                if validate_ipv4(&tun_buf[..n], cfg.mtu as usize).is_err() {
+                if validate_ipv4(&tun_buf[HEADER_LEN..HEADER_LEN + n], cfg.mtu as usize).is_err() {
                     metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
+                let payload_len = if let Some(session) = &session {
+                    match session.seal(&mut tun_buf, n, MSG_DATA) {
+                        Ok(wire_len) => wire_len,
+                        Err(CryptoError::NonceExhaustionNeedsRekey) => {
+                            metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("vpn-engine: session exhausted, needs rekey");
+                            continue;
+                        }
+                        Err(err) => {
+                            metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("vpn-engine: cannot seal datagram: {err}");
+                            continue;
+                        }
+                    }
+                } else {
+                    HEADER_LEN + n
+                };
                 // A failed send for one datagram (e.g. ECONNREFUSED while the
                 // peer is down, or EMSGSIZE) must not kill the tunnel.
                 let sent = if is_server {
                     match learned_peer {
-                        Some(peer) => Some(socket.send_to(&tun_buf[..n], peer).await),
+                        Some(peer) => {
+                            if session.is_some() {
+                                Some(socket.send_to(&tun_buf[..payload_len], peer).await)
+                            } else {
+                                Some(socket.send_to(&tun_buf[HEADER_LEN..payload_len], peer).await)
+                            }
+                        }
                         None => None,
                     }
+                } else if session.is_some() {
+                    Some(socket.send(&tun_buf[..payload_len]).await)
                 } else {
-                    Some(socket.send(&tun_buf[..n]).await)
+                    Some(socket.send(&tun_buf[HEADER_LEN..payload_len]).await)
                 };
                 match sent {
                     Some(Ok(sent_n)) => {
                         metrics.tx_pkts.fetch_add(1, Ordering::Relaxed);
                         metrics.tx_bytes.fetch_add(sent_n as u64, Ordering::Relaxed);
+                        next_keepalive = tokio::time::Instant::now() + cfg.keepalive_interval;
                     }
                     Some(Err(err)) => {
                         metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
@@ -289,7 +437,44 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
                     metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                let packet = &udp_buf[..real_len];
+
+                // Once the endpoint is pinned, a datagram from anywhere
+                // else is dropped *before* decryption: authenticating it
+                // first would burn its nonce in the replay window and the
+                // peer's real copy would then read as a duplicate.
+                if is_server && learned_peer.is_some_and(|peer| peer != from) {
+                    metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                // Decrypt in place when a session key is configured: the
+                // plaintext replaces the ciphertext at offset HEADER_LEN in
+                // the same buffer — no allocation.
+                let (msg_type, packet) = if let Some(session) = &session {
+                    match session.open(&mut udp_buf, real_len) {
+                        Ok((header, pt_len)) => (
+                            header.message_type,
+                            &udp_buf[HEADER_LEN..HEADER_LEN + pt_len],
+                        ),
+                        Err(_err) => {
+                            metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                } else {
+                    (MSG_DATA, &udp_buf[..real_len])
+                };
+
+                if msg_type == MSG_KEEPALIVE {
+                    // No inner packet to validate or forward: it only proves
+                    // the mapping is warm. The server can only accept it from
+                    // the already-pinned endpoint.
+                    if is_server && learned_peer != Some(from) {
+                        metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+
                 if validate_ipv4(packet, cfg.mtu as usize).is_err() {
                     metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
                     continue;
@@ -304,10 +489,11 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
                         peer_vip,
                         cfg.tun_cidr.addr,
                     ) {
-                        // Learn the endpoint only after structural validation
-                        // and an inner source-IP match. This pins the peer but
-                        // is not authentication: any sender that can reach this
-                        // UDP port and spoof the peer's virtual IP would pass.
+                        // Learn the endpoint only after authentication,
+                        // structural validation and an inner source-IP match.
+                        // This pins the peer; the AEAD tag is what makes the
+                        // pin meaningful — a spoofed sender cannot produce
+                        // one without the session key.
                         ServerInbound::Learn => {
                             learned_peer = Some(from);
                             metrics.peers.store(1, Ordering::Relaxed);
@@ -316,15 +502,33 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
                         ServerInbound::Forward => {}
                         ServerInbound::Drop => {
                             metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                            // The endpoint already matched (or the peer is
+                            // not yet pinned), so a Drop here is always an
+                            // inner-VIP mismatch — src or dst.
+                            if source_ip(packet) != peer_vip {
+                                metrics.invalid_inner_src.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                metrics.invalid_inner_dst.fetch_add(1, Ordering::Relaxed);
+                            }
                             continue;
                         }
                     }
-                } else if destination_ip(packet) != cfg.tun_cidr.addr {
-                    // Client: the connected socket already pins the remote,
-                    // but the peer must not inject packets addressed to
-                    // other tunnel IPs.
-                    metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
-                    continue;
+                } else {
+                    // Client: the connected socket pins the remote, but
+                    // authentication does not authorize inner IPs — the
+                    // peer must not inject packets sourced from or
+                    // addressed to other virtual IPs.
+                    let peer_vip = cfg.peer_vip.expect("client sets peer_vip");
+                    let src = source_ip(packet);
+                    if src != peer_vip || destination_ip(packet) != cfg.tun_cidr.addr {
+                        metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                        if src != peer_vip {
+                            metrics.invalid_inner_src.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            metrics.invalid_inner_dst.fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
                 }
                 tun.write(packet).await?;
                 metrics.rx_pkts.fetch_add(1, Ordering::Relaxed);
@@ -348,6 +552,7 @@ fn test_sigterm() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::TAG_LEN;
 
     fn base() -> Config {
         Config {
@@ -359,6 +564,10 @@ mod tests {
             mtu: 1400,
             metrics_sock: PathBuf::from("/tmp/test.sock"),
             metrics_group: None,
+            key: None,
+            sender_index: 1,
+            peer_index: 0,
+            keepalive_interval: Duration::from_secs(25),
         }
     }
 
@@ -390,6 +599,77 @@ mod tests {
         let mut cfg = base();
         cfg.peer_vip = Some(Ipv4Addr::new(10, 80, 1, 1));
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn keyed_config_rules() {
+        let mut cfg = base();
+        cfg.key = Some([1u8; 32]);
+        // peer_index unset: required once --key is given.
+        assert!(cfg.validate().is_err());
+        cfg.peer_index = 2;
+        assert!(cfg.validate().is_ok());
+        cfg.sender_index = 0;
+        assert!(cfg.validate().is_err());
+        cfg.sender_index = 1;
+        // Identical indexes would collapse both direction keys to one.
+        cfg.peer_index = 1;
+        assert!(cfg.validate().is_err());
+        cfg.peer_index = 2;
+        // A zero keepalive interval would starve the select loop.
+        cfg.keepalive_interval = Duration::ZERO;
+        assert!(cfg.validate().is_err());
+        cfg.keepalive_interval = Duration::from_secs(25);
+        // The outer datagram must still fit a 1500-byte path.
+        cfg.mtu = MAX_MTU_ENCRYPTED + 1;
+        assert!(cfg.validate().is_err());
+        cfg.mtu = MAX_MTU_ENCRYPTED;
+        assert!(cfg.validate().is_ok());
+        // Without a key the fields are unused and the wider buffer limit
+        // still applies.
+        cfg.key = None;
+        cfg.sender_index = 0;
+        cfg.peer_index = 0;
+        cfg.mtu = MAX_MTU;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn keyed_mtu_limit_follows_outer_family() {
+        let mut cfg = base();
+        cfg.key = Some([1u8; 32]);
+        cfg.peer_index = 2;
+        // IPv4 outer (58B overhead): 1442 passes, 1443 is rejected.
+        cfg.mtu = MAX_MTU_ENCRYPTED;
+        assert!(cfg.validate().is_ok());
+        cfg.mtu = MAX_MTU_ENCRYPTED + 1;
+        assert!(cfg.validate().is_err());
+        // IPv6 outer (78B overhead): 1422 passes, 1423 is rejected.
+        cfg.bind = "[::]:51820".parse().unwrap();
+        cfg.mtu = MAX_MTU_ENCRYPTED_V6;
+        assert!(cfg.validate().is_ok());
+        cfg.mtu = MAX_MTU_ENCRYPTED_V6 + 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn client_rejects_mismatched_bind_and_remote_family() {
+        let mut cfg = base();
+        cfg.remote = Some("[::1]:51820".parse().unwrap());
+        // v4 bind + v6 remote is unreachable — rejected at startup.
+        assert!(cfg.validate().is_err());
+        cfg.bind = "[::]:0".parse().unwrap();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn client_requires_peer_vip() {
+        let mut cfg = base();
+        cfg.remote = Some("127.0.0.1:51820".parse().unwrap());
+        cfg.peer_vip = None;
+        assert!(cfg.validate().is_err());
+        cfg.peer_vip = Some(Ipv4Addr::new(10, 80, 1, 2));
+        assert!(cfg.validate().is_ok());
     }
 
     const PEER_VIP: Ipv4Addr = Ipv4Addr::new(10, 80, 1, 2);
@@ -560,6 +840,10 @@ mod tests {
             mtu: 1400,
             metrics_sock: sock_path(tag),
             metrics_group: None,
+            key: None,
+            sender_index: 1,
+            peer_index: 0,
+            keepalive_interval: Duration::from_secs(25),
         }
     }
 
@@ -624,12 +908,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_loop_client_and_server_scenarios() {
-        // SIGTERM is process-wide, so both scenarios must live in one test:
+        // SIGTERM is process-wide, so all scenarios must live in one test:
         // the signal we send to stop one engine would otherwise reach an
         // engine still running in a parallel test and break it.
         let _sig = sigterm_guard();
         client_scenario().await;
         server_scenario().await;
+        crypto_client_scenario().await;
+        crypto_server_scenario().await;
         drop(_sig);
     }
 
@@ -638,7 +924,7 @@ mod tests {
         let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let remote_addr = remote.local_addr().unwrap();
         let bind = free_port();
-        let cfg = cfg_for(bind, Some(remote_addr), None, "cli");
+        let cfg = cfg_for(bind, Some(remote_addr), Some(OTHER_VIP), "cli");
         let bind_addr = cfg.bind;
         let engine = tokio::spawn(run_loop(cfg, tun));
 
@@ -675,8 +961,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        // Drops: foreign inner destination, malformed frame, oversized frame
-        // — none may reach TUN.
+        // Drops: foreign inner source, foreign inner destination,
+        // malformed frame, oversized frame — none may reach TUN.
+        remote
+            .send_to(&ipv4_packet(PEER_VIP, LOCAL_VIP, b"zz"), bind_addr)
+            .await
+            .unwrap();
         remote
             .send_to(&ipv4_packet(OTHER_VIP, OTHER_VIP, b"zz"), bind_addr)
             .await
@@ -748,5 +1038,205 @@ mod tests {
 
         test_sigterm();
         engine.await.unwrap().unwrap();
+    }
+
+    const LAB_KEY: [u8; 32] = [0x42u8; 32];
+
+    /// Client scenario with `--key`: outbound TUN traffic leaves as a sealed
+    /// DATA datagram (1430B wire for 1400B inner max — here a small packet),
+    /// inbound sealed traffic decrypts in place onto TUN, and a tampered
+    /// datagram is dropped without reaching TUN. Runs inside the serialized
+    /// SIGTERM test like the plaintext scenarios.
+    async fn crypto_client_scenario() {
+        let (tun, peer) = fake_tun();
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+        let bind = free_port();
+        let mut cfg = cfg_for(bind, Some(remote_addr), Some(OTHER_VIP), "crypt");
+        cfg.key = Some(LAB_KEY);
+        cfg.peer_index = 2;
+        cfg.keepalive_interval = Duration::from_millis(60);
+        let bind_addr = cfg.bind;
+        let engine = tokio::spawn(run_loop(cfg, tun));
+
+        // TUN -> UDP: the wire datagram carries the 14-byte cleartext
+        // header, ciphertext and the 16-byte tag — never plaintext.
+        let inner = ipv4_packet(LOCAL_VIP, OTHER_VIP, b"out");
+        peer.send(&inner).unwrap();
+        let mut rb = [0u8; 256];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), remote.recv_from(&mut rb))
+            .await
+            .expect("remote receive timed out")
+            .unwrap();
+        assert_eq!(n, inner.len() + TOTAL_OVERHEAD);
+        assert_eq!(rb[0], (crate::wire::frame::VERSION << 4) | MSG_DATA);
+        assert_eq!(rb[1], 0);
+        assert_ne!(&rb[..n], inner.as_slice());
+
+        // The remote seals a reply and it lands decrypted on TUN. Its
+        // session uses complementary indexes: it stamps 2 and expects 1.
+        let peer_session = SessionState::new(LAB_KEY, 2, 1);
+        let reply = ipv4_packet(OTHER_VIP, LOCAL_VIP, b"in");
+        let mut seal_buf = vec![0u8; HEADER_LEN + reply.len() + TAG_LEN + 32];
+        seal_buf[HEADER_LEN..HEADER_LEN + reply.len()].copy_from_slice(&reply);
+        let wire_len = peer_session
+            .seal(&mut seal_buf, reply.len(), MSG_DATA)
+            .unwrap();
+        let mut tb = [0u8; 256];
+        let mut landed = false;
+        for _ in 0..40 {
+            remote
+                .send_to(&seal_buf[..wire_len], bind_addr)
+                .await
+                .unwrap();
+            if let Ok(n) = peer.recv(&mut tb) {
+                assert_eq!(&tb[..n], reply.as_slice());
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(landed, "sealed inbound packet never reached TUN");
+
+        // A forged datagram (one flipped ciphertext bit) is dropped — it can
+        // neither authenticate nor claim the replay slot.
+        let mut forged = seal_buf[..wire_len].to_vec();
+        forged[HEADER_LEN] ^= 0x40;
+        remote.send_to(&forged, bind_addr).await.unwrap();
+        // Re-sending the same valid datagram is a replay: also dropped.
+        remote
+            .send_to(&seal_buf[..wire_len], bind_addr)
+            .await
+            .unwrap();
+        // An authenticated packet sourced from an inner IP that is not
+        // the peer's VIP is dropped too: authentication proves who sent
+        // it, it does not authorize the inner addresses.
+        let spoofed = ipv4_packet(PEER_VIP, LOCAL_VIP, b"spoof");
+        let mut spoof_buf = vec![0u8; HEADER_LEN + spoofed.len() + TAG_LEN + 32];
+        spoof_buf[HEADER_LEN..HEADER_LEN + spoofed.len()].copy_from_slice(&spoofed);
+        let spoof_len = peer_session
+            .seal(&mut spoof_buf, spoofed.len(), MSG_DATA)
+            .unwrap();
+        remote
+            .send_to(&spoof_buf[..spoof_len], bind_addr)
+            .await
+            .unwrap();
+        assert!(peer.recv(&mut tb).is_err(), "dropped packet reached TUN");
+
+        // Idle for a beat: the engine emits a sealed KEEPALIVE (header + tag,
+        // no payload) without any TUN traffic.
+        let mut kb = [0u8; 64];
+        let (kn, _) = tokio::time::timeout(Duration::from_secs(2), remote.recv_from(&mut kb))
+            .await
+            .expect("keepalive timed out")
+            .unwrap();
+        assert_eq!(kn, HEADER_LEN + TAG_LEN);
+        assert_eq!(kb[0], (crate::wire::frame::VERSION << 4) | MSG_KEEPALIVE);
+
+        // An inbound sealed KEEPALIVE is accepted but never reaches TUN.
+        let mut ka_buf = vec![0u8; HEADER_LEN + TAG_LEN + 16];
+        let ka_len = peer_session.seal(&mut ka_buf, 0, MSG_KEEPALIVE).unwrap();
+        remote.send_to(&ka_buf[..ka_len], bind_addr).await.unwrap();
+        assert!(peer.recv(&mut tb).is_err(), "keepalive reached TUN");
+
+        test_sigterm();
+        engine.await.unwrap().unwrap();
+    }
+
+    /// Keyed server: learns the peer from an authenticated datagram,
+    /// drops a cross-endpoint replay before decrypting it (so the real
+    /// copy still lands), and emits sealed KEEPALIVEs while idle.
+    async fn crypto_server_scenario() {
+        let (tun, peer) = fake_tun();
+        let bind = free_port();
+        let mut cfg = cfg_for(bind, None, Some(PEER_VIP), "csrv");
+        cfg.key = Some(LAB_KEY);
+        cfg.sender_index = 2;
+        cfg.peer_index = 1;
+        cfg.keepalive_interval = Duration::from_millis(60);
+        let bind_addr = cfg.bind;
+        let engine = tokio::spawn(run_loop(cfg, tun));
+        let good = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // The lab peer stamps index 1 and expects 2.
+        let peer_session = SessionState::new(LAB_KEY, 1, 2);
+
+        // Learn: an authenticated datagram carrying the peer's inner VIP
+        // pins the endpoint and forwards to TUN.
+        let hello = ipv4_packet(PEER_VIP, LOCAL_VIP, b"hi");
+        let mut seal_buf = vec![0u8; HEADER_LEN + hello.len() + TAG_LEN + 32];
+        seal_buf[HEADER_LEN..HEADER_LEN + hello.len()].copy_from_slice(&hello);
+        let wire_len = peer_session
+            .seal(&mut seal_buf, hello.len(), MSG_DATA)
+            .unwrap();
+        let mut tb = [0u8; 256];
+        let mut landed = false;
+        for _ in 0..40 {
+            good.send_to(&seal_buf[..wire_len], bind_addr)
+                .await
+                .unwrap();
+            if let Ok(n) = peer.recv(&mut tb) {
+                assert_eq!(&tb[..n], hello.as_slice());
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(landed, "sealed learn packet never reached TUN");
+
+        // Endpoint pinning runs before decryption: a captured, still
+        // unseen datagram replayed by a different endpoint is dropped
+        // without burning its nonce, so the real copy from the pinned
+        // endpoint still authenticates and lands on TUN.
+        let fresh = ipv4_packet(PEER_VIP, LOCAL_VIP, b"second");
+        let mut captured = vec![0u8; HEADER_LEN + fresh.len() + TAG_LEN + 32];
+        captured[HEADER_LEN..HEADER_LEN + fresh.len()].copy_from_slice(&fresh);
+        let cap_len = peer_session
+            .seal(&mut captured, fresh.len(), MSG_DATA)
+            .unwrap();
+        stranger
+            .send_to(&captured[..cap_len], bind_addr)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut landed = false;
+        for _ in 0..40 {
+            good.send_to(&captured[..cap_len], bind_addr).await.unwrap();
+            if let Ok(n) = peer.recv(&mut tb) {
+                assert_eq!(&tb[..n], fresh.as_slice());
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(landed, "cross-endpoint replay poisoned the replay window");
+
+        // Idle server with a learned peer emits sealed keepalives.
+        let mut kb = [0u8; 64];
+        let (kn, from) = tokio::time::timeout(Duration::from_secs(2), good.recv_from(&mut kb))
+            .await
+            .expect("server keepalive timed out")
+            .unwrap();
+        assert_eq!(from, bind_addr);
+        assert_eq!(kn, HEADER_LEN + TAG_LEN);
+        assert_eq!(kb[0], (crate::wire::frame::VERSION << 4) | MSG_KEEPALIVE);
+
+        test_sigterm();
+        engine.await.unwrap().unwrap();
+    }
+
+    /// A metrics socket that cannot bind aborts the engine with a clear
+    /// error — no half-running forwarder. The loop exits before the signal
+    /// registration, so no SIGTERM interplay with the serialized test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_loop_fails_when_metrics_socket_cannot_bind() {
+        let (tun, _peer) = fake_tun();
+        let bad = PathBuf::from(format!("/tmp/hkfwd-{}-bad.sock", std::process::id()));
+        std::fs::write(&bad, b"occupied").unwrap(); // a file, not a socket
+        let mut cfg = cfg_for(free_port(), None, Some(PEER_VIP), "badm");
+        cfg.metrics_sock = bad.clone();
+        let err = run_loop(cfg, tun).await.unwrap_err();
+        assert!(err.to_string().contains("metrics"));
+        std::fs::remove_file(&bad).ok();
     }
 }
