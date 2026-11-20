@@ -83,29 +83,44 @@ public class HttpContractTests : IClassFixture<WebApplicationFactory<Program>>
         Assert.False(doc.RootElement.GetProperty("data").ValueKind == JsonValueKind.Object);
     }
 
-    [Fact]
-    public async Task HeartbeatOverLimitsReturns422()
+    // One test per limit so a regression in a single rule cannot hide
+    // behind the others; boundary values assert the allowed edge passes.
+
+    [Theory]
+    [InlineData(128, HttpStatusCode.Accepted)]
+    [InlineData(129, HttpStatusCode.UnprocessableEntity)]
+    public async Task HeartbeatNodeIdLengthBoundary(int length, HttpStatusCode expected)
     {
-        var metrics = Enumerable.Range(0, 65).ToDictionary(i => $"k{i}", i => (long)i);
-
         var response = await PostHeartbeat(
-            new { nodeId = new string('n', 129), engineHealthy = true, metrics });
+            new { nodeId = new string('n', length), engineHealthy = true });
 
-        Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
-
-        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-        Assert.False(doc.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal(expected, response.StatusCode);
     }
 
-    [Fact]
-    public async Task HeartbeatOversizedMetricKeyReturns422()
+    [Theory]
+    [InlineData(64, HttpStatusCode.Accepted)]
+    [InlineData(65, HttpStatusCode.UnprocessableEntity)]
+    public async Task HeartbeatMetricsCountBoundary(int count, HttpStatusCode expected)
     {
-        var metrics = new Dictionary<string, long> { [new string('k', 65)] = 1 };
+        var metrics = Enumerable.Range(0, count).ToDictionary(i => $"k{i}", i => (long)i);
 
         var response = await PostHeartbeat(
-            new { nodeId = "ok-node", engineHealthy = true, metrics });
+            new { nodeId = $"boundary-{count}", engineHealthy = true, metrics });
 
-        Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
+        Assert.Equal(expected, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData(64, HttpStatusCode.Accepted)]
+    [InlineData(65, HttpStatusCode.UnprocessableEntity)]
+    public async Task HeartbeatMetricKeyLengthBoundary(int length, HttpStatusCode expected)
+    {
+        var metrics = new Dictionary<string, long> { [new string('k', length)] = 1 };
+
+        var response = await PostHeartbeat(
+            new { nodeId = $"key-boundary-{length}", engineHealthy = true, metrics });
+
+        Assert.Equal(expected, response.StatusCode);
     }
 
     [Fact]
