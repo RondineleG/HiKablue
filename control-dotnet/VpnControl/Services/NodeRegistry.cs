@@ -21,19 +21,22 @@ public sealed class NodeRegistry
             if (_nodes.TryGetValue(hb.NodeId, out var node))
             {
                 node.Record(_clock(), hb.EngineHealthy, hb.Metrics);
-                return node;
+                return node.Snapshot();
             }
             var created = new Node(hb.NodeId, _clock(), hb.EngineHealthy, hb.Metrics);
             _nodes[hb.NodeId] = created;
-            return created;
+            return created.Snapshot();
         }
     }
 
+    // Snapshots are built inside the lock: each returned Node is detached
+    // from the registry, so concurrent heartbeats can't race a ToView().
     public IReadOnlyList<Node> List()
     {
         lock (_nodes)
         {
-            return _nodes.Values.OrderBy(n => n.NodeId).ToList();
+            return _nodes.Values.OrderBy(n => n.NodeId)
+                .Select(n => n.Snapshot()).ToList();
         }
     }
 }

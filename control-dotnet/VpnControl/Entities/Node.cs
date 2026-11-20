@@ -15,7 +15,7 @@ public sealed class Node : BaseEntity
         NodeId = nodeId;
         LastSeen = lastSeen;
         EngineHealthy = engineHealthy;
-        Metrics = metrics;
+        Metrics = CopyMetrics(metrics);
     }
 
     public string NodeId { get; }
@@ -28,8 +28,18 @@ public sealed class Node : BaseEntity
     {
         LastSeen = seen;
         EngineHealthy = engineHealthy;
-        Metrics = metrics;
+        Metrics = CopyMetrics(metrics);
     }
 
-    public NodeView ToView() => new(NodeId, LastSeen, EngineHealthy, Metrics);
+    // Caller-owned dictionaries are mutable after we store them; keep a
+    // private copy so a later mutation can't corrupt registry state.
+    private static Dictionary<string, long>? CopyMetrics(
+        IReadOnlyDictionary<string, long>? metrics) =>
+        metrics is null ? null : new Dictionary<string, long>(metrics);
+
+    /// Detached, consistent copy of the current state — safe to hand out of
+    /// the registry's lock; later heartbeats can't mutate what callers hold.
+    public Node Snapshot() => new(NodeId, LastSeen, EngineHealthy, Metrics);
+
+    public NodeView ToView() => new(NodeId, LastSeen, EngineHealthy, CopyMetrics(Metrics));
 }
