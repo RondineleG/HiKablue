@@ -243,4 +243,63 @@ public sealed class SessionServiceTests : IAsyncLifetime
         var a2 = await _service.CreateSessionAsync(new CreateSessionRequest(NodeId: "node-a"), "alice", null);
         Assert.Equal(2, a2.Data!.LabSessionId);
     }
+
+    [Fact]
+    public async Task InvalidPoolCidrFailsFast()
+    {
+        BeatNode();
+        var service = NewService(poolCidr: "not-a-cidr");
+        var result = await service.CreateSessionAsync(
+            new CreateSessionRequest(), "alice", "k1", CancellationToken.None);
+        Assert.False(result.IsSuccess);
+        Assert.Contains("IpPoolCidr", result.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task RevokeUnknownSessionReturnsNotFound()
+    {
+        var result = await _service.RevokeSessionAsync(Guid.NewGuid(), "alice",
+            isAdmin: false, CancellationToken.None);
+        Assert.False(result.IsSuccess);
+        Assert.Equal(EResultStatus.EntityNotFound, result.Status);
+    }
+
+    [Fact]
+    public async Task RevokeTerminalSessionIsIdempotent()
+    {
+        var sessionId = Guid.NewGuid();
+        await using (var db = NewDb())
+        {
+            db.Nodes.Add(new NodeRow
+            {
+                NodeId = "node-a", BackendInstanceId = "b1",
+                RegisteredAt = DateTimeOffset.UtcNow, EngineHealthy = true
+            });
+            db.Sessions.Add(new SessionRow
+            {
+                SessionId = sessionId, OwnerSubject = "alice",
+                Status = SessionStatus.Revoked, NodeId = "node-a",
+                LabSessionId = 1, ExpiresAt = DateTimeOffset.UtcNow,
+                CreatedAt = DateTimeOffset.UtcNow,
+                UpdatedAt = DateTimeOffset.UtcNow
+            });
+            await db.SaveChangesAsync();
+        }
+        var result = await _service.RevokeSessionAsync(sessionId, "alice",
+            isAdmin: false, CancellationToken.None);
+        Assert.True(result.IsSuccess);
+        Assert.Equal("already terminal", result.Message);
+    }
+
+    [Fact]
+    public async Task IpLeaseRowIsConstructible()
+    {
+        var row = new IpLeaseRow
+        {
+            Address = IPAddress.Parse("10.99.0.9"), NodeId = "node-a",
+            SessionId = Guid.NewGuid(), ReservedAt = DateTimeOffset.UtcNow
+        };
+        Assert.Equal("10.99.0.9", row.Address.ToString());
+        Assert.Equal("node-a", row.NodeId);
+    }
 }

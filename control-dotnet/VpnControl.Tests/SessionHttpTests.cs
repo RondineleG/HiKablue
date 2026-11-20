@@ -131,4 +131,25 @@ public sealed class SessionHttpTests : IAsyncLifetime
         Assert.True(ready.StatusCode == HttpStatusCode.OK,
             $"ready returned {ready.StatusCode}: {await ready.Content.ReadAsStringAsync()}");
     }
+
+    [Fact]
+    public async Task GetAndDeleteWithoutSubjectReturn401()
+    {
+        var created = await _client.SendAsync(
+            Req(HttpMethod.Post, "/v1/sessions", body: new { }));
+        var statusUrl = JsonDocument.Parse(await created.Content.ReadAsStringAsync())
+            .RootElement.GetProperty("data").GetProperty("statusUrl").GetString()!;
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await _client.SendAsync(Req(HttpMethod.Get, statusUrl, subject: null))).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await _client.SendAsync(Req(HttpMethod.Delete, statusUrl, subject: null))).StatusCode);
+    }
+
+    [Fact]
+    public async Task ReadyReturns503WhenDatabaseIsDown()
+    {
+        await _pg.StopAsync();
+        var ready = await _client.GetAsync("/health/ready");
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, ready.StatusCode);
+    }
 }

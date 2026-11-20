@@ -110,7 +110,10 @@ if ! (cd "$ROOT/agent-go" && "$GO_BIN" test -coverpkg=./... \
   line go "FAIL: go test -coverprofile failed"
   fail=1
 else
-  go_out=$(cd "$ROOT/agent-go" && "$GO_BIN" tool cover -func=coverage.out 2>/dev/null | tail -1)
+  # Generated protobuf code (agent-go/gen/) is excluded from the gate, like
+  # the source-generated OpenApi code excluded in coverlet.runsettings.
+  go_out=$(cd "$ROOT/agent-go" && grep -v "/gen/" coverage.out > .coverage-filtered.out \
+      && "$GO_BIN" tool cover -func=.coverage-filtered.out 2>/dev/null | tail -1)
   go_pct=$(echo "$go_out" | grep -oP '[0-9]+\.[0-9]+(?=%)' || true)
   if [ -z "$go_pct" ]; then
     line go "FAIL: go tool cover produced no total"

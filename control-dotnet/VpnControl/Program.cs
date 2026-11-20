@@ -1,7 +1,11 @@
+using System.Security.Cryptography.X509Certificates;
+using Microsoft.AspNetCore.Server.Kestrel.Https;
 using Microsoft.EntityFrameworkCore;
 using VpnControl.Data;
 using VpnControl.Extensions;
 using VpnControl.Security;
+using VpnControl.Services;
+using VpnControl.Workers;
 
 // Milestone 1 slice of vpn-control: a local heartbeat intake plus a node
 // list, both backed by an in-memory registry. The HTTP heartbeat is
@@ -20,6 +24,35 @@ builder.WebHost.UseUrls(LoopbackGuard.ListenUrls(builder.Configuration));
 
 builder.Services.AddOpenApi();
 builder.Services.AddVpnControl();
+
+// Milestone 3 gRPC loop: mTLS client certs carry the node's SPIFFE SAN;
+// certificates are optional at the TLS layer (the REST surface stays
+// reachable without one) and the NodeChannel enforces identity itself.
+// When VpnControl:LabCaPath points at the lab CA, client certificates
+// chain against it instead of the system roots.
+builder.Services.AddGrpc();
+builder.Services.AddSingleton<NodeStreamRegistry>();
+builder.Services.AddHostedService<OutboxDispatcherWorker>();
+builder.Services.AddHostedService<LeaseReaperWorker>();
+
+var labCaPath = builder.Configuration["VpnControl:LabCaPath"];
+if (!string.IsNullOrEmpty(labCaPath) && File.Exists(labCaPath))
+{
+    var labCa = X509CertificateLoader.LoadCertificateFromFile(labCaPath);
+    builder.WebHost.ConfigureKestrel(k => k.ConfigureHttpsDefaults(h =>
+    {
+        h.ClientCertificateMode = ClientCertificateMode.AllowCertificate;
+        h.ClientCertificateValidation = (cert, _, _) =>
+        {
+            using var chain = new X509Chain();
+            chain.ChainPolicy.ExtraStore.Add(labCa);
+            chain.ChainPolicy.CustomTrustStore.Add(labCa);
+            chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+            return chain.Build(cert);
+        };
+    }));
+}
 
 // Milestone 3 store. The connection string is read lazily from the fully
 // composed configuration (test hosts inject it via ConfigureAppConfiguration,
@@ -44,6 +77,7 @@ if (!string.IsNullOrEmpty(app.Configuration["VpnControl:ConnectionString"]))
 HeartbeatAuth.RequireToken(app.Configuration);
 
 await app.MapRegisteredEndpointsAsync();
+app.MapGrpcService<NodeChannelService>();
 // OpenAPI doc stays loopback-only with the rest of the service.
 app.MapOpenApi();
 app.Run();

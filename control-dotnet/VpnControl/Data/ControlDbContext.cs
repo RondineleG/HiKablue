@@ -88,7 +88,15 @@ public sealed class ControlDbContext(DbContextOptions<ControlDbContext> options)
             e.Property(o => o.CommandType).HasColumnName("command_type");
             e.Property(o => o.Payload).HasColumnName("payload").HasColumnType("jsonb");
             e.Property(o => o.Revision).HasColumnName("revision");
+            e.Property(o => o.StreamEpoch).HasColumnName("stream_epoch");
+            e.Property(o => o.BackendInstanceId).HasColumnName("backend_instance_id");
+            e.Property(o => o.Status).HasColumnName("status");
+            e.Property(o => o.Attempts).HasColumnName("attempts");
+            e.Property(o => o.NextRetryAt).HasColumnName("next_retry_at");
+            e.Property(o => o.Deadline).HasColumnName("deadline");
             e.Property(o => o.CreatedAt).HasColumnName("created_at");
+            e.HasIndex(o => new { o.Status, o.NextRetryAt })
+                .HasFilter("status = 'pending'");
             e.Property(o => o.DeliveredAt).HasColumnName("delivered_at");
             e.Property(o => o.AckedAt).HasColumnName("acked_at");
         });

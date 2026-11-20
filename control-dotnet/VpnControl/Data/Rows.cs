@@ -55,6 +55,14 @@ public sealed class OutboxRow
     public required string CommandType { get; set; }
     public required string Payload { get; set; } // jsonb
     public long Revision { get; set; }
+    // Fencing fields stamped when the command is dispatched to a stream.
+    public string? StreamEpoch { get; set; }
+    public string? BackendInstanceId { get; set; }
+    // pending → sent → acked | failed (M3 dispatcher state machine).
+    public string Status { get; set; } = "pending";
+    public int Attempts { get; set; }
+    public DateTimeOffset? NextRetryAt { get; set; }
+    public DateTimeOffset? Deadline { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset? DeliveredAt { get; set; }
     public DateTimeOffset? AckedAt { get; set; }
