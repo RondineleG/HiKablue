@@ -430,6 +430,7 @@ engine-rust/target/
 
 # coverage artifacts
 agent-go/coverage.out
+agent-go/.coverage-filtered.out
 control-dotnet/**/TestResults/
 
 # Lab PKI output (tests/lab/gen-lab-pki.sh) — unencrypted lab keys, never committed
