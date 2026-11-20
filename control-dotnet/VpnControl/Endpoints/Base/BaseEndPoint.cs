@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 using VpnControl.Entities.Base;
 using VpnControl.Interfaces.UseCases;
 using VpnControl.Models;
@@ -26,33 +27,18 @@ public abstract class BaseEndPoint<TEntity>
         return $"/v{version}/{route}";
     }
 
-    /// Reads back the endpoint just added by MapGet/MapPost etc., so the
-    /// registration result reports what was actually mapped (display name,
-    /// route pattern, verbs) instead of restating them by hand.
-    protected static EndpointRegistrationResponse DescribeLastMapped(WebApplication app)
-    {
-        var endpoint = ((IEndpointRouteBuilder)app).DataSources
-            .SelectMany(ds => ds.Endpoints)
-            .LastOrDefault()
-            ?? throw new InvalidOperationException("no endpoint was mapped");
-        var route = endpoint is RouteEndpoint re ? re.RoutePattern.RawText ?? "" : "";
-        var methods = endpoint.Metadata.GetMetadata<IHttpMethodMetadata>()?.HttpMethods;
-        var name = endpoint.Metadata.GetMetadata<IEndpointNameMetadata>()?.EndpointName
-            ?? endpoint.DisplayName ?? "";
-        return new EndpointRegistrationResponse(
-            name, route, methods is { Count: > 0 } ? string.Join(",", methods) : "");
-    }
-
     protected static Task<IResult> HandleUseCase<TRequest, TResponse>(
         IUseCase<TRequest, TResponse> useCase,
-        TRequest request) =>
-        HandleUseCaseAsync(useCase, request, MapResponse, "Internal Server Error");
+        TRequest request,
+        ILogger? logger = null) =>
+        HandleUseCaseAsync(useCase, request, MapResponse, "Internal Server Error", logger);
 
     protected static async Task<IResult> HandleUseCaseAsync<TRequest, TResponse>(
         IUseCase<TRequest, TResponse> useCase,
         TRequest request,
         Func<RequestResult<TResponse>, IResult> successHandler,
-        string errorTitle)
+        string errorTitle,
+        ILogger? logger = null)
     {
         ArgumentNullException.ThrowIfNull(useCase);
         try
@@ -66,14 +52,20 @@ public abstract class BaseEndPoint<TEntity>
         }
         catch (Exception ex)
         {
+            // SEC: never echo ex.Message to the wire — it can carry paths,
+            // config values, connection strings. Log it server-side keyed by
+            // the correlation id instead; the body stays generic.
+            var correlationId = Activity.Current?.Id;
+            logger?.LogError(ex, "{ErrorTitle} (correlation: {CorrelationId})",
+                errorTitle, correlationId ?? "none");
             var response = new ApiResponse<object>
             {
                 Success = false,
                 StatusCode = StatusCodes.Status500InternalServerError,
                 Message = errorTitle,
-                Errors = new[] { ex.Message },
+                Errors = null,
                 Timestamp = DateTime.UtcNow,
-                CorrelationId = Activity.Current?.Id
+                CorrelationId = correlationId
             };
             return Results.Json(response, statusCode: StatusCodes.Status500InternalServerError);
         }

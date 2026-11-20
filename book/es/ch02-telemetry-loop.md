@@ -11,8 +11,9 @@ vivo.
 
 > **Límite del laboratorio.** Como en el capítulo 1, todo aquí corre en un
 > laboratorio aislado y autorizado (`.agc/RULES.md` LAB-01). El socket de
-> métricas todavía no tiene autenticación; el hito del plano de control
-> reemplazará el heartbeat HTTP temporal por el stream gRPC `NodeChannel`.
+> métricas todavía no tiene autenticación; el heartbeat HTTP temporal solo
+> responde al secreto compartido `X-Heartbeat-Token` hasta que el hito del
+> plano de control lo reemplace por el stream gRPC `NodeChannel`.
 
 ## Qué construimos, y por qué está dividido así
 
@@ -189,17 +190,10 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 - **`ctx` / deadline de contexto** — la forma de Go de llevar "rendirse
   después de T" a llamadas bloqueantes; aquí aplicado a reads/writes del
   socket.
-- **`DescribeLastMapped` / `IEndpointNameMetadata` / `RoutePattern` /
-  `IHttpMethodMetadata`** — cómo un registro se reporta con honestidad:
-  tras `MapGet`/`MapPost` (las llamadas que registran la ruta HTTP de
-  GET/POST), `DescribeLastMapped` lee el registro que el
-  framework acaba de montar — `IEndpointNameMetadata` guarda el nombre
-  dado por `WithName`, `RoutePattern` el texto de la ruta,
-  `IHttpMethodMetadata` los verbos HTTP — en vez de repetirlos a mano.
 - **`IEndpointAsync`** — la pequeña interfaz que implementa cada clase de
-  endpoint (`Task<RequestResult<EndpointRegistrationResponse>>
-  RegisterAsync(WebApplication)`), manteniendo el registro de rutas fuera
-  de `Program.cs` y reportando cada ruta mapeada como resultado tipado.
+  endpoint (`Task RegisterAsync(WebApplication)`), manteniendo el
+  registro de rutas fuera de `Program.cs`: el registro o mapea la ruta
+  o lanza, y el propio arranque es el canal de fallo.
 - **`io.ReadFull` / `read_exact`** — helpers leer-hasta-llenar-el-buffer que
   convierten semántica de stream en semántica de frames.
 - **`lastSeen`** — timestamp del último heartbeat, separado del último
@@ -208,7 +202,7 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   antes del payload, para que el lector sepa cuánto ensamblar.
 - **`LoopbackGuard`** — la verificación de arranque que inspecciona las
   URLs configuradas y rechaza arrancar en un enlace no-loopback mientras
-  los heartbeats no se autentican.
+  la entrada de heartbeats es un stand-in de laboratorio.
 - **`0660` + grupo dedicado** — modo del socket Unix que da acceso al dueño
   y al grupo nombrado; la forma del procedimiento de laboratorio de
   compartir el socket del motor con el agente sin privilegios sin abrirlo a
@@ -232,6 +226,26 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Notas de revisión
 
+- `r13` — Limitaciones documentadas cerradas: los heartbeats exigen el
+  secreto compartido `X-Heartbeat-Token` (el arranque rechaza sin
+  `VpnControl:HeartbeatToken`), el payload queda acotado (`node_id` ≤ 128,
+  ≤ 64 claves de métrica ≤ 64 caracteres cada una, las violaciones
+  responden 422) y los nodos que dejan de latir expiran del registro a los
+  10 minutos.
+- `r12` — Registro simplificado: `RegisterAsync` vuelve a devolver un
+  `Task` plano — el `RequestResult<EndpointRegistrationResponse>` tipado
+  y el lector de metadatos `DescribeLastMapped` eran ceremonia que nadie
+  consumía, así que `EndpointRegistrationResponse` y `EndpointMappingTests`
+  también salieron. `MapRegisteredEndpointsAsync` solo espera cada
+  registro; uno roto lanza y aborta el arranque.
+- `r11` — Endurecimiento posterior al merge: `NodeRegistry` ahora
+  entrega snapshots de `Node` desconectados, construidos dentro del lock
+  (los heartbeats ya no compiten con un `ToView()`), `Node` copia los
+  diccionarios de métricas del llamador, y `BaseEndPoint` responde los
+  500 sólo con el título genérico — los detalles de la excepción van al
+  `ILogger` con el correlation id, nunca al response. El colector de
+  cobertura ganó su propia suite (`tests/coverage.test.sh`) sobre
+  `coverage-lib.sh` y los parsers `lcov-percent.py`/`cobertura-percent.py`.
 - `r10` — Gate de cobertura (TEST-02): `tests/coverage.sh` ahora falla el
   gate por debajo del 90% por componente. `run` se dividió para que
   `run_loop` sea testeable con un socketpair como TUN; `main` pasó a ser un
@@ -272,8 +286,8 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   sobre (`request_id`/`version`/`op`/`payload` obligatorios, solo versión
   1, sobres de error JSON válidos, respuestas serializadas con
   serde_json); `bind()` rechaza rutas que no son socket y solo elimina
-  sockets obsoletos; vpn-control valida sus URLs y rechaza cualquier
-  enlace no-loopback mientras los heartbeats no se autentican; el demo
+  sockets obsoletos; vpn-control exige el secreto compartido
+  `X-Heartbeat-Token` y rechaza cualquier enlace no-loopback; el demo
   guarda todo su estado en un directorio exclusivo por ejecución, rechaza
   puertos/interfaces ocupados y documenta que el script — no el agente —
   reenvía el heartbeat.

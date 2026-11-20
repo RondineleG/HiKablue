@@ -1,25 +1,54 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.Configuration;
 using Xunit;
 
 namespace VpnControl.Tests;
 
 /// HTTP contract tests (TEST-01): every route answers in the ApiResponse
-/// envelope — the node list under `data`, 202 for a valid heartbeat, 422
-/// for a blank nodeId.
+/// envelope — the node list under `data`, 202 for a valid heartbeat, 401
+/// without the shared token, 422 for an invalid payload.
 public class HttpContractTests : IClassFixture<WebApplicationFactory<Program>>
 {
+    private const string TestToken = "contract-test-token";
     private readonly HttpClient _client;
 
-    public HttpContractTests(WebApplicationFactory<Program> factory) =>
-        _client = factory.CreateClient();
+    public HttpContractTests(WebApplicationFactory<Program> factory)
+    {
+        // The secret is injected per-test-host via configuration — no
+        // process-wide environment variable, so parallel test classes can't
+        // observe or clobber each other's token (and nothing is left set
+        // after the run).
+        _client = factory.WithWebHostBuilder(builder =>
+            builder.ConfigureAppConfiguration(configuration =>
+                configuration.AddInMemoryCollection(
+                    new Dictionary<string, string?>
+                    {
+                        ["VpnControl:HeartbeatToken"] = TestToken
+                    })))
+            .CreateClient();
+    }
+
+    private Task<HttpResponseMessage> PostHeartbeat(object body, string? token = TestToken)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, "/internal/heartbeats")
+        {
+            Content = JsonContent.Create(body)
+        };
+        if (token is not null)
+        {
+            request.Headers.Add("X-Heartbeat-Token", token);
+        }
+        return _client.SendAsync(request);
+    }
 
     [Fact]
     public async Task HeartbeatValidReturns202WithApiEnvelope()
     {
-        var response = await _client.PostAsJsonAsync("/internal/heartbeats",
+        var response = await PostHeartbeat(
             new { nodeId = "contract-node", engineHealthy = true, metrics = new { rx_bytes = 5 } });
 
         Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
@@ -31,9 +60,48 @@ public class HttpContractTests : IClassFixture<WebApplicationFactory<Program>>
     }
 
     [Fact]
+    public async Task HeartbeatWithoutTokenReturns401()
+    {
+        var response = await PostHeartbeat(
+            new { nodeId = "no-token", engineHealthy = true }, token: null);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.False(doc.RootElement.GetProperty("success").GetBoolean());
+    }
+
+    [Fact]
+    public async Task HeartbeatWithWrongTokenReturns401()
+    {
+        var response = await PostHeartbeat(
+            new { nodeId = "wrong-token", engineHealthy = true }, token: "not-the-secret");
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public void StartupWithoutTokenFails()
+    {
+        // Fail-closed: a host built without the configured secret must never
+        // reach Run() — the token check throws during startup, before the
+        // endpoint can answer unauthenticated.
+        using var factory = new WebApplicationFactory<Program>()
+            .WithWebHostBuilder(builder =>
+                builder.ConfigureAppConfiguration(configuration =>
+                    configuration.AddInMemoryCollection(
+                        new Dictionary<string, string?>
+                        {
+                            ["VpnControl:HeartbeatToken"] = null
+                        })));
+
+        Assert.Throws<InvalidOperationException>(() => factory.CreateClient());
+    }
+
+    [Fact]
     public async Task HeartbeatBlankNodeIdReturns422()
     {
-        var response = await _client.PostAsJsonAsync("/internal/heartbeats",
+        var response = await PostHeartbeat(
             new { nodeId = "  ", engineHealthy = true });
 
         Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
@@ -43,10 +111,50 @@ public class HttpContractTests : IClassFixture<WebApplicationFactory<Program>>
         Assert.False(doc.RootElement.GetProperty("data").ValueKind == JsonValueKind.Object);
     }
 
+    // One test per limit so a regression in a single rule cannot hide
+    // behind the others; boundary values assert the allowed edge passes.
+
+    [Theory]
+    [InlineData(128, HttpStatusCode.Accepted)]
+    [InlineData(129, HttpStatusCode.UnprocessableEntity)]
+    public async Task HeartbeatNodeIdLengthBoundary(int length, HttpStatusCode expected)
+    {
+        var response = await PostHeartbeat(
+            new { nodeId = new string('n', length), engineHealthy = true });
+
+        Assert.Equal(expected, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData(64, HttpStatusCode.Accepted)]
+    [InlineData(65, HttpStatusCode.UnprocessableEntity)]
+    public async Task HeartbeatMetricsCountBoundary(int count, HttpStatusCode expected)
+    {
+        var metrics = Enumerable.Range(0, count).ToDictionary(i => $"k{i}", i => (long)i);
+
+        var response = await PostHeartbeat(
+            new { nodeId = $"boundary-{count}", engineHealthy = true, metrics });
+
+        Assert.Equal(expected, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData(64, HttpStatusCode.Accepted)]
+    [InlineData(65, HttpStatusCode.UnprocessableEntity)]
+    public async Task HeartbeatMetricKeyLengthBoundary(int length, HttpStatusCode expected)
+    {
+        var metrics = new Dictionary<string, long> { [new string('k', length)] = 1 };
+
+        var response = await PostHeartbeat(
+            new { nodeId = $"key-boundary-{length}", engineHealthy = true, metrics });
+
+        Assert.Equal(expected, response.StatusCode);
+    }
+
     [Fact]
     public async Task GetNodesReturnsNodeListInsideData()
     {
-        await _client.PostAsJsonAsync("/internal/heartbeats",
+        await PostHeartbeat(
             new { nodeId = "listed-node", engineHealthy = false, metrics = new { rx_bytes = 42 } });
 
         var response = await _client.GetAsync("/v1/nodes");

@@ -26,6 +26,7 @@ cd "$repo_root"
 TUN=hktelem0
 CTRL_URL=http://127.0.0.1:5080
 CTRL_PORT=5080
+HB_TOKEN=${HB_TOKEN:-hikablue-lab-heartbeat-token}
 ENGINE_PORT=51821
 ENGINE=engine-rust/target/release/vpn-engine
 
@@ -103,7 +104,8 @@ start_engine() {
 }
 
 echo "== control plane up (unprivileged, loopback only)"
-ASPNETCORE_URLS=$CTRL_URL dotnet run --project control-dotnet/VpnControl \
+ASPNETCORE_URLS=$CTRL_URL VpnControl__HeartbeatToken="$HB_TOKEN" \
+    dotnet run --project control-dotnet/VpnControl \
     --no-build >"$CTRL_LOG" 2>&1 &
 CTRL_PID=$!
 wait_ready 15 curl -sf "$CTRL_URL/v1/nodes" \
@@ -125,6 +127,7 @@ echo "  OBSERVED: rx_bytes +5 for a 5-byte datagram"
 
 echo "== heartbeat -> control plane (demo forwards it; the agent only fetches)"
 curl -sf -X POST "$CTRL_URL/internal/heartbeats" -H 'Content-Type: application/json' \
+    -H "X-Heartbeat-Token: $HB_TOKEN" \
     -d "{\"nodeId\":\"lab-node\",\"engineHealthy\":true,\"metrics\":{\"rx_bytes\":$RX}}" \
     >/dev/null
 curl -sf "$CTRL_URL/v1/nodes" | grep -q '"rx_bytes":5' \
@@ -138,6 +141,7 @@ if "$AGENT" --metrics-sock "$SOCK" --timeout 1s >/dev/null 2>&1; then
     echo "agent fetch should fail with engine down" >&2; exit 1
 fi
 curl -sf -X POST "$CTRL_URL/internal/heartbeats" -H 'Content-Type: application/json' \
+    -H "X-Heartbeat-Token: $HB_TOKEN" \
     -d '{"nodeId":"lab-node","engineHealthy":false}' >/dev/null
 curl -sf "$CTRL_URL/v1/nodes" | grep -q '"engineHealthy":false' \
     || { echo "control plane did not reflect engine outage" >&2; exit 1; }
@@ -153,6 +157,7 @@ echo "  OBSERVED: GetMetrics answers again"
 # Recovery must also reach the control plane: the next heartbeat reports the
 # engine healthy again and GET /v1/nodes reflects it.
 curl -sf -X POST "$CTRL_URL/internal/heartbeats" -H 'Content-Type: application/json' \
+    -H "X-Heartbeat-Token: $HB_TOKEN" \
     -d '{"nodeId":"lab-node","engineHealthy":true}' >/dev/null
 curl -sf "$CTRL_URL/v1/nodes" | grep -q '"engineHealthy":true' \
     || { echo "control plane did not reflect recovery" >&2; exit 1; }
