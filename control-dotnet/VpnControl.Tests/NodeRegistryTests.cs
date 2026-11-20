@@ -1,3 +1,4 @@
+using VpnControl.Entities;
 using VpnControl.Models;
 using VpnControl.Services;
 using VpnControl.Security;
@@ -196,6 +197,11 @@ public class NodeRegistryTests
 
     // ---------- Expiry also runs on the heartbeat path ----------
 
+    // Observation channel for the write-path sweep: evicting an id drops
+    // its Node; a later Record() of that id then mints a FRESH identity.
+    // Watching Id changes proves the sweep ran without ever calling
+    // List() (which would evict on the read path anyway).
+
     [Fact]
     public void RecordSweepsExpiredNodesWithoutAnyListCall()
     {
@@ -205,32 +211,38 @@ public class NodeRegistryTests
         var t0 = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
         var clock = t0;
         var registry = new NodeRegistry(() => clock, TimeSpan.FromMinutes(10));
-        registry.Record(new Heartbeat("stale-node", EngineHealthy: true));
+        var stale = registry.Record(new Heartbeat("stale-node", EngineHealthy: true));
 
         clock = t0.AddMinutes(11);
         registry.Record(new Heartbeat("fresh-node", EngineHealthy: true));
 
-        var node = Assert.Single(registry.List());
-        Assert.Equal("fresh-node", node.NodeId);
+        // The sweep inside that heartbeat evicted stale-node, so beating
+        // again under the same id creates a brand-new node identity.
+        var rejoined = registry.Record(new Heartbeat("stale-node", EngineHealthy: true));
+        Assert.NotEqual(stale.Id, rejoined.Id);
     }
 
     [Fact]
-    public void RecordSweepsOnceTheConfiguredIntervalElapsed()
+    public void RecordSweepsOnlyAfterTheConfiguredInterval()
     {
-        // With a small sweepEvery, the heartbeat that arrives after the
-        // interval performs the reaping itself — no List() needed.
         var t0 = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
         var clock = t0;
         var registry = new NodeRegistry(() => clock, TimeSpan.FromMinutes(10),
-            TimeSpan.FromSeconds(30));
-        registry.Record(new Heartbeat("node-a", EngineHealthy: true));
+            TimeSpan.FromMinutes(60));
+        var stale = registry.Record(new Heartbeat("stale-node", EngineHealthy: true));
 
         clock = t0.AddMinutes(11);
-        registry.Record(new Heartbeat("node-b", EngineHealthy: true));
-        // (_lastSweep was t0, so 11 min > 30 s → this heartbeat swept.)
+        registry.Record(new Heartbeat("fresh-node", EngineHealthy: true));
+        // 11 min < 60 min sweep interval: the stale entry is still there and
+        // a heartbeat refreshes it in place — SAME identity, new LastSeen.
+        var stillThere = registry.Record(new Heartbeat("stale-node", EngineHealthy: true));
+        Assert.Equal(stale.Id, stillThere.Id);
 
-        Assert.Single(registry.List(), n => n.NodeId == "node-b");
-        Assert.DoesNotContain(registry.List(), n => n.NodeId == "node-a");
+        // Now let the interval elapse; the next heartbeat reaps it.
+        clock = t0.AddMinutes(61);
+        registry.Record(new Heartbeat("fresh-node", EngineHealthy: true));
+        var rejoined = registry.Record(new Heartbeat("stale-node", EngineHealthy: true));
+        Assert.NotEqual(stale.Id, rejoined.Id);
     }
 
     [Fact]
@@ -242,16 +254,16 @@ public class NodeRegistryTests
             TimeSpan.FromMinutes(1));
         var first = registry.Record(new Heartbeat("active", EngineHealthy: true));
 
+        Node last = first;
         for (var beat = 1; beat <= 15; beat++)
         {
             clock = t0.AddMinutes(beat);
-            registry.Record(new Heartbeat("active", EngineHealthy: true));
+            last = registry.Record(new Heartbeat("active", EngineHealthy: true));
         }
 
-        var node = Assert.Single(registry.List());
-        Assert.Equal(t0.AddMinutes(15), node.LastSeen);
-        Assert.Equal(first.Id, node.Id);
-        Assert.Equal(first.CreatedAt, node.CreatedAt);
+        Assert.Equal(t0.AddMinutes(15), last.LastSeen);
+        Assert.Equal(first.Id, last.Id);
+        Assert.Equal(first.CreatedAt, last.CreatedAt);
     }
 
     [Fact]
@@ -260,23 +272,31 @@ public class NodeRegistryTests
         // Worst case for the bug: a stream of distinct node ids, each beating
         // once and going quiet, with no List() calls. With the write-path
         // sweep, registry size stays bounded by activity within one TTL
-        // window instead of accumulating every dead id forever.
+        // window instead of accumulating every dead id forever — provable
+        // by the identity of a very old id being recycled.
         var t0 = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
         var clock = t0;
         var registry = new NodeRegistry(() => clock, TimeSpan.FromMinutes(10),
             TimeSpan.FromMinutes(1));
 
+        var ancient = registry.Record(new Heartbeat("ephemeral-0-0", EngineHealthy: true));
         for (var batch = 0; batch < 5; batch++)
         {
-            clock = t0.AddMinutes(batch * 15);
             for (var i = 0; i < 100; i++)
             {
+                if (batch == 0 && i == 0)
+                {
+                    continue;
+                }
                 registry.Record(new Heartbeat($"ephemeral-{batch}-{i}", EngineHealthy: true));
             }
+            clock = clock.AddMinutes(15);
         }
 
-        var surviving = registry.List();
-        Assert.True(surviving.Count <= 100,
-            $"expected at most the last batch of 100, found {surviving.Count}");
+        // Write-path sweeps must have dropped ids from the first batches:
+        // re-beating "ephemeral-0-0" registers a new identity rather than
+        // refreshing a 75-minute-old entry.
+        var rejoined = registry.Record(new Heartbeat("ephemeral-0-0", EngineHealthy: true));
+        Assert.NotEqual(ancient.Id, rejoined.Id);
     }
 }
