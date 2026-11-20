@@ -61,8 +61,10 @@ pub struct ClientArgs {
 
 #[derive(Debug, Args)]
 pub struct CommonArgs {
-    /// Inner MTU applied to the TUN interface (max 2018 — the 2048-byte
-    /// buffer also carries 30 bytes of wire overhead).
+    /// Inner MTU applied to the TUN interface. Capped at 1442 when
+    /// --key is set (1500-byte path minus 58 bytes of outer overhead),
+    /// 2018 otherwise (the 2048-byte buffer carries 30 bytes of wire
+    /// overhead).
     #[arg(long, default_value_t = DEFAULT_MTU)]
     pub mtu: u16,
     /// Name of the TUN interface to create.
@@ -80,26 +82,46 @@ pub struct CommonArgs {
     /// later phase. Without it the engine speaks the M2 plaintext format.
     #[arg(long)]
     pub key: Option<String>,
-    /// sender_index stamped on outbound packets and required on inbound
-    /// ones (the lab has a single symmetric peer). Defaults to 1.
+    /// Session index stamped on outbound packets; also selects this
+    /// side's derived direction key. Defaults to 1.
     #[arg(long, default_value_t = 1)]
     pub sender_index: u32,
+    /// Session index the peer stamps on its packets. Required when --key
+    /// is set and must differ from --sender-index: the two indexes pick
+    /// the two direction keys.
+    #[arg(long, default_value_t = 0)]
+    pub peer_index: u32,
     /// Idle seconds before a KEEPALIVE datagram is sent (encrypted mode
     /// only). Defaults to 25.
     #[arg(long, default_value_t = 25)]
     pub keepalive_secs: u64,
 }
 
-/// Parses a 64-hex-char string into a 32-byte key.
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Parses a 64-hex-char string into a 32-byte key. Works on bytes so a
+/// multibyte UTF-8 char is a parse error, never a slice panic.
 pub fn parse_key_hex(s: &str) -> Result<[u8; 32], String> {
     let s = s.trim();
-    if s.len() != 64 {
+    let bytes = s.as_bytes();
+    if bytes.len() != 64 {
         return Err(format!("key must be 64 hex chars, got {}", s.len()));
     }
     let mut key = [0u8; 32];
-    for i in 0..32 {
-        key[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-            .map_err(|_| format!("key has a non-hex byte at offset {}", i * 2))?;
+    for (i, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        let hi = hex_val(pair[0]);
+        let lo = hex_val(pair[1]);
+        key[i] = match (hi, lo) {
+            (Some(h), Some(l)) => (h << 4) | l,
+            _ => return Err(format!("key has a non-hex byte at offset {}", i * 2)),
+        };
     }
     Ok(key)
 }
@@ -169,6 +191,12 @@ mod tests {
         assert!(parse_key_hex(&format!("{}zz", "00".repeat(31))).is_err());
         // Surrounding whitespace is trimmed before the length check.
         assert!(parse_key_hex(&format!("  {}  ", "ab".repeat(32))).is_ok());
+        // Multibyte UTF-8 inside a 64-byte string is a parse error — the
+        // parser works on bytes and never splits a char boundary.
+        let mut unicode = "00".repeat(31);
+        unicode.push('é'); // 2 bytes: brings the byte length to 64
+        assert_eq!(unicode.len(), 64);
+        assert!(parse_key_hex(&unicode).is_err());
     }
 
     #[test]
