@@ -232,7 +232,15 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Notas de revisión
 
-- `r10` — Gate de cobertura (TEST-02): `tests/coverage.sh` ahora falla el
+- `r11` — Endurecimiento posterior al merge: `NodeRegistry` ahora
+  entrega snapshots de `Node` desconectados, construidos dentro del lock
+  (los heartbeats ya no compiten con un `ToView()`), `Node` copia los
+  diccionarios de métricas del llamador, y `BaseEndPoint` responde los
+  500 sólo con el título genérico — los detalles de la excepción van al
+  `ILogger` con el correlation id, nunca al response. El colector de
+  cobertura ganó su propia suite (`tests/coverage.test.sh`) sobre
+  `coverage-lib.sh` y los parsers `lcov-percent.py`/`cobertura-percent.py`.
+- `r10` — Gate de cobertura (TEST-02):Gate de cobertura (TEST-02): `tests/coverage.sh` ahora falla el
   gate por debajo del 90% por componente. `run` se dividió para que
   `run_loop` sea testeable con un socketpair como TUN; `main` pasó a ser un
   `run(args)` testeable en Go; el guard de arranque se movió a

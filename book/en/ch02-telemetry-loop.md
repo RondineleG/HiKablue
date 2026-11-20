@@ -221,7 +221,15 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Revision notes
 
-- `r10` — Coverage gate (TEST-02): `tests/coverage.sh` now fails the gate
+- `r11` — Post-merge hardening: `NodeRegistry` now hands out detached
+  `Node` snapshots built inside the lock (heartbeat writes can no longer
+  race a `ToView()`), `Node` copies caller-owned metrics dictionaries,
+  and `BaseEndPoint` answers 500s with the generic title only — exception
+  details go to `ILogger` keyed by the correlation id, never to the wire.
+  The coverage collector gained its own test suite
+  (`tests/coverage.test.sh`) over `coverage-lib.sh` and the
+  `lcov-percent.py`/`cobertura-percent.py` parsers.
+- `r10` — Coverage gate (TEST-02):Coverage gate (TEST-02): `tests/coverage.sh` now fails the gate
   below 90% per component. `run` was split so `run_loop` is unit-testable
   with a socketpair TUN; `main` became a testable `run(args)` in Go; the
   startup guard moved to `LoopbackGuard.EnforceLoopbackOnly`.
