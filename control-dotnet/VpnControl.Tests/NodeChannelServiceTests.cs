@@ -222,4 +222,141 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
         Assert.Equal("pending", outbox.Status);
         Assert.NotNull(outbox.NextRetryAt);
     }
+
+    [Fact]
+    public async Task RegisterBeyondCapacityThrowsResourceExhausted()
+    {
+        await using (var db = NewDb())
+        {
+            await db.Database.ExecuteSqlAsync($"""
+                INSERT INTO nodes (node_id, backend_instance_id, registered_at,
+                                   engine_healthy, desired_revision)
+                SELECT 'node-' || i, 'b1', now(), true, 0
+                FROM generate_series(1, 1024) AS i
+                """);
+        }
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            _service.OnRegisterAsync("node-overflow",
+                new NodeRegister { NodeId = "node-overflow", BackendInstanceId = "b1" },
+                CancellationToken.None));
+        Assert.Equal(StatusCode.ResourceExhausted, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task AckWithNonGuidCommandIdIsIgnored()
+    {
+        var stream = Stream();
+        await _service.OnCommandAckAsync("edge-1", stream, new CommandAck
+        {
+            CommandId = "not-a-guid", StreamEpoch = "e1",
+            BackendInstanceId = "b1", Outcome = AckOutcome.Applied
+        }, CancellationToken.None);
+        await using var db = NewDb();
+        Assert.Equal(0, await db.Outbox.CountAsync());
+    }
+
+    [Fact]
+    public async Task AckForUnknownCommandIsIgnored()
+    {
+        var stream = Stream();
+        await _service.OnCommandAckAsync("edge-1", stream, new CommandAck
+        {
+            CommandId = Guid.NewGuid().ToString(), StreamEpoch = "e1",
+            BackendInstanceId = "b1", Outcome = AckOutcome.Applied
+        }, CancellationToken.None);
+        await using var db = NewDb();
+        Assert.Equal(0, await db.Outbox.CountAsync());
+    }
+
+    [Fact]
+    public async Task AckForTerminalRowIsIgnored()
+    {
+        var row = await SeedCommandAsync("edge-1", "ProvisionPeer",
+            """{"peer":{}}""");
+        await using (var db = NewDb())
+        {
+            var tracked = await db.Outbox.SingleAsync();
+            tracked.Status = "acked";
+            await db.SaveChangesAsync();
+        }
+        await _service.OnCommandAckAsync("edge-1", Stream(),
+            Ack(row, AckOutcome.Rejected, AckErrorCode.AckErrorDeadlineExceeded),
+            CancellationToken.None);
+        await using var verify = NewDb();
+        Assert.Equal("acked", (await verify.Outbox.SingleAsync()).Status);
+    }
+
+    [Fact]
+    public async Task ProvisionPeerAckActivatesPendingSession()
+    {
+        var sessionId = Guid.NewGuid();
+        await using (var db = NewDb())
+        {
+            db.Nodes.Add(new NodeRow
+            {
+                NodeId = "edge-1", BackendInstanceId = "b1",
+                RegisteredAt = DateTimeOffset.UtcNow, EngineHealthy = true
+            });
+            db.Sessions.Add(new SessionRow
+            {
+                SessionId = sessionId, OwnerSubject = "alice",
+                Status = SessionStatus.Pending, NodeId = "edge-1",
+                LabSessionId = 1, ExpiresAt = DateTimeOffset.UtcNow.AddHours(1),
+                VirtualIp = System.Net.IPAddress.Parse("10.99.0.1"),
+                CreatedAt = DateTimeOffset.UtcNow, UpdatedAt = DateTimeOffset.UtcNow
+            });
+            await db.SaveChangesAsync();
+        }
+        var row = await SeedCommandAsync("edge-1", "ProvisionPeer",
+            $$$"""{"peer":{"session_id":"{{{sessionId}}}","lab_session_id":1,"virtual_ip":"10.99.0.1"}}""");
+        await _service.OnCommandAckAsync("edge-1", Stream(),
+            Ack(row, AckOutcome.Applied), CancellationToken.None);
+        await using var verify = NewDb();
+        Assert.Equal(SessionStatus.Active,
+            (await verify.Sessions.SingleAsync()).Status);
+    }
+
+    [Fact]
+    public async Task SyncStateSerializesLivePeersWithFraming()
+    {
+        await using (var db = NewDb())
+        {
+            db.Nodes.Add(new NodeRow
+            {
+                NodeId = "edge-1", BackendInstanceId = "b1",
+                RegisteredAt = DateTimeOffset.UtcNow, EngineHealthy = true
+            });
+            foreach (var (sid, i) in new[] { (Guid.NewGuid(), 1), (Guid.NewGuid(), 2) })
+            {
+                db.Sessions.Add(new SessionRow
+                {
+                    SessionId = sid, OwnerSubject = "alice",
+                    Status = i == 1 ? SessionStatus.Pending : SessionStatus.Active,
+                    NodeId = "edge-1", LabSessionId = i,
+                    ExpiresAt = DateTimeOffset.UtcNow.AddHours(1),
+                    VirtualIp = System.Net.IPAddress.Parse($"10.99.0.{i}"),
+                    PeerPublicKey = $"key-{i}", KeyEpoch = 1,
+                    CreatedAt = DateTimeOffset.UtcNow,
+                    UpdatedAt = DateTimeOffset.UtcNow
+                });
+            }
+            await db.SaveChangesAsync();
+        }
+        await _service.OnRegisterAsync("edge-1",
+            new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b1" },
+            CancellationToken.None);
+        await using var check = NewDb();
+        var row = await check.Outbox.SingleAsync(o => o.CommandType == "SyncState");
+        var payload = System.Text.Json.JsonDocument.Parse(row.Payload).RootElement;
+        Assert.Equal(2, payload.GetProperty("declared_peer_count").GetInt32());
+        var peerBytes = Convert.FromBase64String(payload.GetProperty("peer_list").GetString()!);
+        Assert.Equal(payload.GetProperty("serialized_length").GetInt32(), peerBytes.Length);
+        var expected = Convert.ToBase64String(
+            System.Security.Cryptography.SHA256.HashData(peerBytes));
+        Assert.Equal(expected, payload.GetProperty("sha256_digest").GetString());
+        var peers = PeerList.Parser.ParseFrom(peerBytes);
+        Assert.Equal(new[] { 1u, 2u },
+            peers.Peers.Select(x => x.LabSessionId).OrderBy(x => x).ToArray());
+        Assert.Equal("key-1", peers.Peers[0].KeyRef);
+    }
 }

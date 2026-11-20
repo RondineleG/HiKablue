@@ -17,7 +17,14 @@ public sealed class LeaseReaperWorker(
     IConfiguration config,
     ILogger<LeaseReaperWorker> logger) : BackgroundService
 {
-    private static readonly TimeSpan Interval = TimeSpan.FromSeconds(60);
+    private TimeSpan Interval
+    {
+        get
+        {
+            var ms = int.TryParse(config["VpnControl:ReaperIntervalMs"], out var v) ? v : 60000;
+            return TimeSpan.FromMilliseconds(Math.Max(ms, 10));
+        }
+    }
 
     private TimeSpan QuarantineWindow
     {
@@ -48,7 +55,7 @@ public sealed class LeaseReaperWorker(
         }
     }
 
-    internal async Task<int> ReapOnceAsync(CancellationToken ct)
+    public async Task<int> ReapOnceAsync(CancellationToken ct)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<ControlDbContext>();

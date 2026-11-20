@@ -27,11 +27,17 @@ public sealed class NodeStreamRegistry
     /// streams at once.
     public void Attach(string nodeId, ActiveStream stream)
     {
+        ActiveStream? replaced = null;
         _streams.AddOrUpdate(nodeId, stream, (_, old) =>
         {
-            old.Closed.Cancel();
+            replaced = old;
             return stream;
         });
+        // Cancel outside the dictionary's internal lock: the cancelled
+        // stream's continuation can run inline and calls Detach, which
+        // needs the same bucket lock — cancelling inside the update
+        // delegate can deadlock.
+        replaced?.Closed.Cancel();
     }
 
     public bool TryGet(string nodeId, out ActiveStream stream) =>

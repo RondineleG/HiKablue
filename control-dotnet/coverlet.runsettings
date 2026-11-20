@@ -7,7 +7,13 @@
           <Format>cobertura</Format>
           <!-- Source-generated OpenAPI support code injected into the app
                assembly by Microsoft.AspNetCore.OpenApi — not app code. -->
-          <Exclude>[VpnControl]Microsoft.AspNetCore.OpenApi.Generated.*,[VpnControl]System.Runtime.CompilerServices.*</Exclude>
+          <Exclude>[VpnControl]Microsoft.AspNetCore.OpenApi.Generated.*,[VpnControl]System.Runtime.CompilerServices.*,[VpnControl]VpnControl.Proto.*,[VpnControl]VpnControl.Data.Migrations.*</Exclude>
+          <!-- protoc output compiled into the app assembly from
+               ../../proto/edge_orchestrator.proto — generated code. -->
+          <!-- Program.cs is the host bootstrapper (DI wiring, Kestrel
+               endpoint config) — exercised end-to-end by the lab gate,
+               not meaningfully coverable in unit tests. -->
+          <ExcludeByFile>**/obj/**/*.cs,**/gen/**/*.cs,**/Program.cs</ExcludeByFile>
         </Configuration>
       </DataCollector>
     </DataCollectors>

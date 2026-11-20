@@ -54,7 +54,7 @@ public sealed class OutboxDispatcherWorker(
         }
     }
 
-    internal async Task<int> DispatchOnceAsync(CancellationToken ct)
+    public async Task<int> DispatchOnceAsync(CancellationToken ct)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<ControlDbContext>();
@@ -111,7 +111,7 @@ public sealed class OutboxDispatcherWorker(
     /// Rebuilds a ControlCommand from the JSONB payload per command type.
     /// Raw key material never leaves the outbox payload format defined by
     /// the writers (SessionService, EnqueueSyncStateAsync).
-    internal static ControlCommand? BuildCommand(OutboxRow row,
+    public static ControlCommand? BuildCommand(OutboxRow row,
         ActiveStream stream, DateTimeOffset now)
     {
         var command = new ControlCommand

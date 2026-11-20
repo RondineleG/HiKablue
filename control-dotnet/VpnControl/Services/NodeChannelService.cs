@@ -38,8 +38,18 @@ public sealed class NodeChannelService(
                 "client certificate must carry a spiffe://lab.hikablue/node/<id> SAN"));
         }
         context.UserState["NodeId"] = nodeId;
+        await NodeChannelCore(nodeId, requestStream, responseStream,
+            context.CancellationToken);
+    }
 
-        if (!await requestStream.MoveNext(context.CancellationToken) ||
+    /// The stream body, separated from the ServerCallContext plumbing so
+    /// tests can drive it without gRPC test doubles.
+    public async Task NodeChannelCore(string nodeId,
+        IAsyncStreamReader<AgentMessage> requestStream,
+        IServerStreamWriter<ControlCommand> responseStream,
+        CancellationToken ct)
+    {
+        if (!await requestStream.MoveNext(ct) ||
             requestStream.Current.PayloadCase != AgentMessage.PayloadOneofCase.Register)
         {
             throw new RpcException(new Status(StatusCode.InvalidArgument,
@@ -62,13 +72,12 @@ public sealed class NodeChannelService(
 
         try
         {
-            await OnRegisterAsync(nodeId, register, context.CancellationToken);
+            await OnRegisterAsync(nodeId, register, ct);
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(
-                context.CancellationToken, closed.Token);
+                ct, closed.Token);
             while (await requestStream.MoveNext(linked.Token))
             {
-                await DispatchAsync(nodeId, active, requestStream.Current,
-                    context.CancellationToken);
+                await DispatchAsync(nodeId, active, requestStream.Current, ct);
             }
         }
         finally
