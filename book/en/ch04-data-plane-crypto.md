@@ -127,6 +127,127 @@ compatibility.
 - **Not verified**: cross-process key derivation via control-plane
   delivery (the lab shares one PSK) — expected in the `key_epoch` phase.
 
+## Reading the code
+
+### `derive_key` — `engine-rust/src/crypto/session.rs`
+
+```rust
+pub(crate) fn derive_key(key: &[u8; 32], index: u32) -> [u8; 32] {
+    use blake2::Digest;
+    let mut h = blake2::Blake2s256::new();
+    h.update(b"hikablue-session-key-v1");
+    h.update(index.to_be_bytes());
+    h.update(key);
+    h.finalize().into()
+}
+```
+
+- The function takes the PSK (`key`) and the direction index
+  (`index`).
+- `Blake2s256::new()` opens a hasher: a function that crushes any input
+  into a fixed 32-byte digest.
+- The `b"hikablue-session-key-v1"` label is *domain separation*: it
+  guarantees this digest never collides with the same PSK used for
+  another purpose.
+- `index.to_be_bytes()` mixes the index (big-endian) into the digest —
+  different index, different key. That is what splits the two
+  directions.
+- `h.update(key)` folds in the secret last.
+- `finalize().into()` returns the 32-byte derived key.
+
+`SessionState::new` calls this twice — with `local_index` for `tx_key`
+and `peer_index` for `rx_key` — and `seal`/`open` never touch the raw
+PSK.
+
+### `check` — `engine-rust/src/crypto/replay.rs`
+
+```rust
+    pub fn check(&self, seq: u64) -> Result<(), ReplayError> {
+        if seq == 0 {
+            return Err(ReplayError::Reserved);
+        }
+        if seq > self.last_seq {
+            return Ok(());
+        }
+        let diff = self.last_seq - seq;
+        if diff >= WINDOW_SIZE {
+            return Err(ReplayError::Expired);
+        }
+        if self.bit(diff) {
+            Err(ReplayError::Duplicate)
+        } else {
+            Ok(())
+        }
+    }
+```
+
+- `seq == 0` is always rejected: 0 is reserved, the first valid counter
+  is 1.
+- `seq > last_seq` passes immediately — it is ahead of what we saw; the
+  later `update()` slides the window.
+- `diff = last_seq - seq` is the distance behind; `diff >= 2048`
+  (`WINDOW_SIZE`) expired beyond the window horizon.
+- `self.bit(diff)` queries the bitmap: bit 1 = already seen →
+  `Duplicate`; bit 0 = legitimate gap → `Ok`.
+- Note: `check` only reads. Marking happens in `update()`, called only
+  after the AEAD tag verifies.
+
+## Glossary
+
+- **AAD (Associated Authenticated Data)** — data authenticated but not
+  encrypted; here, the 14-byte header. Touching it breaks the tag.
+- **AEAD** — "Authenticated Encryption with Associated Data":
+  encryption + integrity in one operation; here, ChaCha20-Poly1305
+  (RFC 8439).
+- **AtomicU64 / `fetch_add`** — atomic integer: increments and returns
+  the old value in one indivisible step, lock-free — that is how the
+  nonce counter stays unique under concurrency.
+- **BLAKE2s-256** — the 32-byte hash function used to derive each
+  direction's key from PSK + index.
+- **`derive_key`** — the function above: turns (label, index, PSK) into
+  one direction's key.
+- **`fetch_add(1)` / latch** — the `tx_counter` counter; the *latch* is
+  the tripwire that, once fired, rejects every `seal` forever.
+- **Headroom / tailroom** — space reserved before/after the payload in
+  the buffer: 14B up front for the header, 16B at the back for the tag
+  — no reallocating.
+- **`--key <64-hex>`** — the lab PSK: 64 hex digits = 32 bytes, passed
+  on both ends. Lab only.
+- **Keepalive (0x02)** — a sealed datagram with no payload, sent when
+  the tunnel is idle ≥ 25s to keep the NAT mapping open.
+- **MAC / tag** — the 16 Poly1305 authentication bytes at the end of
+  the datagram; proof the writer knew the key.
+- **Nonce** — "number used once": the per-direction counter feeding the
+  AEAD IV; repeating (key, nonce) is catastrophic.
+- **PSK** — "pre-shared key": a 32-byte secret known by both sides
+  before the conversation — in the lab, it comes from `--key`.
+- **Replay window** — the 2048-bit bitmap remembering which recent
+  counters were already authenticated.
+- **`--sender-index` / `--peer-index`** — the session identifier
+  stamped by the sender / expected by the receiver; it also selects
+  which derived key to use.
+- **`split_at_mut`** — Rust's slicer that splits a buffer into two
+  disjoint mutable regions in constant time.
+- **TUN** — the virtual interface that hands inner IP packets in and
+  out.
+- **`u64::MAX − 65536`** — the counter ceiling: headroom before
+  overflow to raise `NonceExhaustionNeedsRekey`.
+- **Zeroizing** — a wrapper that overwrites memory with zeros on drop,
+  so the key does not linger in RAM.
+
+## Exercise — predict the wire before looking
+
+A 900-byte inner packet leaves over the UDP socket. How many bytes is
+the UDP payload, and how many is the outer IPv4 datagram? Then check:
+
+- UDP payload = 900 + 14 (header) + 16 (tag) = **930**;
+- outer datagram = 930 + 8 (UDP) + 20 (IPv4) = **958** — well under the
+  1442-byte inner cap that keeps the outer ≤ 1500.
+
+And a challenge: `last_seq = 4100`. Does a packet with `seq = 2051`
+pass `check()`? Hint: compute `diff` and compare with `WINDOW_SIZE`
+(2048). `diff = 2049 ≥ 2048` → `Expired`, rejected.
+
 ## Revisions
 
 - `r0` — AEAD, replay window, nonce latch, symmetric ingress,

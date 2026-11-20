@@ -134,6 +134,128 @@ probando la compatibilidad hacia atrás.
   usa el mismo PSK en ambos lados, no entrega vía control) — esperado
   en la fase de `key_epoch`.
 
+## Leyendo el código
+
+### `derive_key` — `engine-rust/src/crypto/session.rs`
+
+```rust
+pub(crate) fn derive_key(key: &[u8; 32], index: u32) -> [u8; 32] {
+    use blake2::Digest;
+    let mut h = blake2::Blake2s256::new();
+    h.update(b"hikablue-session-key-v1");
+    h.update(index.to_be_bytes());
+    h.update(key);
+    h.finalize().into()
+}
+```
+
+- La función recibe el PSK (`key`) y el índice de la dirección
+  (`index`).
+- `Blake2s256::new()` abre un hasher: una función que tritura cualquier
+  entrada en un resumen fijo de 32 bytes.
+- La etiqueta `b"hikablue-session-key-v1"` es *domain separation*:
+  garantiza que este resumen nunca colisione con el mismo PSK usado
+  para otro fin.
+- `index.to_be_bytes()` mete el índice (big-endian) en el resumen —
+  índice distinto, clave distinta. Es lo que separa las dos
+  direcciones.
+- `h.update(key)` incorpora el secreto al final.
+- `finalize().into()` devuelve la clave derivada de 32 bytes.
+
+`SessionState::new` lo llama dos veces — con `local_index` para
+`tx_key` y `peer_index` para `rx_key` — y `seal`/`open` nunca tocan el
+PSK original.
+
+### `check` — `engine-rust/src/crypto/replay.rs`
+
+```rust
+    pub fn check(&self, seq: u64) -> Result<(), ReplayError> {
+        if seq == 0 {
+            return Err(ReplayError::Reserved);
+        }
+        if seq > self.last_seq {
+            return Ok(());
+        }
+        let diff = self.last_seq - seq;
+        if diff >= WINDOW_SIZE {
+            return Err(ReplayError::Expired);
+        }
+        if self.bit(diff) {
+            Err(ReplayError::Duplicate)
+        } else {
+            Ok(())
+        }
+    }
+```
+
+- `seq == 0` siempre se rechaza: el 0 está reservado, el primer
+  contador válido es 1.
+- `seq > last_seq` pasa de inmediato — está por delante de lo visto; el
+  `update()` posterior desliza la ventana.
+- `diff = last_seq - seq` es la distancia hacia atrás; `diff >= 2048`
+  (`WINDOW_SIZE`) expiró más allá del horizonte de la ventana.
+- `self.bit(diff)` consulta el bitmap: bit 1 = ya visto → `Duplicate`;
+  bit 0 = hueco legítimo → `Ok`.
+- Nótese: `check` solo lee. La marca ocurre en `update()`, llamado
+  únicamente después de que la etiqueta AEAD verifique.
+
+## Glosario
+
+- **AAD (Associated Authenticated Data)** — datos autenticados pero no
+  cifrados; aquí, los 14 bytes del encabezado. Tocarlos rompe la
+  etiqueta.
+- **AEAD** — "Authenticated Encryption with Associated Data": cifrado +
+  integridad en una sola operación; aquí, ChaCha20-Poly1305 (RFC 8439).
+- **AtomicU64 / `fetch_add`** — entero atómico: incrementa y devuelve
+  el valor anterior en un paso indivisible, sin cerrojo — así el
+  contador de nonce permanece único bajo concurrencia.
+- **BLAKE2s-256** — función hash de 32 bytes usada para derivar la
+  clave de cada dirección del PSK + índice.
+- **`derive_key`** — la función de arriba: transforma (etiqueta,
+  índice, PSK) en la clave de una dirección.
+- **`fetch_add(1)` / latch** — el contador `tx_counter`; el *latch* es
+  la traba que, una vez disparada, rechaza todo `seal` para siempre.
+- **Headroom / tailroom** — espacio reservado antes/después del payload
+  en el buffer: 14B delante para el encabezado, 16B detrás para la
+  etiqueta — sin realocar.
+- **`--key <64-hex>`** — PSK de laboratorio: 64 dígitos hexadecimales =
+  32 bytes, pasado en ambos extremos. Solo lab.
+- **Keepalive (0x02)** — datagrama sellado sin payload, emitido cuando
+  el túnel está ocioso ≥ 25s para mantener abierto el mapeo NAT.
+- **MAC / etiqueta** — los 16 bytes de autenticación del Poly1305 al
+  final del datagrama; prueba de que quien escribió conocía la clave.
+- **Nonce** — "number used once": el contador por dirección que
+  alimenta el IV del AEAD; repetir (clave, nonce) es catastrófico.
+- **PSK** — "pre-shared key": secreto de 32 bytes conocido por ambos
+  lados antes de la conversación — en el lab, viene de `--key`.
+- **Replay window** — el bitmap de 2048 bits que recuerda qué
+  contadores recientes ya fueron autenticados.
+- **`--sender-index` / `--peer-index`** — el identificador de sesión
+  estampado por quien envía / esperado por quien recibe; también elige
+  qué clave derivada usar.
+- **`split_at_mut`** — el fatiador de Rust que divide un buffer en dos
+  regiones mutables disjuntas en tiempo constante.
+- **TUN** — la interfaz virtual que entrega/recibe paquetes IP
+  internos.
+- **`u64::MAX − 65536`** — el techo del contador: margen antes del
+  overflow para disparar `NonceExhaustionNeedsRekey`.
+- **Zeroizing** — wrapper que sobrescribe la memoria con ceros al salir
+  de ámbito, para que la clave no quede en RAM.
+
+## Ejercicio — predice el wire antes de mirar
+
+Un paquete interno de 900 bytes sale por el socket UDP. ¿Cuántos bytes
+tiene el payload UDP y cuántos el datagrama IPv4 externo? Luego
+comprueba:
+
+- Payload UDP = 900 + 14 (header) + 16 (etiqueta) = **930**;
+- datagrama externo = 930 + 8 (UDP) + 20 (IPv4) = **958** — bien por
+  debajo del techo de 1442 internos que mantiene el externo ≤ 1500.
+
+Y un desafío: `last_seq = 4100`. ¿Pasa `check()` un paquete con
+`seq = 2051`? Pista: calcula `diff` y compara con `WINDOW_SIZE` (2048).
+`diff = 2049 ≥ 2048` → `Expired`, rechazado.
+
 ## Revisiones
 
 - `r0` — AEAD, ventana de replay, latch de nonce, ingreso simétrico,
