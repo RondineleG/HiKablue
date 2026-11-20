@@ -46,9 +46,12 @@ public sealed class NodeStreamRegistry
     public void Detach(string nodeId, string streamEpoch)
     {
         // Remove only our own stream — a newer one may already be attached.
+        // The compare+remove must be atomic: a separate TryGet/TryRemove
+        // could erase a stream attached in between.
         if (_streams.TryGetValue(nodeId, out var s) && s.StreamEpoch == streamEpoch)
         {
-            _streams.TryRemove(nodeId, out _);
+            ((ICollection<KeyValuePair<string, ActiveStream>>)_streams)
+                .Remove(new KeyValuePair<string, ActiveStream>(nodeId, s));
         }
     }
 }
