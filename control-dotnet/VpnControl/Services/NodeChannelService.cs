@@ -208,6 +208,13 @@ public sealed class NodeChannelService(
                 row.Status = "failed";
                 row.NextRetryAt = null;
                 ControlMetrics.CommandFailed();
+                if (ack.ErrorCode == AckErrorCode.AckErrorRevisionRegression)
+                {
+                    // A regressed command can never be retried in place —
+                    // the desired state must converge through a snapshot
+                    // instead, which re-delivers anything still pending.
+                    await EnqueueSyncStateAsync(nodeId, ct);
+                }
                 break;
             default: // ERROR with a retryable cause → back to pending
                 row.Status = "pending";
