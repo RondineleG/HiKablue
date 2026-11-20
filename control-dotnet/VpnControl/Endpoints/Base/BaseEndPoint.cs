@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 using VpnControl.Entities.Base;
 using VpnControl.Interfaces.UseCases;
 using VpnControl.Models;
@@ -45,14 +46,16 @@ public abstract class BaseEndPoint<TEntity>
 
     protected static Task<IResult> HandleUseCase<TRequest, TResponse>(
         IUseCase<TRequest, TResponse> useCase,
-        TRequest request) =>
-        HandleUseCaseAsync(useCase, request, MapResponse, "Internal Server Error");
+        TRequest request,
+        ILogger? logger = null) =>
+        HandleUseCaseAsync(useCase, request, MapResponse, "Internal Server Error", logger);
 
     protected static async Task<IResult> HandleUseCaseAsync<TRequest, TResponse>(
         IUseCase<TRequest, TResponse> useCase,
         TRequest request,
         Func<RequestResult<TResponse>, IResult> successHandler,
-        string errorTitle)
+        string errorTitle,
+        ILogger? logger = null)
     {
         ArgumentNullException.ThrowIfNull(useCase);
         try
@@ -66,14 +69,20 @@ public abstract class BaseEndPoint<TEntity>
         }
         catch (Exception ex)
         {
+            // SEC: never echo ex.Message to the wire — it can carry paths,
+            // config values, connection strings. Log it server-side keyed by
+            // the correlation id instead; the body stays generic.
+            var correlationId = Activity.Current?.Id;
+            logger?.LogError(ex, "{ErrorTitle} (correlation: {CorrelationId})",
+                errorTitle, correlationId ?? "none");
             var response = new ApiResponse<object>
             {
                 Success = false,
                 StatusCode = StatusCodes.Status500InternalServerError,
                 Message = errorTitle,
-                Errors = new[] { ex.Message },
+                Errors = null,
                 Timestamp = DateTime.UtcNow,
-                CorrelationId = Activity.Current?.Id
+                CorrelationId = correlationId
             };
             return Results.Json(response, statusCode: StatusCodes.Status500InternalServerError);
         }

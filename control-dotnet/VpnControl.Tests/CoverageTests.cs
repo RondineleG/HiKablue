@@ -168,6 +168,8 @@ public class CoverageTests
                         new NodeView("n1", DateTimeOffset.UtcNow, true, null))),
                     "oce" => new ThrowUseCase(new OperationCanceledException()),
                     "boom" => new ThrowUseCase(new InvalidOperationException("kaboom")),
+                    "secret" => new ThrowUseCase(new InvalidOperationException(
+                        "Database connection string contains password=secret")),
                     "validations" => new StubUseCase(RequestResult<NodeView>.WithValidations(
                         new RequestValidation("Field", "is required"))),
                     _ => new StubUseCase(RequestResult<NodeView>.WithError(
@@ -203,6 +205,28 @@ public class CoverageTests
         using var http = new HttpClient { BaseAddress = new Uri(app.Urls.Single()) };
         var response = await http.GetAsync(path);
         Assert.Equal(expected, response.StatusCode);
+
+        await app.StopAsync();
+    }
+
+    [Fact]
+    public async Task InternalErrorsNeverLeakExceptionDetails()
+    {
+        var builder = WebApplication.CreateBuilder();
+        builder.WebHost.UseUrls("http://127.0.0.1:0");
+        builder.Services.AddScoped<IEndpointAsync>(_ => new ProbeEndPoint());
+        await using var app = builder.Build();
+        await app.MapRegisteredEndpointsAsync();
+        await app.StartAsync();
+
+        using var http = new HttpClient { BaseAddress = new Uri(app.Urls.Single()) };
+        var response = await http.GetAsync("/probe/secret/0");
+        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.DoesNotContain("password=secret", body);
+        Assert.DoesNotContain("connection string", body);
+        Assert.Contains("Probe failed", body); // generic title only
 
         await app.StopAsync();
     }

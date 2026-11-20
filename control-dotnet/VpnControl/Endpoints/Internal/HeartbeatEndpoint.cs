@@ -30,8 +30,10 @@ public sealed class HeartbeatEndpoint : BaseEndPoint<Node>, IEndpointAsync
 
     private static Task<IResult> HandleAsync(
         [FromBody] Heartbeat request,
-        [FromServices] IRegisterNodeHeartbeatUseCase useCase) =>
+        [FromServices] IRegisterNodeHeartbeatUseCase useCase,
+        [FromServices] ILoggerFactory loggerFactory) =>
         HandleUseCaseAsync(useCase, request,
             result => Results.Accepted(value: CreateApiResponse(result, StatusCodes.Status202Accepted, includeData: true)),
-            "Heartbeat registration failed");
+            "Heartbeat registration failed",
+            loggerFactory.CreateLogger<HeartbeatEndpoint>());
 }
