@@ -179,17 +179,10 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   statements (`-coverpkg=./...`), C# lines (coverlet).
 - **`ctx` / context deadline** — Go's way of carrying "give up after T" into
   blocking calls; here applied to socket reads/writes.
-- **`DescribeLastMapped` / `IEndpointNameMetadata` / `RoutePattern` /
-  `IHttpMethodMetadata`** — how a registration reports itself honestly:
-  after `MapGet`/`MapPost` (the calls that register an HTTP route for
-  GET/POST), `DescribeLastMapped` reads the endpoint record
-  the framework just built — `IEndpointNameMetadata` holds the name set by
-  `WithName`, `RoutePattern` the raw route text, `IHttpMethodMetadata` the
-  HTTP verbs — instead of restating them by hand.
 - **`IEndpointAsync`** — the small interface every endpoint class
-  implements (`Task<RequestResult<EndpointRegistrationResponse>>
-  RegisterAsync(WebApplication)`), keeping route registration out of
-  `Program.cs` and reporting each mapped route as a typed result.
+  implements (`Task RegisterAsync(WebApplication)`), keeping route
+  registration out of `Program.cs`: registration either maps the route
+  or throws, and the startup itself is the failure channel.
 - **`io.ReadFull` / `read_exact`** — read-until-buffer-full helpers that turn
   stream semantics into frame semantics.
 - **`lastSeen`** — timestamp of the last heartbeat, kept separate from the
@@ -221,6 +214,12 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Revision notes
 
+- `r12` — Registration simplified: `RegisterAsync` returns plain `Task`
+  again — the typed `RequestResult<EndpointRegistrationResponse>` and the
+  `DescribeLastMapped` metadata reader were ceremony nobody consumed, so
+  `EndpointRegistrationResponse` and `EndpointMappingTests` are gone too.
+  `MapRegisteredEndpointsAsync` just awaits each registration; a broken
+  one throws and aborts startup.
 - `r11` — Post-merge hardening: `NodeRegistry` now hands out detached
   `Node` snapshots built inside the lock (heartbeat writes can no longer
   race a `ToView()`), `Node` copies caller-owned metrics dictionaries,

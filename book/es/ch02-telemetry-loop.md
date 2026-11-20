@@ -189,17 +189,10 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 - **`ctx` / deadline de contexto** — la forma de Go de llevar "rendirse
   después de T" a llamadas bloqueantes; aquí aplicado a reads/writes del
   socket.
-- **`DescribeLastMapped` / `IEndpointNameMetadata` / `RoutePattern` /
-  `IHttpMethodMetadata`** — cómo un registro se reporta con honestidad:
-  tras `MapGet`/`MapPost` (las llamadas que registran la ruta HTTP de
-  GET/POST), `DescribeLastMapped` lee el registro que el
-  framework acaba de montar — `IEndpointNameMetadata` guarda el nombre
-  dado por `WithName`, `RoutePattern` el texto de la ruta,
-  `IHttpMethodMetadata` los verbos HTTP — en vez de repetirlos a mano.
 - **`IEndpointAsync`** — la pequeña interfaz que implementa cada clase de
-  endpoint (`Task<RequestResult<EndpointRegistrationResponse>>
-  RegisterAsync(WebApplication)`), manteniendo el registro de rutas fuera
-  de `Program.cs` y reportando cada ruta mapeada como resultado tipado.
+  endpoint (`Task RegisterAsync(WebApplication)`), manteniendo el
+  registro de rutas fuera de `Program.cs`: el registro o mapea la ruta
+  o lanza, y el propio arranque es el canal de fallo.
 - **`io.ReadFull` / `read_exact`** — helpers leer-hasta-llenar-el-buffer que
   convierten semántica de stream en semántica de frames.
 - **`lastSeen`** — timestamp del último heartbeat, separado del último
@@ -232,6 +225,12 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Notas de revisión
 
+- `r12` — Registro simplificado: `RegisterAsync` vuelve a devolver un
+  `Task` plano — el `RequestResult<EndpointRegistrationResponse>` tipado
+  y el lector de metadatos `DescribeLastMapped` eran ceremonia que nadie
+  consumía, así que `EndpointRegistrationResponse` y `EndpointMappingTests`
+  también salieron. `MapRegisteredEndpointsAsync` solo espera cada
+  registro; uno roto lanza y aborta el arranque.
 - `r11` — Endurecimiento posterior al merge: `NodeRegistry` ahora
   entrega snapshots de `Node` desconectados, construidos dentro del lock
   (los heartbeats ya no compiten con un `ToView()`), `Node` copia los

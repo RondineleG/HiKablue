@@ -27,23 +27,6 @@ public abstract class BaseEndPoint<TEntity>
         return $"/v{version}/{route}";
     }
 
-    /// Reads back the endpoint just added by MapGet/MapPost etc., so the
-    /// registration result reports what was actually mapped (display name,
-    /// route pattern, verbs) instead of restating them by hand.
-    protected static EndpointRegistrationResponse DescribeLastMapped(WebApplication app)
-    {
-        var endpoint = ((IEndpointRouteBuilder)app).DataSources
-            .SelectMany(ds => ds.Endpoints)
-            .LastOrDefault()
-            ?? throw new InvalidOperationException("no endpoint was mapped");
-        var route = endpoint is RouteEndpoint re ? re.RoutePattern.RawText ?? "" : "";
-        var methods = endpoint.Metadata.GetMetadata<IHttpMethodMetadata>()?.HttpMethods;
-        var name = endpoint.Metadata.GetMetadata<IEndpointNameMetadata>()?.EndpointName
-            ?? endpoint.DisplayName ?? "";
-        return new EndpointRegistrationResponse(
-            name, route, methods is { Count: > 0 } ? string.Join(",", methods) : "");
-    }
-
     protected static Task<IResult> HandleUseCase<TRequest, TResponse>(
         IUseCase<TRequest, TResponse> useCase,
         TRequest request,

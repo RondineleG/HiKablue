@@ -158,7 +158,7 @@ public class CoverageTests
 
     private sealed class ProbeEndPoint : BaseEndPoint<Node>, IEndpointAsync
     {
-        public Task<RequestResult<EndpointRegistrationResponse>> RegisterAsync(WebApplication app)
+        public Task RegisterAsync(WebApplication app)
         {
             app.MapGet("/probe/{kind}/{status:int}", (string kind, int status) =>
             {
@@ -177,8 +177,7 @@ public class CoverageTests
                 };
                 return HandleUseCaseAsync(useCase, status, _ => Results.Ok("handled"), "Probe failed");
             });
-            return Task.FromResult(
-                RequestResult<EndpointRegistrationResponse>.Success(DescribeLastMapped(app)));
+            return Task.CompletedTask;
         }
     }
 

@@ -3,7 +3,6 @@ using VpnControl.Endpoints.Base;
 using VpnControl.Entities;
 using VpnControl.Interfaces.Configuration;
 using VpnControl.Models;
-using VpnControl.Requests;
 using VpnControl.UseCases.Nodes;
 
 namespace VpnControl.Endpoints.Internal;
@@ -16,7 +15,7 @@ public sealed class HeartbeatEndpoint : BaseEndPoint<Node>, IEndpointAsync
 {
     private const string Route = "/internal/heartbeats";
 
-    public Task<RequestResult<EndpointRegistrationResponse>> RegisterAsync(WebApplication app)
+    public Task RegisterAsync(WebApplication app)
     {
         app.MapPost(Route, HandleAsync)
             .WithName("RegisterNodeHeartbeat")
@@ -24,8 +23,7 @@ public sealed class HeartbeatEndpoint : BaseEndPoint<Node>, IEndpointAsync
             .Produces(StatusCodes.Status202Accepted)
             .Produces(StatusCodes.Status422UnprocessableEntity);
 
-        return Task.FromResult(RequestResult<EndpointRegistrationResponse>.Success(
-            DescribeLastMapped(app)));
+        return Task.CompletedTask;
     }
 
     private static Task<IResult> HandleAsync(

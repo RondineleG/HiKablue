@@ -186,17 +186,10 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 - **`ctx` / deadline de contexto** — a forma do Go de carregar "desistir
   depois de T" para chamadas bloqueantes; aqui aplicado a reads/writes do
   socket.
-- **`DescribeLastMapped` / `IEndpointNameMetadata` / `RoutePattern` /
-  `IHttpMethodMetadata`** — como um registro se reporta com honestidade:
-  após `MapGet`/`MapPost` (as chamadas que registram a rota HTTP de
-  GET/POST), `DescribeLastMapped` lê o registro que o
-  framework acabou de montar — `IEndpointNameMetadata` guarda o nome dado
-  por `WithName`, `RoutePattern` o texto da rota, `IHttpMethodMetadata`
-  os verbos HTTP — em vez de repeti-los à mão.
 - **`IEndpointAsync`** — a pequena interface que toda classe de endpoint
-  implementa (`Task<RequestResult<EndpointRegistrationResponse>>
-  RegisterAsync(WebApplication)`), mantendo o registro de rotas fora do
-  `Program.cs` e reportando cada rota mapeada como resultado tipado.
+  implementa (`Task RegisterAsync(WebApplication)`), mantendo o registro
+  de rotas fora do `Program.cs`: o registro ou mapeia a rota ou lança,
+  e o próprio startup é o canal de falha.
 - **`io.ReadFull` / `read_exact`** — helpers ler-até-encher-o-buffer que
   transformam semântica de stream em semântica de frames.
 - **`lastSeen`** — timestamp do último heartbeat, separado do último
@@ -229,6 +222,12 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Notas de revisão
 
+- `r12` — Registro simplificado: `RegisterAsync` volta a devolver um
+  `Task` simples — o `RequestResult<EndpointRegistrationResponse>` tipado
+  e o leitor de metadados `DescribeLastMapped` eram cerimônia que ninguém
+  consumia, então `EndpointRegistrationResponse` e `EndpointMappingTests`
+  também saíram. `MapRegisteredEndpointsAsync` só espera cada registro;
+  um quebrado lança exceção e aborta o startup.
 - `r11` — Endurecimento pós-merge: o `NodeRegistry` agora entrega
   snapshots de `Node` desacoplados, montados dentro do lock (heartbeats
   não correm mais com um `ToView()`), `Node` copia os dicionários de

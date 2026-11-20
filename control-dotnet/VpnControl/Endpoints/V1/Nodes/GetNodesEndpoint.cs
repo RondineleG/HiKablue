@@ -3,7 +3,6 @@ using VpnControl.Endpoints.Base;
 using VpnControl.Entities;
 using VpnControl.Interfaces.Configuration;
 using VpnControl.Models;
-using VpnControl.Requests;
 using VpnControl.UseCases.Nodes;
 
 namespace VpnControl.Endpoints.V1.Nodes;
@@ -14,7 +13,7 @@ public sealed class GetNodesEndpoint : BaseEndPoint<Node>, IEndpointAsync
     private const int V1 = 1;
     private static readonly string Route = GetVersionedRoute(V1, "nodes");
 
-    public Task<RequestResult<EndpointRegistrationResponse>> RegisterAsync(WebApplication app)
+    public Task RegisterAsync(WebApplication app)
     {
         ConfigureEndpoint(app.MapGet(Route, HandleAsync))
             .WithName("GetNodesV1")
@@ -22,8 +21,7 @@ public sealed class GetNodesEndpoint : BaseEndPoint<Node>, IEndpointAsync
             .WithDescription("Lists every node that ever sent a heartbeat")
             .Produces(StatusCodes.Status200OK);
 
-        return Task.FromResult(RequestResult<EndpointRegistrationResponse>.Success(
-            DescribeLastMapped(app)));
+        return Task.CompletedTask;
     }
 
     private static Task<IResult> HandleAsync(
