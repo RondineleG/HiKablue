@@ -148,8 +148,10 @@ pub(crate) fn derive_key(key: &[u8; 32], index: u32) -> [u8; 32] {
 - A função recebe o PSK (`key`) e o índice da direção (`index`).
 - `Blake2s256::new()` abre um hasher: uma função que esmaga qualquer
   entrada num resumo fixo de 32 bytes.
-- O rótulo `b"hikablue-session-key-v1"` é *domain separation*: garante
-  que este resumo nunca colida com o mesmo PSK usado para outro fim.
+- O rótulo `b"hikablue-session-key-v1"` é *domain separation*: torna
+  as entradas desta derivação diferentes de qualquer outro uso do mesmo
+  PSK — uma colisão entre propósitos exigiria o mesmo rótulo. Reduz o
+  risco, sem prometer impossibilidade.
 - `index.to_be_bytes()` coloca o índice (big-endian) dentro do resumo —
   índice diferente, chave diferente. É o que separa as duas direções.
 - `h.update(key)` mistura o segredo por último.
