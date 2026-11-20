@@ -178,6 +178,10 @@ public sealed class NodeChannelService(
         {
             return;
         }
+        // This context lives for the whole stream, so the tracked row may
+        // still show a stale status (e.g. "pending" while the dispatcher
+        // already re-sent it). Reload so the write below is a real change.
+        await db.Entry(row).ReloadAsync(ct);
 
         var now = DateTimeOffset.UtcNow;
         switch (ack.Outcome)
