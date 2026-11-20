@@ -48,8 +48,9 @@ if [ "$#" -eq 0 ]; then
   echo "coverage: COVERAGE_COMPONENTS selects no component"
   exit 1
 fi
+KNOWN_COMPONENTS="rust go csharp"
 for comp in "$@"; do
-  case " rust go csharp " in
+  case " $KNOWN_COMPONENTS " in
     *" $comp "*) ;;
     *) echo "coverage: unknown component '$comp' in COVERAGE_COMPONENTS"; exit 1;;
   esac
