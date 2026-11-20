@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="XPlat Code Coverage">
+        <Configuration>
+          <Format>cobertura</Format>
+          <!-- Source-generated OpenAPI support code injected into the app
+               assembly by Microsoft.AspNetCore.OpenApi — not app code. -->
+          <Exclude>[VpnControl]Microsoft.AspNetCore.OpenApi.Generated.*,[VpnControl]System.Runtime.CompilerServices.*</Exclude>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>
