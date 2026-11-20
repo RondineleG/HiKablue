@@ -25,6 +25,13 @@ t "89.99% fails 90"     1 pct_ge_min 89.99 90
 t "0% fails"            1 pct_ge_min 0 90
 t "empty pct fails"     1 pct_ge_min "" 90
 t "non-numeric fails"   1 pct_ge_min "abc" 90
+t "trailing junk fails" 1 pct_ge_min "95abc" 90
+t "NaN fails"           1 pct_ge_min "NaN" 90
+t "Infinity fails"      1 pct_ge_min "Infinity" 90
+t "negative fails"      1 pct_ge_min "-1" 90
+t "over 100 fails"      1 pct_ge_min "101" 90
+t "bad min fails"       1 pct_ge_min 95 "abc"
+t "min over 100 fails"  1 pct_ge_min 95 101
 
 echo "-- lcov-percent.py --"
 # fake_engine.rs: DA 1-4 counted (2 covered → 50.00); DA:6 sits in a
