@@ -99,6 +99,10 @@ public class NodeRegistryTests
         var current = Assert.Single(registry.List());
         Assert.Equal(clock, current.LastSeen);
         Assert.False(current.EngineHealthy);
+
+        // Identity is stable: snapshots of the same node share Id/CreatedAt.
+        Assert.Equal(first.Id, current.Id);
+        Assert.Equal(first.CreatedAt, current.CreatedAt);
     }
 
     [Fact]

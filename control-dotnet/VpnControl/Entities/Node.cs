@@ -39,7 +39,15 @@ public sealed class Node : BaseEntity
 
     /// Detached, consistent copy of the current state — safe to hand out of
     /// the registry's lock; later heartbeats can't mutate what callers hold.
-    public Node Snapshot() => new(NodeId, LastSeen, EngineHealthy, Metrics);
+    /// Id/CreatedAt are copied too: a snapshot must keep the entity's
+    /// identity, not mint a new one on every read.
+    public Node Snapshot()
+    {
+        var copy = new Node(NodeId, LastSeen, EngineHealthy, Metrics);
+        copy.Id = Id;
+        copy.CreatedAt = CreatedAt;
+        return copy;
+    }
 
     public NodeView ToView() => new(NodeId, LastSeen, EngineHealthy, CopyMetrics(Metrics));
 }
