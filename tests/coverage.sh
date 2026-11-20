@@ -29,8 +29,20 @@ below() { # below NAME PCT — records a TEST-02 threshold violation
 }
 
 # COVERAGE_COMPONENTS (space list, default all) selects stages — the
-# self-test uses it to isolate one failure per scenario.
+# self-test uses it to isolate one failure per scenario. An unknown name
+# means a typo silently measured nothing, so fail loud instead of passing.
 COMPONENTS=" ${COVERAGE_COMPONENTS:-rust go csharp} "
+set -- $COMPONENTS
+if [ "$#" -eq 0 ]; then
+  echo "coverage: COVERAGE_COMPONENTS selects no component"
+  exit 1
+fi
+for comp in "$@"; do
+  case " rust go csharp " in
+    *" $comp "*) ;;
+    *) echo "coverage: unknown component '$comp' in COVERAGE_COMPONENTS"; exit 1;;
+  esac
+done
 run_for() { case "$COMPONENTS" in *" $1 "*) return 0;; *) return 1;; esac }
 
 echo "== rust (engine-rust) =="

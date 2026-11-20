@@ -62,5 +62,7 @@ ts "broken go fails"       "go test -coverprofile failed" \
   env COVERAGE_COMPONENTS=go GO_BIN=false bash "$ROOT/tests/coverage.sh"
 ts "broken dotnet fails"   "dotnet test --collect coverage failed" \
   env COVERAGE_COMPONENTS=csharp DOTNET_BIN=false bash "$ROOT/tests/coverage.sh"
+ts "typo component fails"  "unknown component 'cshapr'" \
+  env COVERAGE_COMPONENTS=cshapr bash "$ROOT/tests/coverage.sh"
 
 [ "$fails" -eq 0 ] && echo "coverage.test.sh: ALL PASSED" || { echo "coverage.test.sh: FAILED"; exit 1; }
