@@ -31,7 +31,7 @@ sessions (
     session_id         uuid        primary key,
     idempotency_key    text        unique,        -- nullable; set by POST /v1/sessions
     status             text        not null,      -- pending|active|revoking|revoked|failed
-    virtual_ip         inet        not null unique,
+    virtual_ip         inet        not null,      -- audit trail; uniqueness enforced by ip_leases
     node_id            text        not null references nodes(node_id),
     lab_session_id     integer     not null,      -- unique among ACTIVE rows per node
     key_epoch          bigint      not null default 0,
@@ -44,9 +44,12 @@ ip_leases (
     address            inet        primary key,   -- uniqueness IS the allocator
     session_id         uuid        references sessions(session_id),
     node_id            text        not null,
-    reserved_at        timestamptz not null default now(),
-    released_at        timestamptz
+    reserved_at        timestamptz not null default now()
 );
+-- ip_leases holds only ACTIVE leases: release = DELETE the row.
+-- The freed address is immediately reusable; the audit trail lives in
+-- sessions.virtual_ip + sessions.status, so no address is ever unique
+-- across history (only among live leases).
 
 outbox (
     command_id         uuid        primary key,
@@ -85,8 +88,9 @@ Key mechanics:
   `sessions.status` transition. Redelivery of an already-acked command is
   idempotent on the agent (same `command_id` → same result).
 - **Revocation** = `DELETE /v1/sessions/{id}` → `revoking` + `RevokePeer`
-  in one transaction; `acked_at` flips it to `revoked` and releases the
-  lease (`released_at`). IP is freed only after confirmed removal.
+  in one transaction; `acked_at` flips it to `revoked` and deletes the
+  `ip_leases` row, freeing the address for reuse. IP is freed only after
+  confirmed removal.
 - **Deletion guard** enforced agent-side per spec (reject snapshots whose
   removals exceed 20% of current peers or replace a nonempty set with
   empty, unless a forced, audited override).
