@@ -40,18 +40,25 @@ VpnControl/
   Requests/                         RequestResult / EResultStatus (OnForkHub result pattern)
   Extensions/                       MapRegisteredEndpointsAsync + AddVpnControl (convention DI)
   Models/                           Heartbeat, NodeView, ApiResponse records
-  Security/                         LoopbackGuard
+  Security/                         LoopbackGuard, HeartbeatAuth
 ```
 
 ## Limitações conhecidas
 
-Estas limitações são aceitas no Marco 1 (telemetria, laboratório isolado) e
-serão endereçadas nos marcos de control plane:
+Proteções ativas no Marco 1 (laboratório isolado):
 
-- O endpoint `/internal/heartbeats` não tem autenticação — qualquer cliente
-  que alcance o listener loopback pode registrar batimentos.
-- O dicionário de métricas é aceito sem limite de número de chaves nem
-  tamanho de chave/valor — payloads grandes ou com muitas chaves não são
-  rejeitados.
-- O registro não expira nós — um nó que para de enviar heartbeat permanece
-  listado indefinidamente (com `LastSeen` estagnado).
+- `/internal/heartbeats` exige o segredo compartilhado `X-Heartbeat-Token`
+  (config `VpnControl:HeartbeatToken` / env `VpnControl__HeartbeatToken`);
+  sem token configurado o serviço recusa subir. Respostas inválidas: 401.
+- O payload do heartbeat é limitado — `node_id` ≤ 128 caracteres, ≤ 64
+  chaves de métrica com ≤ 64 caracteres cada; violações respondem 422.
+- Nós que param de enviar heartbeat expiram do registro após 10 minutos
+  sem `LastSeen` novo.
+
+Limitação que permanece, deferida ao marco de control plane:
+
+- O token é um segredo **compartilhado**, não identidade por nó — qualquer
+  processo local com o segredo pode bater por qualquer `nodeId`. A
+  identidade real chega com o `NodeChannel` gRPC (mTLS). `GET /v1/nodes`
+  segue aberto no loopback, e o serviço continua recusando binds fora do
+  loopback via `LoopbackGuard`.

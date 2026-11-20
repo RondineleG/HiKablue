@@ -10,9 +10,13 @@ public sealed class NodeRegistry
 {
     private readonly Dictionary<string, Node> _nodes = new();
     private readonly Func<DateTimeOffset> _clock;
+    private readonly TimeSpan _staleAfter;
 
-    public NodeRegistry(Func<DateTimeOffset>? clock = null) =>
+    public NodeRegistry(Func<DateTimeOffset>? clock = null, TimeSpan? staleAfter = null)
+    {
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
+        _staleAfter = staleAfter ?? TimeSpan.FromMinutes(10);
+    }
 
     public Node Record(Heartbeat hb)
     {
@@ -31,10 +35,18 @@ public sealed class NodeRegistry
 
     // Snapshots are built inside the lock: each returned Node is detached
     // from the registry, so concurrent heartbeats can't race a ToView().
+    // Nodes that stop beating expire: a LastSeen older than staleAfter is
+    // evicted here, under the same lock, instead of lingering forever.
     public IReadOnlyList<Node> List()
     {
         lock (_nodes)
         {
+            var cutoff = _clock() - _staleAfter;
+            foreach (var staleId in _nodes.Where(kv => kv.Value.LastSeen < cutoff)
+                .Select(kv => kv.Key).ToList())
+            {
+                _nodes.Remove(staleId);
+            }
             return _nodes.Values.OrderBy(n => n.NodeId)
                 .Select(n => n.Snapshot()).ToList();
         }

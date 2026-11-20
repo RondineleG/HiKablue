@@ -10,8 +10,9 @@ a C# control plane keeps a list of who is alive.
 
 > **Lab boundary.** As in Chapter 1, everything here runs in an isolated,
 > authorized lab (`.agc/RULES.md` LAB-01). The metrics socket carries no
-> authentication yet; the control-plane milestone replaces the temporary
-> HTTP heartbeat with the gRPC `NodeChannel` stream.
+> authentication yet; the temporary HTTP heartbeat answers only to the
+> shared `X-Heartbeat-Token` secret until the control-plane milestone
+> replaces it with the gRPC `NodeChannel` stream.
 
 ## What we built, and why it is split this way
 
@@ -190,8 +191,8 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 - **Length-prefixed frame** — message framing that sends the byte count
   before the payload, so the reader knows how much to assemble.
 - **`LoopbackGuard`** — the startup check that inspects the configured
-  URLs and refuses to boot on a non-loopback bind while heartbeats are
-  unauthenticated.
+  URLs and refuses to boot on a non-loopback bind while the heartbeat
+  intake is a lab stand-in.
 - **`0660` + dedicated group** — Unix socket mode that gives the owner and
   the named group access; the lab procedure's way of sharing the engine
   socket with the unprivileged agent without opening it to every local user.
@@ -214,6 +215,11 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Revision notes
 
+- `r13` — Documented limitations closed: heartbeats require the shared
+  `X-Heartbeat-Token` (startup refuses without `VpnControl:HeartbeatToken`),
+  payloads are bounded (`node_id` ≤ 128, ≤ 64 metric keys ≤ 64 chars each,
+  violations answer 422), and nodes that stop beating expire from the
+  registry after 10 minutes.
 - `r12` — Registration simplified: `RegisterAsync` returns plain `Task`
   again — the typed `RequestResult<EndpointRegistrationResponse>` and the
   `DescribeLastMapped` metadata reader were ceremony nobody consumed, so
@@ -265,8 +271,8 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   (required `request_id`/`version`/`op`/`payload`, only version 1, valid
   JSON error envelopes, responses serialized with serde_json); `bind()`
   refuses non-socket paths and only removes stale sockets; vpn-control
-  validates its URLs and refuses any non-loopback bind while heartbeats
-  are unauthenticated; the demo keeps all run state in an exclusive
+  requires the `X-Heartbeat-Token` shared secret and refuses any
+  non-loopback bind; the demo keeps all run state in an exclusive
   per-run directory, refuses occupied ports/interfaces, and documents that
   the script — not the agent — forwards the heartbeat.
 

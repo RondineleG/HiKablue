@@ -29,7 +29,7 @@ public class NodeRegistryTests
         // "seen now" but reports engine_healthy = false.
         var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
         var clock = now;
-        var registry = new NodeRegistry(() => clock);
+        var registry = new NodeRegistry(() => clock, TimeSpan.FromDays(365));
 
         registry.Record(new Heartbeat("quiet-node", EngineHealthy: true));
         registry.Record(new Heartbeat("degraded-node", EngineHealthy: true));
@@ -159,5 +159,38 @@ public class NodeRegistryTests
         await Task.WhenAll(new[] { writer }.Concat(readers));
         Assert.Empty(exceptions);
         Assert.Equal(ids.Length, registry.List().Count);
+    }
+
+    [Fact]
+    public void NodesThatStopBeatingExpire()
+    {
+        var t0 = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var clock = t0;
+        var registry = new NodeRegistry(() => clock, TimeSpan.FromMinutes(10));
+        registry.Record(new Heartbeat("node-a", EngineHealthy: true));
+        registry.Record(new Heartbeat("node-b", EngineHealthy: true));
+
+        clock = t0.AddMinutes(5);
+        registry.Record(new Heartbeat("node-b", EngineHealthy: true));
+
+        clock = t0.AddMinutes(11);
+        var node = Assert.Single(registry.List());
+        Assert.Equal("node-b", node.NodeId);
+    }
+
+    [Fact]
+    public void AnExpiredNodeCanRegisterAgain()
+    {
+        var t0 = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var clock = t0;
+        var registry = new NodeRegistry(() => clock, TimeSpan.FromMinutes(10));
+        registry.Record(new Heartbeat("node-a", EngineHealthy: true));
+
+        clock = t0.AddMinutes(11);
+        Assert.Empty(registry.List());
+
+        var rejoined = registry.Record(new Heartbeat("node-a", EngineHealthy: false));
+        Assert.Equal("node-a", Assert.Single(registry.List()).NodeId);
+        Assert.False(rejoined.EngineHealthy);
     }
 }

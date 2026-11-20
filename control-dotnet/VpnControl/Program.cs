@@ -6,13 +6,15 @@ using VpnControl.Security;
 // deliberately temporary — it is replaced by the gRPC NodeChannel stream
 // (with mTLS identity) in the control-plane milestone.
 //
-// SECURITY: the heartbeat endpoint does NOT authenticate the caller — any
-// local process can POST a heartbeat for any nodeId. It is a lab-only
-// stand-in and must never face a network: the service refuses to start on
-// any non-loopback URL, however the URL is configured.
+// SECURITY: the heartbeat endpoint answers only to the shared
+// X-Heartbeat-Token secret (a lab stand-in until the gRPC NodeChannel
+// carries mTLS identity) and must never face a network: the service
+// refuses to start without a token or on any non-loopback URL, however
+// the URL is configured.
 var builder = WebApplication.CreateBuilder(args);
 
 LoopbackGuard.EnforceLoopbackOnly(builder.Configuration);
+HeartbeatAuth.RequireToken(builder.Configuration);
 builder.WebHost.UseUrls(LoopbackGuard.ListenUrls(builder.Configuration));
 
 builder.Services.AddVpnControl();

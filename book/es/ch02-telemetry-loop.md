@@ -11,8 +11,9 @@ vivo.
 
 > **Límite del laboratorio.** Como en el capítulo 1, todo aquí corre en un
 > laboratorio aislado y autorizado (`.agc/RULES.md` LAB-01). El socket de
-> métricas todavía no tiene autenticación; el hito del plano de control
-> reemplazará el heartbeat HTTP temporal por el stream gRPC `NodeChannel`.
+> métricas todavía no tiene autenticación; el heartbeat HTTP temporal solo
+> responde al secreto compartido `X-Heartbeat-Token` hasta que el hito del
+> plano de control lo reemplace por el stream gRPC `NodeChannel`.
 
 ## Qué construimos, y por qué está dividido así
 
@@ -201,7 +202,7 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   antes del payload, para que el lector sepa cuánto ensamblar.
 - **`LoopbackGuard`** — la verificación de arranque que inspecciona las
   URLs configuradas y rechaza arrancar en un enlace no-loopback mientras
-  los heartbeats no se autentican.
+  la entrada de heartbeats es un stand-in de laboratorio.
 - **`0660` + grupo dedicado** — modo del socket Unix que da acceso al dueño
   y al grupo nombrado; la forma del procedimiento de laboratorio de
   compartir el socket del motor con el agente sin privilegios sin abrirlo a
@@ -225,6 +226,12 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Notas de revisión
 
+- `r13` — Limitaciones documentadas cerradas: los heartbeats exigen el
+  secreto compartido `X-Heartbeat-Token` (el arranque rechaza sin
+  `VpnControl:HeartbeatToken`), el payload queda acotado (`node_id` ≤ 128,
+  ≤ 64 claves de métrica ≤ 64 caracteres cada una, las violaciones
+  responden 422) y los nodos que dejan de latir expiran del registro a los
+  10 minutos.
 - `r12` — Registro simplificado: `RegisterAsync` vuelve a devolver un
   `Task` plano — el `RequestResult<EndpointRegistrationResponse>` tipado
   y el lector de metadatos `DescribeLastMapped` eran ceremonia que nadie
@@ -279,8 +286,8 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   sobre (`request_id`/`version`/`op`/`payload` obligatorios, solo versión
   1, sobres de error JSON válidos, respuestas serializadas con
   serde_json); `bind()` rechaza rutas que no son socket y solo elimina
-  sockets obsoletos; vpn-control valida sus URLs y rechaza cualquier
-  enlace no-loopback mientras los heartbeats no se autentican; el demo
+  sockets obsoletos; vpn-control exige el secreto compartido
+  `X-Heartbeat-Token` y rechaza cualquier enlace no-loopback; el demo
   guarda todo su estado en un directorio exclusivo por ejecución, rechaza
   puertos/interfaces ocupados y documenta que el script — no el agente —
   reenvía el heartbeat.
