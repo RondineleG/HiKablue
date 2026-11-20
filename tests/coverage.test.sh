@@ -55,7 +55,7 @@ ts() { # ts NAME EXPECTED_DIAG CMD... — non-zero exit AND the stage's own
 ts "missing llvm fails"    "llvm-tools-preview missing" \
   env COVERAGE_COMPONENTS=rust LLVM_PROFDATA=/nonexistent LLVM_COV=/nonexistent bash "$ROOT/tests/coverage.sh"
 ts "broken cargo fails"    "instrumented cargo test failed" \
-  env COVERAGE_COMPONENTS=rust CARGO_BIN=false bash "$ROOT/tests/coverage.sh"
+  env COVERAGE_COMPONENTS=rust CARGO_BIN=false LLVM_PROFDATA=/bin/true LLVM_COV=/bin/true bash "$ROOT/tests/coverage.sh"
 ts "empty lcov report fails" "llvm-cov produced no report" \
   env COVERAGE_COMPONENTS=rust CARGO_BIN=/bin/true LLVM_PROFDATA=/bin/true LLVM_COV=/bin/false bash "$ROOT/tests/coverage.sh"
 ts "broken go fails"       "go test -coverprofile failed" \
