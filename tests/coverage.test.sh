@@ -81,6 +81,25 @@ ts "broken dotnet fails"   "dotnet test --collect coverage failed" \
 ts "typo component fails"  "unknown component 'cshapr'" \
   env COVERAGE_COMPONENTS=cshapr bash "$STUB_COV"
 
+# Gate mode (COVERAGE_GATE=1, set by checks.sh) must ignore env vars that
+# would shrink the official run; selective runs stay available only for
+# these self-tests and local debugging.
+printf '%s\n' "$LCOV" > "$STUB/fake-50.lcov"
+printf '#!/bin/sh\ncat %q\n' "$STUB/fake-50.lcov" > "$STUB/llvm-cov-fake"
+chmod +x "$STUB/llvm-cov-fake"
+ts "gate ignores COVERAGE_COMPONENTS" "go test -coverprofile failed" \
+  env COVERAGE_GATE=1 COVERAGE_COMPONENTS=rust \
+      CARGO_BIN=/bin/true LLVM_PROFDATA=/bin/true LLVM_COV=/bin/true \
+      GO_BIN=false DOTNET_BIN=/bin/true bash "$STUB_COV"
+ts "gate ignores COVERAGE_MIN" "coverage: rust 50.00% < 90%" \
+  env COVERAGE_GATE=1 COVERAGE_MIN=50 COVERAGE_COMPONENTS=rust \
+      CARGO_BIN=/bin/true LLVM_PROFDATA=/bin/true LLVM_COV="$STUB/llvm-cov-fake" \
+      GO_BIN=false DOTNET_BIN=/bin/true bash "$STUB_COV"
+t "selective run still works outside the gate" 0 \
+  env COVERAGE_COMPONENTS=rust COVERAGE_MIN=50 \
+      CARGO_BIN=/bin/true LLVM_PROFDATA=/bin/true LLVM_COV="$STUB/llvm-cov-fake" \
+      bash "$STUB_COV"
+
 # Artifact preservation: sentinels sit inside the two dirs coverage.sh
 # rm -rf's before measuring. If a stub run ever touched the real tree the
 # sentinels would be gone — surviving files prove isolation held.

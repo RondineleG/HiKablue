@@ -19,6 +19,17 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COVERAGE_MIN="${COVERAGE_MIN:-90}"
 fail=0
 
+# COVERAGE_GATE=1 (set by checks.sh) is the official TEST-02 gate: all
+# three components must be measured at the 90% floor no matter what the
+# environment says — otherwise COVERAGE_COMPONENTS=rust or COVERAGE_MIN=50
+# would produce a formally-green gate that never verified coverage.
+# Selective runs stay available for the collector's self-test and local
+# debugging only.
+if [ "${COVERAGE_GATE:-0}" = "1" ]; then
+  COVERAGE_COMPONENTS="rust go csharp"
+  COVERAGE_MIN=90
+fi
+
 line() { printf '%-10s %s\n' "$1" "$2"; }
 
 below() { # below NAME PCT — records a TEST-02 threshold violation

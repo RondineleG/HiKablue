@@ -121,9 +121,11 @@ run_step "dotnet: build + test vpn-control" step_dotnet
 
 run_step "book parity (en / es / pt-BR)" bash tests/book/check-parity.sh
 
-# TEST-02: line coverage must stay >= COVERAGE_MIN (default 90%) per
-# component — the step fails below the threshold.
-run_step "coverage >= 90% (rust/go/c#, TEST-02)" bash tests/coverage.sh
+# TEST-02: line coverage must stay >= 90% per component — the step fails
+# below the threshold. COVERAGE_GATE=1 makes coverage.sh ignore any
+# COVERAGE_COMPONENTS / COVERAGE_MIN the caller exported: the official
+# gate always measures all three components at the rule's floor.
+run_step "coverage >= 90% (rust/go/c#, TEST-02)" env COVERAGE_GATE=1 bash tests/coverage.sh
 
 # TEST-01: the collector itself is verified with fixtures + stubbed tools.
 run_step "coverage collector self-test (fixtures + stubs)" bash tests/coverage.test.sh
