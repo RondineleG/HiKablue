@@ -129,7 +129,7 @@ Key mechanics:
    and pending sessions.
 2. **Session Allocation Race Prevention (`lab_session_id`):** provisioning
    transactions take an exclusive lock on the parent node row
-   (`SELECT id FROM nodes WHERE id = $1 FOR UPDATE;`) before computing
+   (`SELECT node_id FROM nodes WHERE node_id = $1 FOR UPDATE;`) before computing
    `MAX(lab_session_id) + 1`, with a bounded exponential retry loop
    (max 3 attempts, 10–50 ms jitter) to absorb error 23505
    (unique_violation).
@@ -148,3 +148,12 @@ Key mechanics:
    `ipam_reaped_leases_total`. A late ACK for an expired session is
    rejected with `ACK_ERROR_DEADLINE_EXCEEDED` and triggers an immediate
    agent resync.
+
+   **Recorded divergence (ARCH-01):** the session spec currently requires
+   keeping an IP reserved while its node is unreachable — release only
+   after confirmed removal. The reaper above relaxes that rule for dead
+   nodes (leases would otherwise leak forever on a permanently lost node):
+   forced release is allowed only after the full quarantine window and is
+   always audited. The spec must be amended to carry this exception before
+   implementation; if it is not, the reaper falls back to quarantining
+   without releasing the lease.
