@@ -85,6 +85,7 @@ ip netns exec "$NS_A" "$ENGINE" server \
 PID_A=$!
 ip netns exec "$NS_B" "$ENGINE" client \
     --bind 0.0.0.0:0 --remote "$OUTER_A:$PORT" --tun-cidr "$VIP_B/24" \
+    --peer "$VIP_A" \
     --key "$LAB_KEY" --sender-index 1 --peer-index 2 \
     --metrics-sock /tmp/hik-lab-b.sock &
 PID_B=$!

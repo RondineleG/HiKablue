@@ -55,16 +55,21 @@ pub struct ClientArgs {
     /// Virtual IPv4 address and prefix for the TUN interface, e.g. 10.80.1.2/24.
     #[arg(long)]
     pub tun_cidr: Ipv4Cidr,
+    /// Virtual IPv4 address of the server inside the tunnel, e.g. 10.80.1.1.
+    /// Authenticated packets whose inner source differs are dropped:
+    /// cryptographic peer authentication does not authorize inner IPs.
+    #[arg(long)]
+    pub peer: Ipv4Addr,
     #[command(flatten)]
     pub common: CommonArgs,
 }
 
 #[derive(Debug, Args)]
 pub struct CommonArgs {
-    /// Inner MTU applied to the TUN interface. Capped at 1442 when
-    /// --key is set (1500-byte path minus 58 bytes of outer overhead),
-    /// 2018 otherwise (the 2048-byte buffer carries 30 bytes of wire
-    /// overhead).
+    /// Inner MTU applied to the TUN interface. Capped at 1442 over IPv4
+    /// or 1422 over IPv6 when --key is set (1500-byte path minus outer
+    /// overhead), 2018 otherwise (the 2048-byte buffer carries 30 bytes
+    /// of wire overhead).
     #[arg(long, default_value_t = DEFAULT_MTU)]
     pub mtu: u16,
     /// Name of the TUN interface to create.

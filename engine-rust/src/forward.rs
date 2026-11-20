@@ -37,13 +37,16 @@ pub const MAX_MTU: u16 = (BUFFER_SIZE - TOTAL_OVERHEAD) as u16;
 /// 1500-byte path: 1500 minus 58 bytes of overhead (20 IPv4 + 8 UDP +
 /// 14 header + 16 tag).
 pub const MAX_MTU_ENCRYPTED: u16 = 1500 - 58;
+/// Same ceiling over an IPv6 outer: 40 IPv6 + 8 UDP + 30 = 78 bytes.
+pub const MAX_MTU_ENCRYPTED_V6: u16 = 1500 - 78;
 
 #[derive(Debug)]
 pub struct Config {
     pub bind: SocketAddr,
     /// Client only: the fixed remote endpoint.
     pub remote: Option<SocketAddr>,
-    /// Server only: the virtual IP the learned peer must present.
+    /// Virtual IP the peer must present inside the tunnel — the learned
+    /// endpoint on the server, the server's VIP on the client.
     pub peer_vip: Option<Ipv4Addr>,
     pub tun_cidr: Ipv4Cidr,
     pub tun_name: String,
@@ -71,6 +74,21 @@ impl Config {
                 "mtu {} outside 1..={MAX_MTU} (fixed {BUFFER_SIZE}-byte buffers)",
                 self.mtu
             )));
+        }
+        // A client can never reach a remote of the other family: a v4
+        // socket cannot send to v6 and vice versa. Reject at startup
+        // instead of failing the first connect.
+        if let Some(remote) = self.remote {
+            if remote.is_ipv6() != self.bind.is_ipv6() {
+                return Err(invalid(
+                    "bind and remote address families must match".into(),
+                ));
+            }
+        }
+        // Client mode drops anything the peer did not send: without an
+        // expected peer VIP the ingress check could never run.
+        if self.remote.is_some() && self.peer_vip.is_none() {
+            return Err(invalid("client mode requires a peer vip".into()));
         }
         if let Some(peer) = self.peer_vip {
             if !self.tun_cidr.contains(peer) {
@@ -105,14 +123,31 @@ impl Config {
                     "keepalive interval must be greater than zero".into(),
                 ));
             }
-            if self.mtu > MAX_MTU_ENCRYPTED {
+            let max_mtu = if self.outer_is_ipv6() {
+                MAX_MTU_ENCRYPTED_V6
+            } else {
+                MAX_MTU_ENCRYPTED
+            };
+            if self.mtu > max_mtu {
                 return Err(invalid(format!(
-                    "mtu {} above {MAX_MTU_ENCRYPTED} (1500-byte path minus 58-byte outer overhead)",
-                    self.mtu
+                    "mtu {} above {max_mtu} (1500-byte path minus {}-byte outer overhead)",
+                    self.mtu,
+                    if self.outer_is_ipv6() { 78 } else { 58 }
                 )));
             }
         }
         Ok(())
+    }
+
+    /// Outer transport family the socket will actually use. For the client
+    /// the connected remote decides; for the server it's the bind address
+    /// — `[::]` binds dual-stack and IPv4 peers arrive as IPv4-mapped, so
+    /// the conservative IPv6 overhead applies there too.
+    fn outer_is_ipv6(&self) -> bool {
+        match self.remote {
+            Some(remote) => remote.is_ipv6(),
+            None => self.bind.is_ipv6(),
+        }
     }
 }
 
@@ -234,7 +269,8 @@ pub async fn run(cfg: Config) -> io::Result<()> {
 /// TUN (a socketpair end) and real loopback UDP sockets.
 async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
     cfg.validate()?;
-    let is_server = cfg.peer_vip.is_some();
+    // Server mode has no fixed remote; the client always connects one.
+    let is_server = cfg.remote.is_none();
 
     let socket = UdpSocket::bind(cfg.bind).await?;
     if let Some(remote) = cfg.remote {
@@ -477,13 +513,22 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
                             continue;
                         }
                     }
-                } else if destination_ip(packet) != cfg.tun_cidr.addr {
-                    // Client: the connected socket already pins the remote,
-                    // but the peer must not inject packets addressed to
-                    // other tunnel IPs.
-                    metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
-                    metrics.invalid_inner_dst.fetch_add(1, Ordering::Relaxed);
-                    continue;
+                } else {
+                    // Client: the connected socket pins the remote, but
+                    // authentication does not authorize inner IPs — the
+                    // peer must not inject packets sourced from or
+                    // addressed to other virtual IPs.
+                    let peer_vip = cfg.peer_vip.expect("client sets peer_vip");
+                    let src = source_ip(packet);
+                    if src != peer_vip || destination_ip(packet) != cfg.tun_cidr.addr {
+                        metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                        if src != peer_vip {
+                            metrics.invalid_inner_src.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            metrics.invalid_inner_dst.fetch_add(1, Ordering::Relaxed);
+                        }
+                        continue;
+                    }
                 }
                 tun.write(packet).await?;
                 metrics.rx_pkts.fetch_add(1, Ordering::Relaxed);
@@ -586,6 +631,44 @@ mod tests {
         cfg.sender_index = 0;
         cfg.peer_index = 0;
         cfg.mtu = MAX_MTU;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn keyed_mtu_limit_follows_outer_family() {
+        let mut cfg = base();
+        cfg.key = Some([1u8; 32]);
+        cfg.peer_index = 2;
+        // IPv4 outer (58B overhead): 1442 passes, 1443 is rejected.
+        cfg.mtu = MAX_MTU_ENCRYPTED;
+        assert!(cfg.validate().is_ok());
+        cfg.mtu = MAX_MTU_ENCRYPTED + 1;
+        assert!(cfg.validate().is_err());
+        // IPv6 outer (78B overhead): 1422 passes, 1423 is rejected.
+        cfg.bind = "[::]:51820".parse().unwrap();
+        cfg.mtu = MAX_MTU_ENCRYPTED_V6;
+        assert!(cfg.validate().is_ok());
+        cfg.mtu = MAX_MTU_ENCRYPTED_V6 + 1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn client_rejects_mismatched_bind_and_remote_family() {
+        let mut cfg = base();
+        cfg.remote = Some("[::1]:51820".parse().unwrap());
+        // v4 bind + v6 remote is unreachable — rejected at startup.
+        assert!(cfg.validate().is_err());
+        cfg.bind = "[::]:0".parse().unwrap();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn client_requires_peer_vip() {
+        let mut cfg = base();
+        cfg.remote = Some("127.0.0.1:51820".parse().unwrap());
+        cfg.peer_vip = None;
+        assert!(cfg.validate().is_err());
+        cfg.peer_vip = Some(Ipv4Addr::new(10, 80, 1, 2));
         assert!(cfg.validate().is_ok());
     }
 
@@ -841,7 +924,7 @@ mod tests {
         let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let remote_addr = remote.local_addr().unwrap();
         let bind = free_port();
-        let cfg = cfg_for(bind, Some(remote_addr), None, "cli");
+        let cfg = cfg_for(bind, Some(remote_addr), Some(OTHER_VIP), "cli");
         let bind_addr = cfg.bind;
         let engine = tokio::spawn(run_loop(cfg, tun));
 
@@ -878,8 +961,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        // Drops: foreign inner destination, malformed frame, oversized frame
-        // — none may reach TUN.
+        // Drops: foreign inner source, foreign inner destination,
+        // malformed frame, oversized frame — none may reach TUN.
+        remote
+            .send_to(&ipv4_packet(PEER_VIP, LOCAL_VIP, b"zz"), bind_addr)
+            .await
+            .unwrap();
         remote
             .send_to(&ipv4_packet(OTHER_VIP, OTHER_VIP, b"zz"), bind_addr)
             .await
@@ -965,7 +1052,7 @@ mod tests {
         let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let remote_addr = remote.local_addr().unwrap();
         let bind = free_port();
-        let mut cfg = cfg_for(bind, Some(remote_addr), None, "crypt");
+        let mut cfg = cfg_for(bind, Some(remote_addr), Some(OTHER_VIP), "crypt");
         cfg.key = Some(LAB_KEY);
         cfg.peer_index = 2;
         cfg.keepalive_interval = Duration::from_millis(60);
