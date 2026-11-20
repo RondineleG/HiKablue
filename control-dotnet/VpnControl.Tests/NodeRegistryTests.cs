@@ -299,11 +299,12 @@ public class NodeRegistryTests
         var rejoined = registry.Record(new Heartbeat("ephemeral-0-0", EngineHealthy: true));
         Assert.NotEqual(ancient.Id, rejoined.Id);
 
-        // And the bound itself: only the last batch (plus the recycled
-        // sentinel) survives — dead ids do not accumulate.
-        var surviving = registry.List()
-            .Where(n => n.NodeId != "ephemeral-0-0").ToList();
-        Assert.True(surviving.Count <= 100,
-            $"expected at most the last batch of 100, found {surviving.Count}");
+        // The bound itself: rewind the clock so List()'s own eviction
+        // cannot fire (nothing is stale relative to t0+1) — the count then
+        // shows exactly what the write-path sweeps left inside, not what a
+        // read-path cleanup produced. Without those sweeps this is ~500.
+        clock = t0.AddMinutes(1);
+        Assert.True(registry.List().Count <= 100,
+            $"expected the dictionary bounded near one batch, found {registry.List().Count}");
     }
 }
