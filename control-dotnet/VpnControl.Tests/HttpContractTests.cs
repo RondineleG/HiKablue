@@ -1,7 +1,9 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.Configuration;
 using Xunit;
 
 namespace VpnControl.Tests;
@@ -16,10 +18,18 @@ public class HttpContractTests : IClassFixture<WebApplicationFactory<Program>>
 
     public HttpContractTests(WebApplicationFactory<Program> factory)
     {
-        // Program reads the token from configuration before the factory's
-        // ConfigureAppConfiguration runs; the env var is the reliable hook.
-        Environment.SetEnvironmentVariable("VpnControl__HeartbeatToken", TestToken);
-        _client = factory.CreateClient();
+        // The secret is injected per-test-host via configuration — no
+        // process-wide environment variable, so parallel test classes can't
+        // observe or clobber each other's token (and nothing is left set
+        // after the run).
+        _client = factory.WithWebHostBuilder(builder =>
+            builder.ConfigureAppConfiguration(configuration =>
+                configuration.AddInMemoryCollection(
+                    new Dictionary<string, string?>
+                    {
+                        ["VpnControl:HeartbeatToken"] = TestToken
+                    })))
+            .CreateClient();
     }
 
     private Task<HttpResponseMessage> PostHeartbeat(object body, string? token = TestToken)
@@ -68,6 +78,24 @@ public class HttpContractTests : IClassFixture<WebApplicationFactory<Program>>
             new { nodeId = "wrong-token", engineHealthy = true }, token: "not-the-secret");
 
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public void StartupWithoutTokenFails()
+    {
+        // Fail-closed: a host built without the configured secret must never
+        // reach Run() — the token check throws during startup, before the
+        // endpoint can answer unauthenticated.
+        using var factory = new WebApplicationFactory<Program>()
+            .WithWebHostBuilder(builder =>
+                builder.ConfigureAppConfiguration(configuration =>
+                    configuration.AddInMemoryCollection(
+                        new Dictionary<string, string?>
+                        {
+                            ["VpnControl:HeartbeatToken"] = null
+                        })));
+
+        Assert.Throws<InvalidOperationException>(() => factory.CreateClient());
     }
 
     [Fact]

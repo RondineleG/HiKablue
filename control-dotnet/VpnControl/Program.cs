@@ -14,11 +14,16 @@ using VpnControl.Security;
 var builder = WebApplication.CreateBuilder(args);
 
 LoopbackGuard.EnforceLoopbackOnly(builder.Configuration);
-HeartbeatAuth.RequireToken(builder.Configuration);
 builder.WebHost.UseUrls(LoopbackGuard.ListenUrls(builder.Configuration));
 
 builder.Services.AddVpnControl();
 var app = builder.Build();
+
+// Token check stays fail-closed — the process never reaches Run() without
+// it — but reads app.Configuration after Build so test hosts can inject
+// the secret through ConfigureAppConfiguration instead of process-wide
+// environment variables.
+HeartbeatAuth.RequireToken(app.Configuration);
 
 await app.MapRegisteredEndpointsAsync();
 app.Run();
