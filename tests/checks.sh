@@ -71,6 +71,7 @@ run_step "commit subjects + branch name" bash tests/validate-commits.sh
 run_step "commit validator" bash .github/scripts/validate-commits.sh
 run_step "diff safety (forbidden patterns)" bash tests/lab/check-diff-safety.sh "$BASE_SHA" "$HEAD_SHA"
 run_step "diff safety self-tests" bash tests/lab/check-diff-safety.test.sh
+run_step "lab PKI issuance tests" bash tests/lab/gen-lab-pki.test.sh
 
 step_shell() {
     mapfile -t scripts < <(git ls-files '*.sh')
