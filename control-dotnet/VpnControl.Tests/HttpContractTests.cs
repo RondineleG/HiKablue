@@ -168,4 +168,14 @@ public class HttpContractTests : IClassFixture<WebApplicationFactory<Program>>
         Assert.False(node.GetProperty("engineHealthy").GetBoolean());
         Assert.Equal(42, node.GetProperty("metrics").GetProperty("rx_bytes").GetInt64());
     }
+
+    [Fact]
+    public async Task OpenApiDocumentIsServed()
+    {
+        var response = await _client.GetAsync("/openapi/v1.json");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.True(doc.RootElement.GetProperty("paths").TryGetProperty("/v1/nodes", out _));
+    }
 }

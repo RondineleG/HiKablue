@@ -25,8 +25,9 @@ public sealed class GetNodesEndpoint : BaseEndPoint<Node>, IEndpointAsync
     }
 
     private static Task<IResult> HandleAsync(
+        HttpContext http,
         [FromServices] IGetNodesUseCase useCase,
         [FromServices] ILoggerFactory loggerFactory) =>
         HandleUseCase(useCase, new GetNodesRequest(),
-            loggerFactory.CreateLogger<GetNodesEndpoint>());
+            loggerFactory.CreateLogger<GetNodesEndpoint>(), http.RequestAborted);
 }

@@ -46,7 +46,7 @@ public sealed class HeartbeatEndpoint : BaseEndPoint<Node>, IEndpointAsync
                 Success = false,
                 StatusCode = StatusCodes.Status401Unauthorized,
                 Message = "Unauthorized",
-                Timestamp = DateTime.UtcNow,
+                Timestamp = DateTimeOffset.UtcNow,
                 CorrelationId = Activity.Current?.Id
             }, statusCode: StatusCodes.Status401Unauthorized));
         }
@@ -54,6 +54,6 @@ public sealed class HeartbeatEndpoint : BaseEndPoint<Node>, IEndpointAsync
         return HandleUseCaseAsync(useCase, request,
             result => Results.Accepted(value: CreateApiResponse(result, StatusCodes.Status202Accepted, includeData: true)),
             "Heartbeat registration failed",
-            loggerFactory.CreateLogger<HeartbeatEndpoint>());
+            loggerFactory.CreateLogger<HeartbeatEndpoint>(), http.RequestAborted);
     }
 }

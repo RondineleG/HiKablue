@@ -22,7 +22,7 @@ public class ApiResponse<T>
     public IEnumerable<string>? Errors { get; set; }
 
     [JsonPropertyName("timestamp")]
-    public DateTime Timestamp { get; set; }
+    public DateTimeOffset Timestamp { get; set; }
 
     [JsonPropertyName("correlationId")]
     public string? CorrelationId { get; set; }

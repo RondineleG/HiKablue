@@ -60,8 +60,12 @@ Proteções ativas no Marco 1 (laboratório isolado):
   sem token configurado o serviço recusa subir. Respostas inválidas: 401.
 - O payload do heartbeat é limitado — `node_id` ≤ 128 caracteres, ≤ 64
   chaves de métrica com ≤ 64 caracteres cada; violações respondem 422.
+- O registro em memória é limitado a 1024 nós (`maxNodes`) — um `nodeId`
+  novo com a tabela cheia responde 429; nós conhecidos continuam
+  atualizando.
 - Nós que param de enviar heartbeat expiram do registro após 10 minutos
   sem `LastSeen` novo.
+- O documento OpenAPI é servido em `/openapi/v1.json` (loopback apenas).
 
 Limitação que permanece, deferida ao marco de control plane:
 

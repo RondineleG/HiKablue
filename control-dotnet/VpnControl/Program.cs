@@ -16,6 +16,7 @@ var builder = WebApplication.CreateBuilder(args);
 LoopbackGuard.EnforceLoopbackOnly(builder.Configuration);
 builder.WebHost.UseUrls(LoopbackGuard.ListenUrls(builder.Configuration));
 
+builder.Services.AddOpenApi();
 builder.Services.AddVpnControl();
 var app = builder.Build();
 
@@ -26,6 +27,8 @@ var app = builder.Build();
 HeartbeatAuth.RequireToken(app.Configuration);
 
 await app.MapRegisteredEndpointsAsync();
+// OpenAPI doc stays loopback-only with the rest of the service.
+app.MapOpenApi();
 app.Run();
 
 // Lets WebApplicationFactory-style tests reference the implicit Program.

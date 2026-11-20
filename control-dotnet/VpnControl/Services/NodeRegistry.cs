@@ -9,19 +9,22 @@ namespace VpnControl.Services;
 public sealed class NodeRegistry
 {
     private static readonly TimeSpan DefaultSweepEvery = TimeSpan.FromMinutes(1);
+    private const int DefaultMaxNodes = 1024;
 
     private readonly Dictionary<string, Node> _nodes = new();
     private readonly Func<DateTimeOffset> _clock;
     private readonly TimeSpan _staleAfter;
     private readonly TimeSpan _sweepEvery;
+    private readonly int _maxNodes;
     private DateTimeOffset _lastSweep;
 
     public NodeRegistry(Func<DateTimeOffset>? clock = null, TimeSpan? staleAfter = null,
-        TimeSpan? sweepEvery = null)
+        TimeSpan? sweepEvery = null, int maxNodes = DefaultMaxNodes)
     {
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
         _staleAfter = staleAfter ?? TimeSpan.FromMinutes(10);
         _sweepEvery = sweepEvery ?? DefaultSweepEvery;
+        _maxNodes = maxNodes;
         _lastSweep = _clock();
     }
 
@@ -30,7 +33,10 @@ public sealed class NodeRegistry
     // grow the dictionary forever whenever nobody reads. The sweep runs at
     // most once per sweepEvery — under the same lock, on the same clock —
     // so each heartbeat still costs O(1) plus an occasional O(n) scan.
-    public Node Record(Heartbeat hb)
+    // Returns null when the registry is at maxNodes and the id is new:
+    // rejecting unknown ids keeps a heartbeat flood of fresh nodeIds from
+    // evicting (or joining) the real fleet. Known nodes always update.
+    public Node? Record(Heartbeat hb)
     {
         lock (_nodes)
         {
@@ -44,6 +50,10 @@ public sealed class NodeRegistry
             {
                 node.Record(now, hb.EngineHealthy, hb.Metrics);
                 return node.Snapshot();
+            }
+            if (_nodes.Count >= _maxNodes)
+            {
+                return null;
             }
             var created = new Node(hb.NodeId, now, hb.EngineHealthy, hb.Metrics);
             _nodes[hb.NodeId] = created;
