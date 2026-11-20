@@ -34,7 +34,7 @@ public sealed class SessionService(
     ILogger<SessionService> logger) : ISessionService
 {
     private const int MaxAttempts = 3;
-    private const int MaxPoolProbe = 256;
+    private const int MaxPoolAddresses = 65536;
     private static readonly TimeSpan JitterMin = TimeSpan.FromMilliseconds(10);
     private static readonly TimeSpan JitterMax = TimeSpan.FromMilliseconds(50);
 
@@ -82,8 +82,8 @@ public sealed class SessionService(
         }
 
         var ttl = request.TtlSeconds is > 0 ? Math.Min(request.TtlSeconds.Value, 86400) : DefaultTtlSeconds;
-        var pool = EnumeratePool(PoolCidr).Take(MaxPoolProbe + 1).ToList();
-        if (pool.Count == 0)
+        var pool = EnumeratePool(PoolCidr).ToList();
+        if (pool.Count == 0 || pool.Count > MaxPoolAddresses)
         {
             return RequestResult<SessionView>.WithError("invalid VpnControl:IpPoolCidr", EResultStatus.HasError);
         }
@@ -106,17 +106,14 @@ public sealed class SessionService(
                     .Select(s => (int?)s.LabSessionId)
                     .MaxAsync(cancellationToken) + 1 ?? 1;
 
-                // Probe dispersion (ADR-0001 §3): hash-seeded order, never a
-                // linear scan from index 0 under contention.
+                // Probe dispersion (ADR-0001 §3): hash-seeded order over the
+                // WHOLE pool, never a linear scan from index 0 and never a
+                // truncated prefix — every usable address stays reachable.
                 var candidates = pool
-                    .Select((a, i) => (a, i))
-                    .OrderBy(x => (uint)HashCode.Combine(node.NodeId, sessionId, x.i))
-                    .Select(x => x.a)
-                    .Take(MaxPoolProbe)
-                    .ToList();
-                var candidatesArray = candidates.ToArray();
+                    .OrderBy(x => (uint)HashCode.Combine(node.NodeId, sessionId, x))
+                    .ToArray();
                 var taken = await db.Database
-                    .SqlQuery<string>($"SELECT address::text AS \"Value\" FROM ip_leases WHERE address = ANY({candidatesArray})")
+                    .SqlQuery<string>($"SELECT host(address) AS \"Value\" FROM ip_leases WHERE address = ANY({candidates})")
                     .ToListAsync(cancellationToken);
                 var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
                 if (free is null)
@@ -133,6 +130,7 @@ public sealed class SessionService(
                     IdempotencyKey = idempotencyKey,
                     RequestHash = hash,
                     OwnerSubject = subject,
+                    PeerPublicKey = request.PeerPublicKey,
                     Status = SessionStatus.Pending,
                     VirtualIp = free,
                     NodeId = node.NodeId,
@@ -156,7 +154,7 @@ public sealed class SessionService(
                         {
                             session_id = sessionId, lab_session_id = labId,
                             virtual_ip = free.ToString(), expires_at = row.ExpiresAt,
-                            key_epoch = row.KeyEpoch
+                            key_epoch = row.KeyEpoch, key_ref = request.PeerPublicKey
                         }
                     })
                 };
@@ -181,6 +179,22 @@ public sealed class SessionService(
                     await Task.Delay(Random.Shared.Next((int)JitterMin.TotalMilliseconds,
                         (int)JitterMax.TotalMilliseconds), cancellationToken);
                 }
+            }
+        }
+
+        if (created is null && idempotencyKey is not null)
+        {
+            // A concurrent request may have committed this key between our
+            // replay check and the insert: re-read instead of reporting 503.
+            var replay = await db.Sessions.AsNoTracking()
+                .FirstOrDefaultAsync(s => s.IdempotencyKey == idempotencyKey, cancellationToken);
+            if (replay is not null)
+            {
+                return replay.RequestHash == hash
+                    ? RequestResult<SessionView>.Success(ToView(replay), "idempotent replay")
+                    : RequestResult<SessionView>.WithError(
+                        "idempotency key was already used with a different payload",
+                        EResultStatus.EntityAlreadyExists);
             }
         }
 
@@ -303,8 +317,11 @@ public sealed class SessionService(
         {
             yield break;
         }
-        uint network = ((uint)bytes[0] << 24) | ((uint)bytes[1] << 16) | ((uint)bytes[2] << 8) | bytes[3];
         var hostBits = 32 - bits;
+        // Mask the base address to the network — a non-aligned CIDR like
+        // 10.99.0.2/30 must not leak addresses outside the block.
+        uint network = (((uint)bytes[0] << 24) | ((uint)bytes[1] << 16) | ((uint)bytes[2] << 8) | bytes[3])
+            & (0xFFFFFFFFu << hostBits);
         uint count = (1u << hostBits) - 2; // usable hosts, skip network + broadcast
         for (uint i = 1; i <= count; i++)
         {
