@@ -298,5 +298,12 @@ public class NodeRegistryTests
         // refreshing a 75-minute-old entry.
         var rejoined = registry.Record(new Heartbeat("ephemeral-0-0", EngineHealthy: true));
         Assert.NotEqual(ancient.Id, rejoined.Id);
+
+        // And the bound itself: only the last batch (plus the recycled
+        // sentinel) survives — dead ids do not accumulate.
+        var surviving = registry.List()
+            .Where(n => n.NodeId != "ephemeral-0-0").ToList();
+        Assert.True(surviving.Count <= 100,
+            $"expected at most the last batch of 100, found {surviving.Count}");
     }
 }
