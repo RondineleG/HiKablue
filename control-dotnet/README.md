@@ -42,3 +42,16 @@ VpnControl/
   Models/                           Heartbeat, NodeView, ApiResponse records
   Security/                         LoopbackGuard
 ```
+
+## Limitações conhecidas
+
+Estas limitações são aceitas no Marco 1 (telemetria, laboratório isolado) e
+serão endereçadas nos marcos de control plane:
+
+- O endpoint `/internal/heartbeats` não tem autenticação — qualquer cliente
+  que alcance o listener loopback pode registrar batimentos.
+- O dicionário de métricas é aceito sem limite de número de chaves nem
+  tamanho de chave/valor — payloads grandes ou com muitas chaves não são
+  rejeitados.
+- O registro não expira nós — um nó que para de enviar heartbeat permanece
+  listado indefinidamente (com `LastSeen` estagnado).
