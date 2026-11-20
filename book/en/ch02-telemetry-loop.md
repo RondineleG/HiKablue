@@ -229,7 +229,7 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   The coverage collector gained its own test suite
   (`tests/coverage.test.sh`) over `coverage-lib.sh` and the
   `lcov-percent.py`/`cobertura-percent.py` parsers.
-- `r10` — Coverage gate (TEST-02):Coverage gate (TEST-02): `tests/coverage.sh` now fails the gate
+- `r10` — Coverage gate (TEST-02): `tests/coverage.sh` now fails the gate
   below 90% per component. `run` was split so `run_loop` is unit-testable
   with a socketpair TUN; `main` became a testable `run(args)` in Go; the
   startup guard moved to `LoopbackGuard.EnforceLoopbackOnly`.

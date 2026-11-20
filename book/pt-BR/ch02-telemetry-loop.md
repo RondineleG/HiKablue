@@ -237,7 +237,7 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
   correlation id, nunca para o response. O coletor de cobertura ganhou
   sua própria suíte (`tests/coverage.test.sh`) sobre `coverage-lib.sh` e
   os parsers `lcov-percent.py`/`cobertura-percent.py`.
-- `r10` — Gate de cobertura (TEST-02):Gate de cobertura (TEST-02): `tests/coverage.sh` agora falha o
+- `r10` — Gate de cobertura (TEST-02): `tests/coverage.sh` agora falha o
   gate abaixo de 90% por componente. `run` foi dividido para `run_loop` ser
   testável com um socketpair como TUN; `main` virou um `run(args)` testável
   em Go; o guard de inicialização foi para
