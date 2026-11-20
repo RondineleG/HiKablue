@@ -125,6 +125,9 @@ run_step "book parity (en / es / pt-BR)" bash tests/book/check-parity.sh
 # component — the step fails below the threshold.
 run_step "coverage >= 90% (rust/go/c#, TEST-02)" bash tests/coverage.sh
 
+# TEST-01: the collector itself is verified with fixtures + stubbed tools.
+run_step "coverage collector self-test (fixtures + stubs)" bash tests/coverage.test.sh
+
 if [ "$run_lab" -eq 1 ]; then
     run_step "lab integration: ip netns ping (sudo)" \
         sudo tests/lab/netns-ping.sh engine-rust/target/release/vpn-engine
