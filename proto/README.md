@@ -10,9 +10,11 @@ Conventions:
   deleting a field.
 - `stream_epoch`, `backend_instance_id`, `revision` and `deadline` are on
   every `ControlCommand`; ACKs echo them back.
-- Snapshots carry framing (`declared_peer_count`, `serialized_length`,
-  `sha256_digest`) and never raw key material — fresh keys travel only in
-  `ProvisionPeer.key_material`.
+- Snapshots carry the peers as a serialized `PeerList` in `peer_list`,
+  and the framing (`declared_peer_count`, `serialized_length`,
+  `sha256_digest`) describes those exact bytes — the agent validates
+  framing on the received bytes, then decodes. Key material travels only
+  in `ProvisionPeer.key_material`, never in a snapshot.
 
 ## Regenerate bindings
 

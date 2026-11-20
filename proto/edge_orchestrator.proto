@@ -147,12 +147,23 @@ message SyncState {
   bool force = 2;
 }
 
+// Canonical serialization of a snapshot's peer list: the exact bytes that
+// serialized_length and sha256_digest describe. The agent MUST verify the
+// framing over the received bytes BEFORE decoding them — re-serializing
+// decoded objects is not guaranteed to reproduce the same bytes.
+message PeerList {
+  repeated Peer peers = 1;
+}
+
 message PeerSnapshot {
   uint64 revision = 1;
-  // Framing checks: all three must match the received peer list before
-  // any mutation (declared count, serialized byte length, SHA-256).
+  // Framing checks over `peer_list`: all three must match the received
+  // bytes before any mutation (declared count, byte length, SHA-256).
   uint32 declared_peer_count = 2;
   uint32 serialized_length = 3;
   bytes sha256_digest = 4;
-  repeated Peer peers = 5;
+  // Serialized PeerList, produced deterministically by the control plane
+  // (fields in tag order, no map fields in Peer). The agent validates the
+  // framing on these bytes, then decodes them into Peer objects.
+  bytes peer_list = 5;
 }
