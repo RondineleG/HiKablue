@@ -1108,6 +1108,19 @@ mod tests {
             .send_to(&seal_buf[..wire_len], bind_addr)
             .await
             .unwrap();
+        // An authenticated packet sourced from an inner IP that is not
+        // the peer's VIP is dropped too: authentication proves who sent
+        // it, it does not authorize the inner addresses.
+        let spoofed = ipv4_packet(PEER_VIP, LOCAL_VIP, b"spoof");
+        let mut spoof_buf = vec![0u8; HEADER_LEN + spoofed.len() + TAG_LEN + 32];
+        spoof_buf[HEADER_LEN..HEADER_LEN + spoofed.len()].copy_from_slice(&spoofed);
+        let spoof_len = peer_session
+            .seal(&mut spoof_buf, spoofed.len(), MSG_DATA)
+            .unwrap();
+        remote
+            .send_to(&spoof_buf[..spoof_len], bind_addr)
+            .await
+            .unwrap();
         assert!(peer.recv(&mut tb).is_err(), "dropped packet reached TUN");
 
         // Idle for a beat: the engine emits a sealed KEEPALIVE (header + tag,
