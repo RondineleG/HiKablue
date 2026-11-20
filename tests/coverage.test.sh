@@ -48,6 +48,15 @@ t "invalid xml fails"    1 python3 "$ROOT/tests/cobertura-percent.py" "$FIX/not-
 t "non-cobertura fails"  1 python3 "$ROOT/tests/cobertura-percent.py" "$FIX/wrong-root.xml"
 
 echo "-- coverage.sh failure modes (one injected fault per scenario) --"
+# Stub scenarios run coverage.sh in a throwaway tree: it rm -rf's its own
+# artifact dirs before measuring, so pointing it at the real checkout would
+# delete the official run's reports. $STUB mirrors just the paths it needs.
+STUB="$(mktemp -d)"
+trap 'rm -rf "$STUB"' EXIT
+mkdir -p "$STUB/engine-rust" "$STUB/agent-go" "$STUB/control-dotnet"
+cp -R "$ROOT/tests" "$STUB/tests"
+STUB_COV="$STUB/tests/coverage.sh"
+
 ts() { # ts NAME EXPECTED_DIAG CMD... — non-zero exit AND the stage's own
   # diagnostic, so a masked failure can't pass as the named one.
   local name="$1" diag="$2"; shift 2
@@ -60,16 +69,29 @@ ts() { # ts NAME EXPECTED_DIAG CMD... — non-zero exit AND the stage's own
   fi
 }
 ts "missing llvm fails"    "llvm-tools-preview missing" \
-  env COVERAGE_COMPONENTS=rust LLVM_PROFDATA=/nonexistent LLVM_COV=/nonexistent bash "$ROOT/tests/coverage.sh"
+  env COVERAGE_COMPONENTS=rust LLVM_PROFDATA=/nonexistent LLVM_COV=/nonexistent bash "$STUB_COV"
 ts "broken cargo fails"    "instrumented cargo test failed" \
-  env COVERAGE_COMPONENTS=rust CARGO_BIN=false LLVM_PROFDATA=/bin/true LLVM_COV=/bin/true bash "$ROOT/tests/coverage.sh"
+  env COVERAGE_COMPONENTS=rust CARGO_BIN=false LLVM_PROFDATA=/bin/true LLVM_COV=/bin/true bash "$STUB_COV"
 ts "empty lcov report fails" "llvm-cov produced no report" \
-  env COVERAGE_COMPONENTS=rust CARGO_BIN=/bin/true LLVM_PROFDATA=/bin/true LLVM_COV=/bin/false bash "$ROOT/tests/coverage.sh"
+  env COVERAGE_COMPONENTS=rust CARGO_BIN=/bin/true LLVM_PROFDATA=/bin/true LLVM_COV=/bin/false bash "$STUB_COV"
 ts "broken go fails"       "go test -coverprofile failed" \
-  env COVERAGE_COMPONENTS=go GO_BIN=false bash "$ROOT/tests/coverage.sh"
+  env COVERAGE_COMPONENTS=go GO_BIN=false bash "$STUB_COV"
 ts "broken dotnet fails"   "dotnet test --collect coverage failed" \
-  env COVERAGE_COMPONENTS=csharp DOTNET_BIN=false bash "$ROOT/tests/coverage.sh"
+  env COVERAGE_COMPONENTS=csharp DOTNET_BIN=false bash "$STUB_COV"
 ts "typo component fails"  "unknown component 'cshapr'" \
-  env COVERAGE_COMPONENTS=cshapr bash "$ROOT/tests/coverage.sh"
+  env COVERAGE_COMPONENTS=cshapr bash "$STUB_COV"
+
+# Artifact preservation: sentinels sit inside the two dirs coverage.sh
+# rm -rf's before measuring. If a stub run ever touched the real tree the
+# sentinels would be gone — surviving files prove isolation held.
+SENT_RUST="$ROOT/engine-rust/target/profraw/selftest-keep.profraw"
+SENT_COV="$ROOT/control-dotnet/VpnControl.Tests/TestResults/coverage/selftest-keep.xml"
+mkdir -p "$(dirname "$SENT_RUST")" "$(dirname "$SENT_COV")"
+echo sentinel > "$SENT_RUST"
+echo sentinel > "$SENT_COV"
+env COVERAGE_COMPONENTS=rust CARGO_BIN=false LLVM_PROFDATA=/bin/true \
+    LLVM_COV=/bin/true bash "$STUB_COV" >/dev/null 2>&1 || true
+t "official artifacts preserved" 0 test -f "$SENT_RUST" -a -f "$SENT_COV"
+rm -f "$SENT_RUST" "$SENT_COV"  # only files this test created
 
 [ "$fails" -eq 0 ] && echo "coverage.test.sh: ALL PASSED" || { echo "coverage.test.sh: FAILED"; exit 1; }
