@@ -13,12 +13,20 @@ intake, deliberately in-memory:
 - `VpnControl.Tests` — xunit tests for the registry, including the
   missing-heartbeat-vs-engine-failure exercise.
 
-**Security:** the heartbeat endpoint is **unauthenticated and lab-only** —
-any local process can set any node's state. It must never face a network:
-the service checks its URLs at startup and **refuses to start on a
+**Security:** the heartbeat endpoint is **lab-only** and answers only to a
+**shared secret**: every request must carry `X-Heartbeat-Token`, configured
+via `VpnControl:HeartbeatToken` (or the `VpnControl__HeartbeatToken`
+environment variable). The service **refuses to start without a token** and
+rejects a missing or wrong token with HTTP 401. It must never face a
+network: the service checks its URLs at startup and **refuses to start on a
 non-loopback bind** (wildcard, LAN, `0.0.0.0`), whatever the configuration
-source (`urls`, `ASPNETCORE_URLS`, appsettings). Real identity arrives with
-the mTLS gRPC `NodeChannel` in the control-plane milestone.
+source (`urls`, `ASPNETCORE_URLS`, appsettings).
+
+**Current protection:** a shared secret — adequate for the isolated lab
+only; any local process holding it can report as any `nodeId` (no per-node
+identity). **Future protection:** individual node identity via the mTLS
+gRPC `NodeChannel` in the control-plane milestone. See "Limitações
+conhecidas" below for payload limits and node expiry.
 
 Run: `dotnet run --project VpnControl` (binds `http://127.0.0.1:5080` by
 default; `urls` config or `ASPNETCORE_URLS` may override but must stay
