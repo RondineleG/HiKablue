@@ -22,6 +22,21 @@ use super::replay::{AntiReplayWindow, ReplayError};
 /// key is catastrophic keystream reuse.
 pub const NONCE_EXHAUSTION_MARGIN: u64 = 65536;
 
+/// Derives the direction key bound to one session index. The party using
+/// `index` as its session ID seals with `KDF(psk ‖ index)` and its peer
+/// opens with the same derivation — so the two directions never share a
+/// key and the same counter value under each direction is safe (spec:
+/// "separate keys per direction"). With identical indexes both derivations
+/// coincide; `Config::validate` requires distinct indexes when keyed.
+pub(crate) fn derive_key(key: &[u8; 32], index: u32) -> [u8; 32] {
+    use blake2::Digest;
+    let mut h = blake2::Blake2s256::new();
+    h.update(b"hikablue-session-key-v1");
+    h.update(index.to_be_bytes());
+    h.update(key);
+    h.finalize().into()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoError {
     /// The send counter is about to wrap; reject every further encryption
@@ -54,7 +69,10 @@ impl std::fmt::Display for CryptoError {
 impl std::error::Error for CryptoError {}
 
 pub struct SessionState {
-    key: Zeroizing<[u8; 32]>,
+    /// `derive_key(psk, local_index)` — the send direction.
+    tx_key: Zeroizing<[u8; 32]>,
+    /// `derive_key(key, peer_index)` — the receive direction.
+    rx_key: Zeroizing<[u8; 32]>,
     /// Index we stamp on outbound packets.
     local_index: u32,
     /// Index we require on inbound packets.
@@ -69,7 +87,8 @@ pub struct SessionState {
 impl SessionState {
     pub fn new(key: [u8; 32], local_index: u32, peer_index: u32) -> Self {
         Self {
-            key: Zeroizing::new(key),
+            tx_key: Zeroizing::new(derive_key(&key, local_index)),
+            rx_key: Zeroizing::new(derive_key(&key, peer_index)),
             local_index,
             peer_index,
             tx_counter: AtomicU64::new(0),
@@ -109,7 +128,7 @@ impl SessionState {
             nonce: nonce_counter,
         };
         frame::encode(&header, &mut buf[..HEADER_LEN]);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*self.key));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*self.tx_key));
         // Split the buffer: the encoded header stays borrowed as AAD while
         // the plaintext region encrypts in place; the tag lands right after.
         let (head, rest) = buf.split_at_mut(HEADER_LEN);
@@ -148,7 +167,7 @@ impl SessionState {
         let (aad_and_ct, tag_region) = buf.split_at_mut(HEADER_LEN + ct_len);
         let (aad, ct_buf) = aad_and_ct.split_at_mut(HEADER_LEN);
         let tag = Tag::from_slice(&tag_region[..TAG_LEN]);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*self.key));
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&*self.rx_key));
         cipher
             .decrypt_in_place_detached(
                 frame::aead_nonce(header.nonce).as_slice().into(),
@@ -194,11 +213,11 @@ mod tests {
         let mut buf = staged(msg);
         let wire_len = a.seal(&mut buf, msg.len(), MSG_DATA).unwrap();
         assert_eq!(wire_len, HEADER_LEN + msg.len() + TAG_LEN);
-        // Wire layout: type, reserved, sender_index, nonce LE.
-        assert_eq!(buf[0], MSG_DATA);
+        // Wire layout: version|type, reserved, session_id BE, counter BE.
+        assert_eq!(buf[0], (crate::wire::frame::VERSION << 4) | MSG_DATA);
         assert_eq!(buf[1], 0);
-        assert_eq!(&buf[2..6], &1u32.to_le_bytes());
-        assert_eq!(&buf[6..14], &1u64.to_le_bytes()); // first nonce is 1
+        assert_eq!(&buf[2..6], &1u32.to_be_bytes());
+        assert_eq!(&buf[6..14], &1u64.to_be_bytes()); // first nonce is 1
 
         let (header, pt_len) = b.open(&mut buf, wire_len).unwrap();
         assert_eq!(header.nonce, 1);
@@ -229,7 +248,8 @@ mod tests {
         let key = [0xA5u8; 32];
         let counter: u64 = 0x0700000041424344; // lands at iv[4..]
         let iv = frame::aead_nonce(counter);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        // Sealing runs under the derived direction key, not the raw PSK.
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&derive_key(&key, 1)));
         let pt = b"wire";
         let aad = [0u8; HEADER_LEN];
         let expected = cipher
@@ -367,6 +387,27 @@ mod tests {
     }
 
     #[test]
+    fn direction_keys_differ_per_index() {
+        // The two directions must not share a key: the derivation binds
+        // the key to the sender's index, so sealing under index 1 opens
+        // for the peer expecting 1 — and both directions roundtrip.
+        assert_ne!(derive_key(&KEY, 1), derive_key(&KEY, 2));
+        let a = SessionState::new(KEY, 1, 2);
+        let b = SessionState::new(KEY, 2, 1);
+        let mut buf = staged(b"dir");
+        let wire_len = a.seal(&mut buf, 3, MSG_DATA).unwrap();
+        let (header, pt) = b.open(&mut buf, wire_len).unwrap();
+        assert_eq!(header.sender_index, 1);
+        assert_eq!(pt, 3);
+        // …and back the other way under the second derived key.
+        let mut buf2 = staged(b"rid");
+        let w2 = b.seal(&mut buf2, 3, MSG_DATA).unwrap();
+        let (header2, pt2) = a.open(&mut buf2, w2).unwrap();
+        assert_eq!(header2.sender_index, 2);
+        assert_eq!(pt2, 3);
+    }
+
+    #[test]
     fn rekey_resets_counters_and_replay() {
         let a = session();
         let mut buf = staged(b"q");
@@ -375,7 +416,7 @@ mod tests {
         let mut buf2 = staged(b"q");
         let w = fresh.seal(&mut buf2, 1, MSG_DATA).unwrap();
         // Nonce restarted at 1 under the new key.
-        assert_eq!(&buf2[6..14], &1u64.to_le_bytes());
+        assert_eq!(&buf2[6..14], &1u64.to_be_bytes());
         let (header, _) = fresh.open(&mut buf2, w).unwrap();
         assert_eq!(header.nonce, 1);
     }
