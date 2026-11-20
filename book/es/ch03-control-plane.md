@@ -117,7 +117,138 @@ vivos), el `LeaseReaperWorker` (cuarentena de sesiones obsoletas) y el
 cliente mTLS del agente Go con fencing. Se apoyan en el esquema y los
 payloads construidos aquí.
 
-## Verificación
+## Leyendo el código
+
+Todo el argumento de seguridad del asignador cabe en una docena de
+líneas. Primero el lock del nodo — todo aprovisionamiento de un nodo se
+serializa detrás de esto:
+
+```csharp
+private async Task EnsureNodeLockedAsync(string nodeId, Entities.Node node, CancellationToken ct)
+{
+    // Upsert the row then lock it FOR UPDATE — single-issuer for
+    // lab_session_id and desired_revision on this node (ADR-0001 §2).
+    var now = DateTimeOffset.UtcNow;
+    await db.Database.ExecuteSqlAsync($"""
+        INSERT INTO nodes (node_id, backend_instance_id, registered_at, last_seen_at, engine_healthy, desired_revision)
+        VALUES ({nodeId}, {""}, {now}, {node.LastSeen}, {node.EngineHealthy}, 0)
+        ON CONFLICT (node_id) DO NOTHING
+        """, ct);
+    await LockNodeAsync(nodeId, ct);
+}
+
+private Task<int> LockNodeAsync(string nodeId, CancellationToken ct) =>
+    db.Database.ExecuteSqlAsync(
+        $"SELECT node_id FROM nodes WHERE node_id = {nodeId} FOR UPDATE", ct);
+```
+
+- `INSERT ... ON CONFLICT DO NOTHING` crea la fila del nodo si una
+  sesión llega antes de que el nodo se registre jamás — upsert sin
+  fallar.
+- `SELECT ... FOR UPDATE` es el cerrojo sobre la fila *padre*: todo
+  `CreateSessionAsync` concurrente de este nodo se serializa aquí, así
+  que el `MAX(lab_session_id)+1` siguiente lo calcula exactamente una
+  transacción.
+- `ExecuteSqlAsync` interpola parámetros (`{nodeId}`) — **no** es
+  concatenación de strings; Npgsql los envía como parámetros ligados.
+
+Luego el sondeo — la parte que sobrevive a la contención:
+
+```csharp
+var candidates = pool
+    .OrderBy(x => (uint)HashCode.Combine(node.NodeId, sessionId, x))
+    .ToArray();
+var taken = await db.Database
+    .SqlQuery<string>($"SELECT host(address) AS \"Value\" FROM ip_leases WHERE address = ANY({candidates})")
+    .ToListAsync(cancellationToken);
+var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
+```
+
+- `HashCode.Combine(node.NodeId, sessionId, x)` baraja **todo** el pool
+  por sesión — dos creates concurrentes arrancan en offsets no
+  relacionados, así que solo colisionan cuando el pool está de verdad
+  casi lleno.
+- `host(address)` quita el `/32` que renderizaría `address::text`, así
+  un `inet` almacenado compara limpio contra `IPAddress.ToString()`.
+- `FirstOrDefault` elige el primer candidato *no reclamado*; uno
+  reclamado se salta en memoria antes del INSERT — seguro barato antes
+  de que el árbitro real (el PK) decida.
+- Si el insert aún así pierde la carrera (`23505`), la transacción hace
+  rollback y el bucle de reintentos arranca con un nuevo shuffle.
+
+| Archivo | Qué hace |
+|---|---|
+| `proto/edge_orchestrator.proto` | Stream bidi `EdgeOrchestrator.NodeChannel`; campos de fencing en cada comando; taxonomía `AckErrorCode`; framing `PeerList`/`PeerSnapshot` |
+| `tests/lab/gen-lab-pki.sh` | CA de laboratorio (`init`) + certs de cliente por nodo (`issue`) con SANs SPIFFE; `umask 077`, EKU solo clientAuth |
+| `.agc/adr/0001-ipam-and-session-persistence.md` | Esquema + invariantes: lock de la fila del nodo, sondeo disperso, política del reaper |
+| `control-dotnet/VpnControl/Data/` | `ControlDbContext` + filas: `nodes`, `sessions`, `ip_leases` (fila EF sin clave, PK real vía migración), `outbox` |
+| `control-dotnet/VpnControl/Services/SessionService.cs` | El bucle de asignación de arriba + `RevokeSessionAsync` (revoking + outbox `RevokePeer`, lease retenido) |
+| `control-dotnet/VpnControl/Endpoints/V1/Sessions/` | `POST`/`GET`/`DELETE /v1/sessions` — `X-Subject`, `X-Admin-Token`, `Idempotency-Key`, 202 + `statusUrl`, `no-store` |
+| `control-dotnet/VpnControl/Endpoints/HealthEndpoint.cs` | `/health/live` estático, `/health/ready` = `SELECT 1` real |
+| `control-dotnet/VpnControl.Tests/SessionServiceTests.cs` | Testcontainers Postgres: carrera por la última /30, idempotencia concurrente, enmascaramiento CIDR, ciclo del lease |
+
+## Glosario
+
+- **`AckErrorCode`** — la razón tipada que un agente pone en un
+  `CommandAck` (`FENCED_STREAM`, `DEADLINE_EXCEEDED`,
+  `REVISION_REGRESSION`, …) para que el plano de control reaccione sin
+  parsear texto libre.
+- **`backend_instance_id`** — identificador fresco que el backend acuña
+  por arranque del plano de datos; un reinicio lo cambia y valla los
+  comandos pendientes.
+- **CA (Certificate Authority)** — la raíz ECDSA P-256 desechable del
+  laboratorio que firma el certificado de cada nodo; la crea
+  `gen-lab-pki.sh`.
+- **CIDR** — notación "Classless Inter-Domain Routing"
+  (`10.42.0.0/22`): dirección base más longitud de prefijo que define
+  el pool del IPAM.
+- **`CommandAck`** — la respuesta del agente a un `ControlCommand`:
+  aplicado, rechazado o con error, siempre repitiendo los campos de
+  fencing del comando.
+- **EF Core / Npgsql** — el ORM de .NET y su proveedor PostgreSQL;
+  mapean filas a clases y `IPAddress` al tipo de columna `inet`.
+- **`FOR UPDATE` / `SKIP LOCKED`** — bloqueo de filas de PostgreSQL:
+  `FOR UPDATE` serializa escritores sobre una fila; `SKIP LOCKED`
+  permite a un worker reclamar filas de outbox pendientes que otro
+  worker aún no bloqueó.
+- **Fencing** — rechazar un comando porque el stream o el backend que
+  lo emitió/ejecutó está obsoleto (`stream_epoch`,
+  `backend_instance_id`).
+- **gRPC `NodeChannel`** — el RPC de streaming bidireccional que abre
+  el agente; los comandos vuelven por la misma conexión (fase 3).
+- **`host(address)`** — función de PostgreSQL que devuelve la parte de
+  dirección de un valor `inet` sin sufijo `/32` — lo que compara la
+  consulta de sondeo.
+- **Idempotency-Key** — clave del cliente que hace rejugable un `POST`:
+  misma clave + mismo payload → misma respuesta; payload distinto →
+  409.
+- **`inet`** — tipo PostgreSQL para una dirección IP; su índice único
+  es el asignador de leases.
+- **IPAM** — IP Address Management: el asignador que entrega y reclama
+  direcciones del túnel.
+- **`lab_session_id`** — el id numérico de sesión único entre las
+  sesiones *vivas* de un nodo; lo que lleva el protocolo de datos del
+  laboratorio.
+- **mTLS** — TLS mutuo: ambas partes presentan certificados; el cert
+  del agente lleva su identidad SPIFFE en una URI SAN.
+- **`23505`** — el SQLSTATE `unique_violation` de PostgreSQL; la señal
+  del bucle de reintentos de que un candidato fue reclamado a mitad de
+  transacción.
+- **Outbox pattern** — los comandos se almacenan (tabla `outbox`) antes
+  de despacharse, así que un crash no puede perder un
+  `ProvisionPeer`/`RevokePeer`.
+- **SAN (Subject Alternative Name)** — la extensión del certificado
+  (OID 2.5.29.17) que lleva la URI SPIFFE que identifica al nodo.
+- **SPIFFE** — estándar de identidad de workloads; aquí la URI
+  `spiffe://lab.hikablue/node/<id>` que nombra a cada nodo.
+- **`stream_epoch`** — id emitido por el plano de control para un
+  stream autenticado; una reconexión lo incrementa y valla los ACKs del
+  stream viejo.
+- **Testcontainers** — la librería con la que los tests arrancan un
+  PostgreSQL real en Docker, para probar las carreras del asignador
+  contra el motor real.
+
+
 
 - `tests/checks.sh --lab` — ALL PASSED (incluyendo una carrera de
   creación concurrente contra la última dirección /30 y replay de
