@@ -105,12 +105,15 @@ sin un solo `Vec`.
 
 ## Ingreso simétrico
 
-Servidor y cliente mantienen la misma disciplina de siempre: el paquete
-interno debe ser IPv4 válido, venir del VIP del par y apuntar al VIP
-local — ahora *después* de autenticado, lo que hace significativo el
-pin del endpoint (un spoof no produce etiqueta válida sin la clave).
-Los drops cuentan por causa: `invalid_inner_src_total`,
-`invalid_inner_dst_total`, `dropped_pkts`.
+Servidor y cliente aplican la misma regla simétrica: el paquete interno
+debe ser IPv4 válido, venir del VIP del par y apuntar al VIP local —
+ahora *después* de autenticado, lo que hace significativo el pin del
+endpoint (un spoof no produce etiqueta válida sin la clave). El
+servidor conoce al par por `--peer`; el cliente nombra la misma
+expectativa con su propio `--peer <server-vip>` — la autenticación
+prueba quién envió el datagrama, pero solo esta regla decide qué
+direcciones internas puede llevar. Los drops cuentan por causa:
+`invalid_inner_src_total`, `invalid_inner_dst_total`, `dropped_pkts`.
 
 ## Lab
 

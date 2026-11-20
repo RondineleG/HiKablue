@@ -99,12 +99,15 @@ single `Vec`.
 
 ## Symmetric ingress
 
-Server and client keep the same discipline as before: the inner packet
-must be valid IPv4, come from the peer's VIP and target the local VIP —
-now *after* authentication, which is what makes endpoint pinning
-meaningful (a spoof cannot produce a valid tag without the key). Drops
-count per cause: `invalid_inner_src_total`, `invalid_inner_dst_total`,
-`dropped_pkts`.
+Server and client apply the same symmetric rule: the inner packet must
+be valid IPv4, come from the peer's VIP and target the local VIP — now
+*after* authentication, which is what makes endpoint pinning meaningful
+(a spoof cannot produce a valid tag without the key). The server knows
+the peer by `--peer`; the client names the same expectation with its
+own `--peer <server-vip>` — authentication proves who sent the
+datagram, but only this rule decides which inner addresses it may
+carry. Drops count per cause: `invalid_inner_src_total`,
+`invalid_inner_dst_total`, `dropped_pkts`.
 
 ## Lab
 

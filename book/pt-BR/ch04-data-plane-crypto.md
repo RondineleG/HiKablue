@@ -101,12 +101,15 @@ entrega regiões disjuntas para AAD, texto e tag sem um único `Vec`.
 
 ## Ingresso simétrico
 
-Servidor e cliente aplicam a mesma disciplina de sempre: o pacote
-interno precisa ser IPv4 válido, vir do VIP do peer e mirar o VIP
-local — agora *depois* de autenticado, o que torna o pin do endpoint
-significativo (um spoof não produz tag válida sem a chave). Drops por
-causa vão para métricas separadas: `invalid_inner_src_total`,
-`invalid_inner_dst_total`, `dropped_pkts`.
+Servidor e cliente aplicam a mesma regra simétrica: o pacote interno
+precisa ser IPv4 válido, vir do VIP do peer e mirar o VIP local —
+agora *depois* de autenticado, o que torna o pin do endpoint
+significativo (um spoof não produz tag válida sem a chave). O servidor
+conhece o peer por `--peer`; o cliente nomeia a mesma expectativa com o
+seu próprio `--peer <server-vip>` — a autenticação prova quem enviou o
+datagrama, mas só essa regra decide quais endereços internos ele pode
+carregar. Drops por causa vão para métricas separadas:
+`invalid_inner_src_total`, `invalid_inner_dst_total`, `dropped_pkts`.
 
 ## Lab
 
