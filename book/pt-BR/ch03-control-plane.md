@@ -110,13 +110,59 @@ enfileira `RevokePeer`; o lease de IP é *retido* até o nó confirmar —
 a liberação confirmada chega com o tratamento de `CommandAck` na fase 3.
 Toda resposta é `no-store`.
 
-## O que ainda falta
+## O loop se fecha: `NodeChannel`
 
-A outra metade do loop: `NodeChannelService` (o stream gRPC com mTLS +
-validação SPIFFE), o `OutboxDispatcherWorker` (SKIP LOCKED → streams
-vivos), o `LeaseReaperWorker` (quarentena de sessões obsoletas) e o
-cliente mTLS do agente Go com fencing. Eles se apoiam no schema e nos
-payloads construídos aqui.
+Com a persistência em lugar, a fase 3 ligou o stream que o contrato
+prometia:
+
+- **Identidade antes de tudo.** O Kestrel só exige certificado de cliente
+  quando `VpnControl:LabCaPath` aponta para a CA de laboratório (as
+  cadeias são validadas com `CustomRootTrust`). Em seguida, o
+  `SpiffeCertificateValidator` abre a extensão SAN (OID 2.5.29.17) com
+  `AsnReader`, pega a entrada uniformResourceIdentifier e exige
+  `spiffe://lab.hikablue/node/<id>` — o id vira `UserState["NodeId"]` e
+  precisa bater com `register.node_id`, então um certificado só consegue
+  falar como si mesmo.
+- **`NodeChannelService`.** O primeiro frame tem que ser `NodeRegister`;
+  o `stream_epoch` é o timestamp Unix-millis na conexão, e o
+  `NodeStreamRegistry` substitui atomicamente qualquer stream anterior
+  (seu CancellationTokenSource é cancelado — o interruptor de fencing).
+  Heartbeats renovam `nodes.last_seen_at` e o registry em memória. Um
+  `CommandAck` é correlacionado por `command_id` *e* verificado: um ack
+  com outro `stream_epoch` ou `backend_instance_id` é ignorado.
+  `APPLIED` marca a linha `acked` (e um ack de `RevokePeer` apaga o lease
+  e revoga a sessão); `FENCED_STREAM`/`FENCED_BACKEND` falham a linha,
+  fecham o stream e enfileiram um `SyncState` de ressincronização;
+  `DEADLINE_EXCEEDED`, `REVISION_REGRESSION` e `INVALID_PAYLOAD` falham a
+  linha e incrementam o contador de comandos falhos; qualquer outro caso
+  devolve o comando para `pending` com `next_retry_at` de 250 ms.
+- **`OutboxDispatcherWorker`.** A cada 100–250 ms ele puxa linhas
+  pendentes com `FOR UPDATE SKIP LOCKED`, cruza `node_id` com o stream
+  vivo, carimba epoch, backend e deadline de 30 s, envia o comando e
+  marca a linha `sent` com `attempts + 1`. Sem stream? A linha espera em
+  `next_retry_at`.
+- **`LeaseReaperWorker`.** A cada 60 s: sessões com `expires_at` vencido
+  cujo nó ficou mudo além da janela de quarentena (padrão 300 s) viram
+  `quarantined`, seu lease é apagado e o log de auditoria registra
+  `FORCED_REAPER_RELEASE` enquanto `ipam_reaped_leases_total` incrementa
+  — a invariante de hardening do ADR-0001, implementada.
+- **O lado Go.** O `pkg/orchestrator` disca com `credentials.NewTLS` (a
+  CA de laboratório como única raiz, o cert do nó como identidade de
+  cliente), keepalive 30 s/10 s e backoff de reconexão. O `Channel.Run`
+  envia `NodeRegister` primeiro, bate heartbeat a cada 10 s numa
+  goroutine (um `sendMu` serializa os `Send` concorrentes, que o grpc-go
+  proíbe), e o `evaluate` verifica antes de despachar: `stream_epoch`
+  mais antigo → `FENCED_STREAM`, `backend_instance_id` alheio →
+  `FENCED_BACKEND`, `deadline` vencido → `DEADLINE_EXCEEDED`,
+  `revision` ≤ aplicada → `REVISION_REGRESSION`. Só então o payload
+  chega ao handler local.
+
+Verificado localmente: 16 novos testes C# (matriz de aceitação e rejeição
+SPIFFE, fencing, liberação do lease em ack de revogação) e 14 testes Go —
+um handshake mTLS real contra uma CA de teste, rejeição de certificado
+não confiável, e um `NodeChannel` bufconn em processo que registra, bate
+heartbeat, despacha e confirma. Cobertura: C# ≥ 95%, Go ≥ 90% (o
+`agent-go/gen` gerado é excluído, como o código OpenApi gerado).
 
 ## Lendo o código
 
@@ -264,3 +310,9 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   `/v1/sessions` + probes de saúde entregues (PR #12): 85 testes C#
   verdes, corrida pela última IP e idempotência verificadas em
   PostgreSQL 16.
+- `r1` — loop gRPC entregue: `NodeChannelService` + validação SPIFFE,
+  dispatcher de outbox (SKIP LOCKED), reaper de leases e o
+  `pkg/orchestrator` do agente Go (dial mTLS, loop
+  register/heartbeat/ack, fencing). Schema de outbox ampliado
+  (`stream_epoch`, `backend_instance_id`, `status`, `attempts`,
+  `next_retry_at`, `deadline` — migration `outbox-dispatch`).

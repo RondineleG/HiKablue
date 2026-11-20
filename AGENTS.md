@@ -17,3 +17,12 @@ The architecture specification is authoritative for protocol and topology. `.agc
 - Raw UDP is for test traffic in an isolated, authorized lab only. See `.agc/RULES.md` for required safeguards.
 
 Name branches `feat/<slug>` for additive work and `fix/<slug>` for bug fixes. Use Conventional Commits and the Git identity configured for the repository. Do not add AI attribution trailers such as `Generated with ...` or `Co-Authored-By`. The pull-request check validates branch names and commit subjects.
+
+## Milestone status
+
+- **Milestone 3 (control plane) delivered.** Schema lives in EF Core
+  migrations under `control-dotnet/VpnControl/Data/Migrations/`:
+  `initial-control-plane` (nodes, sessions, ip_leases, outbox) and
+  `outbox-dispatch` (stream_epoch, backend_instance_id, status, attempts,
+  next_retry_at, deadline on outbox). Apply with `dotnet ef database
+  update` or `db.Database.MigrateAsync()`.
