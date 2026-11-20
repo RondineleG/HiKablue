@@ -14,7 +14,9 @@ public sealed class NodeService : INodeService
     public NodeService(NodeRegistry registry) => _registry = registry;
 
     public Task<RequestResult<Node>> RecordHeartbeatAsync(Heartbeat hb, CancellationToken cancellationToken = default) =>
-        Task.FromResult(RequestResult<Node>.Success(_registry.Record(hb)));
+        Task.FromResult(_registry.Record(hb) is { } node
+            ? RequestResult<Node>.Success(node)
+            : RequestResult<Node>.WithError("node registry is full", EResultStatus.TooManyRequests));
 
     public Task<RequestResult<IReadOnlyList<Node>>> GetNodesAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult(RequestResult<IReadOnlyList<Node>>.Success(_registry.List()));

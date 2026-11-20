@@ -160,12 +160,13 @@ public class CoverageTests
     {
         public Task RegisterAsync(WebApplication app)
         {
-            app.MapGet("/probe/{kind}/{status:int}", (string kind, int status) =>
+            app.MapGet("/probe/{kind}/{status:int}", (string kind, int status, HttpContext http) =>
             {
                 IUseCase<int, NodeView> useCase = kind switch
                 {
                     "ok" => new StubUseCase(RequestResult<NodeView>.Success(
                         new NodeView("n1", DateTimeOffset.UtcNow, true, null))),
+                    "ct" => new CancellableProbeUseCase(),
                     "oce" => new ThrowUseCase(new OperationCanceledException()),
                     "boom" => new ThrowUseCase(new InvalidOperationException("kaboom")),
                     "secret" => new ThrowUseCase(new InvalidOperationException(
@@ -175,20 +176,33 @@ public class CoverageTests
                     _ => new StubUseCase(RequestResult<NodeView>.WithError(
                         "probe failure", (EResultStatus)status)),
                 };
-                return HandleUseCaseAsync(useCase, status, _ => Results.Ok("handled"), "Probe failed");
+                return HandleUseCaseAsync(useCase, status, _ => Results.Ok("handled"),
+                    "Probe failed", cancellationToken: http.RequestAborted);
             });
             return Task.CompletedTask;
         }
     }
 
+    private sealed class CancellableProbeUseCase : IUseCase<int, NodeView>
+    {
+        public Task<RequestResult<NodeView>> ExecuteAsync(
+            int request, CancellationToken cancellationToken = default) =>
+            Task.FromResult(cancellationToken.CanBeCanceled
+                ? RequestResult<NodeView>.Success(
+                    new NodeView("n1", DateTimeOffset.UtcNow, true, null))
+                : RequestResult<NodeView>.WithError("request token not wired"));
+    }
+
     [Theory]
     [InlineData("/probe/ok/0", HttpStatusCode.OK)]
+    [InlineData("/probe/ct/0", HttpStatusCode.OK)] // RequestAborted reaches the use case
     [InlineData("/probe/x/1", HttpStatusCode.UnprocessableEntity)]
     [InlineData("/probe/x/2", HttpStatusCode.BadRequest)]
     [InlineData("/probe/x/3", HttpStatusCode.NotFound)]
     [InlineData("/probe/x/4", HttpStatusCode.BadRequest)]
     [InlineData("/probe/x/5", HttpStatusCode.Conflict)]
     [InlineData("/probe/x/6", HttpStatusCode.NoContent)]
+    [InlineData("/probe/x/7", HttpStatusCode.TooManyRequests)]
     [InlineData("/probe/validations/0", HttpStatusCode.UnprocessableEntity)]
     [InlineData("/probe/oce/0", (HttpStatusCode)499)]
     [InlineData("/probe/boom/0", HttpStatusCode.InternalServerError)]

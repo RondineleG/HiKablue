@@ -30,20 +30,23 @@ public abstract class BaseEndPoint<TEntity>
     protected static Task<IResult> HandleUseCase<TRequest, TResponse>(
         IUseCase<TRequest, TResponse> useCase,
         TRequest request,
-        ILogger? logger = null) =>
-        HandleUseCaseAsync(useCase, request, MapResponse, "Internal Server Error", logger);
+        ILogger? logger = null,
+        CancellationToken cancellationToken = default) =>
+        HandleUseCaseAsync(useCase, request, MapResponse, "Internal Server Error",
+            logger, cancellationToken);
 
     protected static async Task<IResult> HandleUseCaseAsync<TRequest, TResponse>(
         IUseCase<TRequest, TResponse> useCase,
         TRequest request,
         Func<RequestResult<TResponse>, IResult> successHandler,
         string errorTitle,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(useCase);
         try
         {
-            var result = await useCase.ExecuteAsync(request);
+            var result = await useCase.ExecuteAsync(request, cancellationToken);
             return result.Status == EResultStatus.Success ? successHandler(result) : MapResponse(result);
         }
         catch (OperationCanceledException)
@@ -64,7 +67,7 @@ public abstract class BaseEndPoint<TEntity>
                 StatusCode = StatusCodes.Status500InternalServerError,
                 Message = errorTitle,
                 Errors = null,
-                Timestamp = DateTime.UtcNow,
+                Timestamp = DateTimeOffset.UtcNow,
                 CorrelationId = correlationId
             };
             return Results.Json(response, statusCode: StatusCodes.Status500InternalServerError);
@@ -85,6 +88,7 @@ public abstract class BaseEndPoint<TEntity>
             EResultStatus.EntityNotFound => Results.NotFound(response),
             EResultStatus.HasValidation => Results.UnprocessableEntity(response),
             EResultStatus.EntityAlreadyExists => Results.Conflict(response),
+            EResultStatus.TooManyRequests => Results.Json(response, statusCode: StatusCodes.Status429TooManyRequests),
             EResultStatus.HasError or EResultStatus.EntityHasError => Results.BadRequest(response),
             _ => Results.BadRequest(response)
         };
@@ -109,6 +113,7 @@ public abstract class BaseEndPoint<TEntity>
             EResultStatus.EntityNotFound => StatusCodes.Status404NotFound,
             EResultStatus.HasValidation => StatusCodes.Status422UnprocessableEntity,
             EResultStatus.EntityAlreadyExists => StatusCodes.Status409Conflict,
+            EResultStatus.TooManyRequests => StatusCodes.Status429TooManyRequests,
             EResultStatus.HasError or EResultStatus.EntityHasError => StatusCodes.Status400BadRequest,
             _ => StatusCodes.Status400BadRequest
         };

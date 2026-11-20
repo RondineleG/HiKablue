@@ -91,7 +91,7 @@ public class NodeRegistryTests
         registry.Record(new Heartbeat("node-a", false,
             new Dictionary<string, long> { ["rx_bytes"] = 9 }));
 
-        Assert.Equal(t0, first.LastSeen);
+        Assert.Equal(t0, first!.LastSeen);
         Assert.True(first.EngineHealthy);
         Assert.Equal(5, first.Metrics?["rx_bytes"]);
         Assert.Equal(t0, listed.LastSeen);
@@ -192,7 +192,7 @@ public class NodeRegistryTests
 
         var rejoined = registry.Record(new Heartbeat("node-a", EngineHealthy: false));
         Assert.Equal("node-a", Assert.Single(registry.List()).NodeId);
-        Assert.False(rejoined.EngineHealthy);
+        Assert.False(rejoined!.EngineHealthy);
     }
 
     // ---------- Expiry also runs on the heartbeat path ----------
@@ -219,7 +219,7 @@ public class NodeRegistryTests
         // The sweep inside that heartbeat evicted stale-node, so beating
         // again under the same id creates a brand-new node identity.
         var rejoined = registry.Record(new Heartbeat("stale-node", EngineHealthy: true));
-        Assert.NotEqual(stale.Id, rejoined.Id);
+        Assert.NotEqual(stale!.Id, rejoined!.Id);
     }
 
     [Fact]
@@ -236,13 +236,13 @@ public class NodeRegistryTests
         // 11 min < 60 min sweep interval: the stale entry is still there and
         // a heartbeat refreshes it in place — SAME identity, new LastSeen.
         var stillThere = registry.Record(new Heartbeat("stale-node", EngineHealthy: true));
-        Assert.Equal(stale.Id, stillThere.Id);
+        Assert.Equal(stale!.Id, stillThere!.Id);
 
         // Now let the interval elapse; the next heartbeat reaps it.
         clock = t0.AddMinutes(61);
         registry.Record(new Heartbeat("fresh-node", EngineHealthy: true));
         var rejoined = registry.Record(new Heartbeat("stale-node", EngineHealthy: true));
-        Assert.NotEqual(stale.Id, rejoined.Id);
+        Assert.NotEqual(stale!.Id, rejoined!.Id);
     }
 
     [Fact]
@@ -254,15 +254,15 @@ public class NodeRegistryTests
             TimeSpan.FromMinutes(1));
         var first = registry.Record(new Heartbeat("active", EngineHealthy: true));
 
-        Node last = first;
+        Node? last = first;
         for (var beat = 1; beat <= 15; beat++)
         {
             clock = t0.AddMinutes(beat);
             last = registry.Record(new Heartbeat("active", EngineHealthy: true));
         }
 
-        Assert.Equal(t0.AddMinutes(15), last.LastSeen);
-        Assert.Equal(first.Id, last.Id);
+        Assert.Equal(t0.AddMinutes(15), last!.LastSeen);
+        Assert.Equal(first!.Id, last.Id);
         Assert.Equal(first.CreatedAt, last.CreatedAt);
     }
 
@@ -297,7 +297,7 @@ public class NodeRegistryTests
         // re-beating "ephemeral-0-0" registers a new identity rather than
         // refreshing a 75-minute-old entry.
         var rejoined = registry.Record(new Heartbeat("ephemeral-0-0", EngineHealthy: true));
-        Assert.NotEqual(ancient.Id, rejoined.Id);
+        Assert.NotEqual(ancient!.Id, rejoined!.Id);
 
         // The bound itself: rewind the clock so List()'s own eviction
         // cannot fire (nothing is stale relative to t0+1) — the count then
@@ -306,5 +306,48 @@ public class NodeRegistryTests
         clock = t0.AddMinutes(1);
         Assert.True(registry.List().Count <= 100,
             $"expected the dictionary bounded near one batch, found {registry.List().Count}");
+    }
+
+    // ---------- Capacity: maxNodes bounds the table ----------
+
+    [Fact]
+    public void FullRegistryRejectsNewNodeIdsButStillUpdatesKnownOnes()
+    {
+        // Sweeps bound *stale* entries; maxNodes bounds *active* ones: a
+        // flood of distinct, still-fresh nodeIds can't grow the table past
+        // the cap, and rejecting the newcomer keeps it from evicting a
+        // known node.
+        var registry = new NodeRegistry(maxNodes: 2);
+
+        Assert.NotNull(registry.Record(new Heartbeat("node-a", EngineHealthy: true)));
+        Assert.NotNull(registry.Record(new Heartbeat("node-b", EngineHealthy: true)));
+
+        Assert.Null(registry.Record(new Heartbeat("intruder", EngineHealthy: true)));
+
+        var known = registry.Record(new Heartbeat("node-a", EngineHealthy: false));
+        Assert.NotNull(known);
+        Assert.False(known.EngineHealthy);
+
+        var nodes = registry.List();
+        Assert.Equal(2, nodes.Count);
+        Assert.DoesNotContain(nodes, n => n.NodeId == "intruder");
+    }
+
+    [Fact]
+    public void FullRegistryAcceptsANewNodeAfterItsEntryExpires()
+    {
+        var t0 = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var clock = t0;
+        var registry = new NodeRegistry(() => clock, TimeSpan.FromMinutes(10),
+            TimeSpan.FromMinutes(1), maxNodes: 1);
+
+        registry.Record(new Heartbeat("node-a", EngineHealthy: true));
+        Assert.Null(registry.Record(new Heartbeat("node-b", EngineHealthy: true)));
+
+        clock = t0.AddMinutes(15);
+        Assert.NotNull(registry.Record(new Heartbeat("node-b", EngineHealthy: true)));
+
+        var node = Assert.Single(registry.List());
+        Assert.Equal("node-b", node.NodeId);
     }
 }
