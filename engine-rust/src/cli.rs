@@ -61,7 +61,8 @@ pub struct ClientArgs {
 
 #[derive(Debug, Args)]
 pub struct CommonArgs {
-    /// Inner MTU applied to the TUN interface (max 2048).
+    /// Inner MTU applied to the TUN interface (max 2018 — the 2048-byte
+    /// buffer also carries 30 bytes of wire overhead).
     #[arg(long, default_value_t = DEFAULT_MTU)]
     pub mtu: u16,
     /// Name of the TUN interface to create.
@@ -74,6 +75,33 @@ pub struct CommonArgs {
     /// the socket is limited to the engine's own user/group.
     #[arg(long)]
     pub metrics_group: Option<String>,
+    /// 32-byte ChaCha20-Poly1305 session key as 64 hex chars. Lab-only
+    /// pre-shared key: real key delivery arrives via the control plane in a
+    /// later phase. Without it the engine speaks the M2 plaintext format.
+    #[arg(long)]
+    pub key: Option<String>,
+    /// sender_index stamped on outbound packets and required on inbound
+    /// ones (the lab has a single symmetric peer). Defaults to 1.
+    #[arg(long, default_value_t = 1)]
+    pub sender_index: u32,
+    /// Idle seconds before a KEEPALIVE datagram is sent (encrypted mode
+    /// only). Defaults to 25.
+    #[arg(long, default_value_t = 25)]
+    pub keepalive_secs: u64,
+}
+
+/// Parses a 64-hex-char string into a 32-byte key.
+pub fn parse_key_hex(s: &str) -> Result<[u8; 32], String> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return Err(format!("key must be 64 hex chars, got {}", s.len()));
+    }
+    let mut key = [0u8; 32];
+    for i in 0..32 {
+        key[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .map_err(|_| format!("key has a non-hex byte at offset {}", i * 2))?;
+    }
+    Ok(key)
 }
 
 /// An IPv4 address with prefix length, written `A.B.C.D/N`.
@@ -124,6 +152,24 @@ impl std::fmt::Display for Ipv4Cidr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_key_hex_accepts_64_hex_chars() {
+        let key = parse_key_hex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+            .unwrap();
+        assert_eq!(key[0], 0x00);
+        assert_eq!(key[1], 0x11);
+        assert_eq!(key[31], 0xff);
+    }
+
+    #[test]
+    fn parse_key_hex_rejects_wrong_length_and_non_hex() {
+        assert!(parse_key_hex("abcd").is_err());
+        assert!(parse_key_hex(&"00".repeat(33)).is_err());
+        assert!(parse_key_hex(&format!("{}zz", "00".repeat(31))).is_err());
+        // Surrounding whitespace is trimmed before the length check.
+        assert!(parse_key_hex(&format!("  {}  ", "ab".repeat(32))).is_ok());
+    }
 
     #[test]
     fn parses_cidr() {

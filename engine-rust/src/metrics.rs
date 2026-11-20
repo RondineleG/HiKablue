@@ -49,6 +49,9 @@ pub struct Metrics {
     pub tx_bytes: AtomicU64,
     pub tx_pkts: AtomicU64,
     pub dropped_pkts: AtomicU64,
+    /// Datagrams dropped by the ingress anti-spoofing check (inner source
+    /// or destination mismatch) — a subset of `dropped_pkts`.
+    pub invalid_inner_src: AtomicU64,
     /// 0 or 1 for the current single fixed peer.
     pub peers: AtomicU64,
     started: Instant,
@@ -62,6 +65,7 @@ impl Metrics {
             tx_bytes: AtomicU64::new(0),
             tx_pkts: AtomicU64::new(0),
             dropped_pkts: AtomicU64::new(0),
+            invalid_inner_src: AtomicU64::new(0),
             peers: AtomicU64::new(0),
             started: Instant::now(),
         })
@@ -75,6 +79,7 @@ fn metrics_json(m: &Metrics) -> serde_json::Value {
         "tx_bytes": m.tx_bytes.load(Ordering::Relaxed),
         "tx_pkts": m.tx_pkts.load(Ordering::Relaxed),
         "dropped_pkts": m.dropped_pkts.load(Ordering::Relaxed),
+        "invalid_inner_src_total": m.invalid_inner_src.load(Ordering::Relaxed),
         "peers": m.peers.load(Ordering::Relaxed),
         "uptime_secs": m.started.elapsed().as_secs(),
     })

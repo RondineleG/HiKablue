@@ -19,6 +19,11 @@ OUTER_B="192.168.57.2"
 VIP_A="10.80.1.1"
 VIP_B="10.80.1.2"
 PORT=51820
+# Lab-only symmetric key (Phase 2 data plane): proves the AEAD wire path
+# end to end. Never a real credential — real keys arrive via the control
+# plane's ProvisionPeer in a later milestone. Plaintext mode still works
+# by omitting --key.
+LAB_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 PID_A=""
 PID_B=""
 CREATED=0
@@ -73,11 +78,11 @@ ip netns exec "$NS_B" ip link set hkl-b up
 # socket path (default /run/vpn/engine.sock would collide).
 ip netns exec "$NS_A" "$ENGINE" server \
     --bind "0.0.0.0:$PORT" --tun-cidr "$VIP_A/24" --peer "$VIP_B" \
-    --metrics-sock /tmp/hik-lab-a.sock &
+    --key "$LAB_KEY" --metrics-sock /tmp/hik-lab-a.sock &
 PID_A=$!
 ip netns exec "$NS_B" "$ENGINE" client \
     --bind 0.0.0.0:0 --remote "$OUTER_A:$PORT" --tun-cidr "$VIP_B/24" \
-    --metrics-sock /tmp/hik-lab-b.sock &
+    --key "$LAB_KEY" --metrics-sock /tmp/hik-lab-b.sock &
 PID_B=$!
 sleep 1
 
