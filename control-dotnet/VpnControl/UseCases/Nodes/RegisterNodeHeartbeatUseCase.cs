@@ -60,7 +60,10 @@ public sealed class RegisterNodeHeartbeatUseCase : IRegisterNodeHeartbeatUseCase
         var result = await _service.RecordHeartbeatAsync(request, cancellationToken);
         if (!result.IsSuccess || result.Data is null)
         {
-            return RequestResult<NodeView>.WithError(result.ErrorMessage ?? result.Message);
+            // Preserve the service's status — a full registry must surface
+            // as TooManyRequests (429), not a generic 400.
+            return RequestResult<NodeView>.WithError(result.ErrorMessage ?? result.Message,
+                result.IsSuccess ? EResultStatus.HasError : result.Status);
         }
 
         return RequestResult<NodeView>.Success(result.Data.ToView());

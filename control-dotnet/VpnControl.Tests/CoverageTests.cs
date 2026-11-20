@@ -272,6 +272,30 @@ public class CoverageTests
         Assert.Equal("service down", list.ErrorMessage);
     }
 
+    private sealed class FullRegistryNodeService : INodeService
+    {
+        public Task<RequestResult<Node>> RecordHeartbeatAsync(
+            Heartbeat hb, CancellationToken cancellationToken = default) =>
+            Task.FromResult(RequestResult<Node>.WithError(
+                "node registry is full", EResultStatus.TooManyRequests));
+
+        public Task<RequestResult<IReadOnlyList<Node>>> GetNodesAsync(
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(RequestResult<IReadOnlyList<Node>>.WithError("service down"));
+    }
+
+    [Fact]
+    public async Task RegisterHeartbeatKeepsTheTooManyRequestsStatus()
+    {
+        // A full registry must surface as 429 end to end: the use case
+        // wraps the service error but must not downgrade it to HasError.
+        var result = await new RegisterNodeHeartbeatUseCase(new FullRegistryNodeService())
+            .ExecuteAsync(new Heartbeat("n1", true));
+
+        Assert.False(result.IsSuccess);
+        Assert.Equal(EResultStatus.TooManyRequests, result.Status);
+    }
+
     // ---------- Convention DI: interface-less *Service ----------
 
     private sealed class LoneService;

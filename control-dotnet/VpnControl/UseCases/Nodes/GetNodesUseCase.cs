@@ -21,7 +21,8 @@ public sealed class GetNodesUseCase : IGetNodesUseCase
         var result = await _service.GetNodesAsync(cancellationToken);
         if (!result.IsSuccess || result.Data is null)
         {
-            return RequestResult<IReadOnlyList<NodeView>>.WithError(result.ErrorMessage ?? result.Message);
+            return RequestResult<IReadOnlyList<NodeView>>.WithError(result.ErrorMessage ?? result.Message,
+                result.IsSuccess ? EResultStatus.HasError : result.Status);
         }
 
         return RequestResult<IReadOnlyList<NodeView>>.Success(
