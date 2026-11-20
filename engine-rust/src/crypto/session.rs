@@ -148,7 +148,9 @@ impl SessionState {
     /// `buf[HEADER_LEN..HEADER_LEN+plaintext_len]`.
     ///
     /// Order matters: the replay slot is only claimed *after* the tag
-    /// verifies, so a forgery cannot burn sequence numbers.
+    /// verifies, so a forgery cannot burn sequence numbers. The final
+    /// check and the mark run under one lock — two concurrent `open`
+    /// calls cannot both accept the same nonce.
     pub fn open(&self, buf: &mut [u8], wire_len: usize) -> Result<(Header, usize), CryptoError> {
         if wire_len > buf.len() || wire_len < HEADER_LEN + TAG_LEN {
             return Err(CryptoError::BadHeader);
@@ -176,7 +178,14 @@ impl SessionState {
                 tag,
             )
             .map_err(|_| CryptoError::Authentication)?;
-        self.rx_replay.lock().unwrap().update(header.nonce);
+        // Post-auth acceptance is atomic: a second authenticated copy that
+        // raced through the preliminary check re-fails here before the
+        // bit can be marked, so each nonce is accepted exactly once.
+        {
+            let mut replay = self.rx_replay.lock().unwrap();
+            replay.check(header.nonce).map_err(CryptoError::Replay)?;
+            replay.update(header.nonce);
+        }
         Ok((header, ct_len))
     }
 
@@ -405,6 +414,64 @@ mod tests {
         let (header2, pt2) = a.open(&mut buf2, w2).unwrap();
         assert_eq!(header2.sender_index, 2);
         assert_eq!(pt2, 3);
+    }
+
+    #[test]
+    fn concurrent_open_accepts_each_nonce_once() {
+        // Two copies of the same authenticated datagram raced through
+        // open(): exactly one succeeds, the other gets Duplicate — the
+        // post-authentication check+update runs under one lock.
+        let sealer = SessionState::new(KEY, 2, 1);
+        let rx = SessionState::new(KEY, 1, 2);
+        let mut buf = staged(b"race");
+        let wire_len = sealer.seal(&mut buf, 4, MSG_DATA).unwrap();
+        let wire: Vec<u8> = buf[..wire_len].to_vec();
+        let barrier = std::sync::Barrier::new(2);
+        let results: Vec<Result<usize, CryptoError>> = std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let (rx, barrier, wire) = (&rx, &barrier, &wire);
+                handles.push(s.spawn(move || {
+                    let mut local = wire.clone();
+                    barrier.wait();
+                    rx.open(&mut local, wire.len()).map(|(h, l)| {
+                        assert_eq!(h.nonce, 1);
+                        l
+                    })
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| **r == Err(CryptoError::Replay(ReplayError::Duplicate)))
+                .count(),
+            1
+        );
+        // Distinct nonces opened concurrently all pass — no deadlock and
+        // no false positives from the shared window lock.
+        let wins: Vec<Vec<u8>> = (0..8)
+            .map(|_| {
+                let mut b = staged(b"n");
+                let l = sealer.seal(&mut b, 1, MSG_DATA).unwrap();
+                b[..l].to_vec()
+            })
+            .collect();
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for w in &wins {
+                let rx = &rx;
+                handles.push(s.spawn(move || {
+                    let mut local = w.clone();
+                    rx.open(&mut local, w.len())
+                }));
+            }
+            for h in handles {
+                assert!(h.join().unwrap().is_ok());
+            }
+        });
     }
 
     #[test]
