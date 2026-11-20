@@ -132,7 +132,8 @@ if ! command -v python3 >/dev/null; then
   line csharp "FAIL: python3 required to parse cobertura xml"
   fail=1
 elif ! (cd "$CD_DIR" && "$DOTNET_BIN" test VpnControl.Tests/VpnControl.Tests.csproj \
-      --collect:"XPlat Code Coverage" --results-directory "$COV_DIR" -v q >/dev/null 2>&1); then
+      --collect:"XPlat Code Coverage" --settings coverlet.runsettings \
+      --results-directory "$COV_DIR" -v q >/dev/null 2>&1); then
   line csharp "FAIL: dotnet test --collect coverage failed"
   fail=1
 else

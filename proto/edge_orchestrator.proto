@@ -1,0 +1,185 @@
+// edge_orchestrator.proto — Go agent ↔ C# control plane contract.
+// vpn-debian-specification.md §5 (Integration contracts).
+//
+// One bidirectional stream per authenticated node connection. The agent
+// authenticates with mTLS (lab CA, one certificate identity per node); the
+// control plane fences stale streams and stale backend instances with
+// stream_epoch and backend_instance_id.
+//
+// Field-number policy: removed fields are reserved, never reused.
+syntax = "proto3";
+
+package edge.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option csharp_namespace = "VpnControl.Proto";
+option go_package = "github.com/RondineleG/HiKablue/agent-go/gen/edge/v1;edgev1";
+
+service EdgeOrchestrator {
+  // Agent opens the stream; the control plane sends commands back on it.
+  rpc NodeChannel(stream AgentMessage) returns (stream ControlCommand);
+}
+
+// ---------------------------------------------------------------------------
+// Agent → control plane
+// ---------------------------------------------------------------------------
+
+message AgentMessage {
+  oneof payload {
+    NodeRegister register = 1;
+    NodeHeartbeat heartbeat = 2;
+    CommandAck command_ack = 3;
+  }
+}
+
+// First message on every stream. node_id must match the mTLS certificate
+// identity; a mismatch closes the stream.
+message NodeRegister {
+  string node_id = 1;
+  // Fresh identifier minted per data-plane instance start. A backend
+  // restart changes it and triggers reconciliation + new key epochs.
+  string backend_instance_id = 2;
+  string agent_version = 3;
+  // Last revision the backend reports as applied; drives the first
+  // reconciliation decision.
+  uint64 applied_revision = 4;
+}
+
+message NodeHeartbeat {
+  string backend_instance_id = 1;
+  uint64 applied_revision = 2;
+  bool engine_healthy = 3;
+  map<string, int64> metrics = 4;
+}
+
+// Machine-readable reason carried by a REJECTED/ERROR ack so the control
+// plane can react without parsing free text.
+enum AckErrorCode {
+  ACK_ERROR_NONE = 0;
+  ACK_ERROR_FENCED_STREAM = 1;
+  ACK_ERROR_FENCED_BACKEND = 2;
+  ACK_ERROR_DEADLINE_EXCEEDED = 3;
+  ACK_ERROR_INVALID_PAYLOAD = 4;
+  ACK_ERROR_REVISION_REGRESSION = 5;
+  ACK_ERROR_INTERNAL = 6;
+}
+
+// ACKs echo the command identifiers; the control plane accepts an ACK only
+// from the current authenticated stream, for the current backend instance,
+// and for a matching command_id.
+message CommandAck {
+  string command_id = 1;
+  string stream_epoch = 2;
+  string backend_instance_id = 3;
+  // The revision the agent actually applied — may lag the command's
+  // desired revision only when outcome is not APPLIED.
+  uint64 applied_revision = 4;
+  AckOutcome outcome = 5;
+  // Machine-readable failure detail on REJECTED/ERROR; no key material.
+  string error = 6;
+  AckErrorCode error_code = 7;
+}
+
+enum AckOutcome {
+  ACK_OUTCOME_UNSPECIFIED = 0;
+  ACK_OUTCOME_APPLIED = 1;
+  // Agent refused the command (bad deadline, wrong backend, invalid peer).
+  ACK_OUTCOME_REJECTED = 2;
+  // Agent tried and failed; delivery is retried per at-least-once semantics.
+  ACK_OUTCOME_ERROR = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Control plane → agent
+// ---------------------------------------------------------------------------
+
+message ControlCommand {
+  string command_id = 1;
+  string node_id = 2;
+  // Control-plane-issued identifier for this authenticated stream. A
+  // reconnect fences the previous stream and its pending ACKs.
+  string stream_epoch = 3;
+  // Commands addressed to a different backend instance are stale: the
+  // agent rejects them and reports its current id instead of applying.
+  string backend_instance_id = 4;
+  // Desired-state revision this command belongs to.
+  uint64 revision = 5;
+  // Commands past their deadline are reported as failed, not applied.
+  google.protobuf.Timestamp deadline = 6;
+
+  oneof payload {
+    ProvisionPeer provision_peer = 10;
+    RevokePeer revoke_peer = 11;
+    SyncState sync_state = 12;
+  }
+}
+
+// One VPN peer as desired state sees it.
+message Peer {
+  // API-facing session UUID.
+  string session_id = 1;
+  // Numeric session id for the lab protocol; unique among ACTIVE sessions
+  // on this node (spec §5 persistence).
+  uint32 lab_session_id = 2;
+  string virtual_ip = 3;
+  google.protobuf.Timestamp expires_at = 4;
+  // Instance-bound key reference for already-provisioned keys. Never raw
+  // key material: a PeerSnapshot carries references only.
+  string key_ref = 5;
+  // Epoch the referenced key material was issued under; a backend restart
+  // bumps it so stale references are fenced.
+  uint64 key_epoch = 6;
+}
+
+// Fresh directional key material, allowed ONLY on explicit provisioning of
+// a new peer or a new key epoch — never inside a snapshot.
+message PeerKeyMaterial {
+  uint64 key_epoch = 1;
+  // 32-byte ChaCha20 keys, one per direction (engine→peer, peer→engine).
+  bytes egress_key = 2;
+  bytes ingress_key = 3;
+}
+
+message ProvisionPeer {
+  Peer peer = 1;
+  PeerKeyMaterial key_material = 2;
+}
+
+message RevokePeer {
+  string session_id = 1;
+  uint32 lab_session_id = 2;
+  string reason = 3;
+}
+
+// Full desired-state snapshot sent after a revision gap, a reconnect, or a
+// backend restart. The agent validates framing before mutating anything
+// (spec §5 snapshot validation and deletion guard).
+message SyncState {
+  PeerSnapshot snapshot = 1;
+  // Force bypasses ONLY the >20%-deletion / empty-replacement guard, and
+  // only under authenticated, audited operator authorization bound to
+  // node_id + backend_instance_id + revision + digest.
+  bool force = 2;
+}
+
+// Canonical serialization of a snapshot's peer list: the exact bytes that
+// serialized_length and sha256_digest describe. The agent MUST verify the
+// framing over the received bytes BEFORE decoding them — re-serializing
+// decoded objects is not guaranteed to reproduce the same bytes.
+message PeerList {
+  repeated Peer peers = 1;
+}
+
+message PeerSnapshot {
+  uint64 revision = 1;
+  // Framing checks over `peer_list`: all three must match the received
+  // bytes before any mutation (declared count, byte length, SHA-256).
+  uint32 declared_peer_count = 2;
+  uint32 serialized_length = 3;
+  bytes sha256_digest = 4;
+  // Serialized PeerList, produced deterministically by the control plane
+  // (fields in tag order, no map fields in Peer). The agent validates the
+  // framing on these bytes, then decodes them into Peer objects.
+  bytes peer_list = 5;
+}
