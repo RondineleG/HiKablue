@@ -91,6 +91,14 @@ namespace VpnControl.Data.Migrations
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("acked_at");
 
+                    b.Property<int>("Attempts")
+                        .HasColumnType("integer")
+                        .HasColumnName("attempts");
+
+                    b.Property<string>("BackendInstanceId")
+                        .HasColumnType("text")
+                        .HasColumnName("backend_instance_id");
+
                     b.Property<string>("CommandType")
                         .IsRequired()
                         .HasColumnType("text")
@@ -100,9 +108,17 @@ namespace VpnControl.Data.Migrations
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("created_at");
 
+                    b.Property<DateTimeOffset?>("Deadline")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("deadline");
+
                     b.Property<DateTimeOffset?>("DeliveredAt")
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("delivered_at");
+
+                    b.Property<DateTimeOffset?>("NextRetryAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("next_retry_at");
 
                     b.Property<string>("NodeId")
                         .IsRequired()
@@ -118,7 +134,19 @@ namespace VpnControl.Data.Migrations
                         .HasColumnType("bigint")
                         .HasColumnName("revision");
 
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("status");
+
+                    b.Property<string>("StreamEpoch")
+                        .HasColumnType("text")
+                        .HasColumnName("stream_epoch");
+
                     b.HasKey("CommandId");
+
+                    b.HasIndex("Status", "NextRetryAt")
+                        .HasFilter("status = 'pending'");
 
                     b.ToTable("outbox", (string)null);
                 });
@@ -165,6 +193,7 @@ namespace VpnControl.Data.Migrations
                         .HasColumnName("owner_subject");
 
                     b.Property<string>("PeerPublicKey")
+                        .HasColumnType("text")
                         .HasColumnName("peer_public_key");
 
                     b.Property<string>("RequestHash")
