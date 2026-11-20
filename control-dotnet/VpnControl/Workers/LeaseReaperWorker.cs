@@ -75,6 +75,9 @@ public sealed class LeaseReaperWorker(
             .ToListAsync(ct);
 
         var reaped = 0;
+        // Quarantine + lease release must commit atomically: a crash between
+        // them would leave a live session whose IP was already freed.
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
         foreach (var session in expired)
         {
             session.Status = SessionStatus.Quarantined;
@@ -93,6 +96,7 @@ public sealed class LeaseReaperWorker(
         {
             await db.SaveChangesAsync(ct);
         }
+        await tx.CommitAsync(ct);
         return reaped;
     }
 }
