@@ -25,4 +25,8 @@ Name branches `feat/<slug>` for additive work and `fix/<slug>` for bug fixes. Us
   `initial-control-plane` (nodes, sessions, ip_leases, outbox) and
   `outbox-dispatch` (stream_epoch, backend_instance_id, status, attempts,
   next_retry_at, deadline on outbox). Apply with `dotnet ef database
-  update` or `db.Database.MigrateAsync()`.
+  update` or `db.Database.MigrateAsync()`. The Go orchestration client is
+  delivered as `agent-go/pkg/orchestrator` (mTLS channel, fencing, ACKs);
+  wiring it into `cmd/vpn-agent` — which still runs the M1 metrics/HTTP
+  heartbeat loop — is deferred to the milestone-4 integration work along
+  with the end-to-end gRPC lab.
