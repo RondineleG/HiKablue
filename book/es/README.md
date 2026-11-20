@@ -8,4 +8,6 @@ Ediciones: [English](../en/README.md) · [Português (Brasil)](../pt-BR/README.m
 
 | 2 | `ch02-telemetry-loop` | [El motor aprende a responder: telemetría](ch02-telemetry-loop.md) |
 
+| 3 | `ch03-control-plane` | [Quién puede hablar: el plano de control aprende a recordar](ch03-control-plane.md) |
+
 La paridad entre ediciones se verifica con `tests/book/check-parity.sh`.

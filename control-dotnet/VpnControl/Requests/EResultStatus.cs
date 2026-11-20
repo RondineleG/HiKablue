@@ -12,5 +12,6 @@ public enum EResultStatus
     EntityHasError,
     EntityAlreadyExists,
     NoContent,
-    TooManyRequests
+    TooManyRequests,
+    Unavailable
 }
