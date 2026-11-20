@@ -28,7 +28,13 @@ below() { # below NAME PCT — records a TEST-02 threshold violation
   fi
 }
 
+# COVERAGE_COMPONENTS (space list, default all) selects stages — the
+# self-test uses it to isolate one failure per scenario.
+COMPONENTS=" ${COVERAGE_COMPONENTS:-rust go csharp} "
+run_for() { case "$COMPONENTS" in *" $1 "*) return 0;; *) return 1;; esac }
+
 echo "== rust (engine-rust) =="
+if run_for rust; then
 RUST_DIR="$ROOT/engine-rust"
 PROFRAW_DIR="$RUST_DIR/target/profraw"
 rm -rf "$PROFRAW_DIR" "$RUST_DIR/target/coverage.profdata"
@@ -70,8 +76,10 @@ else
     below rust "$rust_pct"
   fi
 fi
+fi
 
 echo "== go (agent-go) =="
+if run_for go; then
 GO_BIN="${GO_BIN:-go}"
 if ! (cd "$ROOT/agent-go" && "$GO_BIN" test -coverpkg=./... \
       -coverprofile=coverage.out ./... >/dev/null 2>&1); then
@@ -88,8 +96,10 @@ else
     below go "$go_pct"
   fi
 fi
+fi
 
 echo "== c# (control-dotnet) =="
+if run_for csharp; then
 CD_DIR="$ROOT/control-dotnet"
 DOTNET_BIN="${DOTNET_BIN:-$(command -v dotnet || echo "$HOME/.dotnet/dotnet")}"
 COV_DIR="$CD_DIR/VpnControl.Tests/TestResults/coverage"
@@ -115,6 +125,7 @@ else
     line csharp "lines: ${cs_line}% branches: ${cs_branch}%"
     below csharp "$cs_line"
   fi
+fi
 fi
 
 [ "$fail" -eq 0 ] && echo "coverage: measured (all >= ${COVERAGE_MIN}%)" || { echo "coverage: FAIL"; exit 1; }
