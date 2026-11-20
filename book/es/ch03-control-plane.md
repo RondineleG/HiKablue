@@ -174,7 +174,9 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   reclamado se salta en memoria antes del INSERT — seguro barato antes
   de que el árbitro real (el PK) decida.
 - Si el insert aún así pierde la carrera (`23505`), la transacción hace
-  rollback y el bucle de reintentos arranca con un nuevo shuffle.
+  rollback y el bucle de reintentos relee qué direcciones quedaron tomadas —
+  el claim del ganador se salta en la próxima pasada por el mismo orden
+  disperso.
 
 | Archivo | Qué hace |
 |---|---|

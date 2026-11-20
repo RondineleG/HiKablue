@@ -173,7 +173,9 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   reivindicado é pulado em memória antes do INSERT — seguro barato antes
   de o árbitro real (o PK) decidir.
 - Se o insert ainda assim perde a corrida (`23505`), a transação faz
-  rollback e o loop de tentativas recomeça com um novo shuffle.
+  rollback e o loop de tentativas relê quais endereços ficaram tomados —
+  a reserva do vencedor é pulada na próxima passada pela mesma ordem
+  dispersa.
 
 | Arquivo | O que faz |
 |---|---|

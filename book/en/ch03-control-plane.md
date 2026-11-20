@@ -166,7 +166,8 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   is skipped in memory before the INSERT — cheap insurance before the
   real arbiter (the PK) decides.
 - If the insert still loses a race (`23505`), the transaction rolls back
-  and the retry loop starts over with a fresh shuffle.
+  and the retry loop re-reads which addresses are now taken — the winner's
+  claim is skipped on the next pass through the same dispersed order.
 
 | File | What it does |
 |---|---|
