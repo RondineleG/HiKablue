@@ -47,7 +47,7 @@ Keep this table current: every milestone change set updates the status and links
 | # | Milestone | Status |
 |---|---|---|
 | 0 | Foundation — monorepo + toolchains | **Delivered** — Rust, Go, and C# all run real components; versions pinned (`rust-toolchain.toml`, `global.json`, `go.mod` + `.go-version`) |
-| 1 | **Telemetry** — metrics socket, Go fetcher, C# heartbeat registry | **Delivered** — [PR #6](https://github.com/RondineleG/HiKablue/pull/6) |
+| 1 | **Telemetry** — metrics socket, Go fetcher, C# heartbeat registry | **Delivered** — [PR #6](https://github.com/RondineleG/HiKablue/pull/6); hardened in [PR #8](https://github.com/RondineleG/HiKablue/pull/8) (registry snapshots, heartbeat token auth, payload limits, node expiry, coverage-gate self-tests) |
 | 2 | Raw TUN ↔ UDP tunnel | **Delivered** in [PR #4](https://github.com/RondineleG/HiKablue/pull/4) — ping verified both ways on Debian 12/13 (delivered out of order, ahead of milestone 1) |
 | 3 | Control plane — PostgreSQL, IPAM, session states, outbox; gRPC `NodeChannel` over mTLS replaces the HTTP heartbeat | Pending |
 | 4 | End-to-end session — encrypted Rust backend, CLI, peer operations, local expiration, reconciliation | Pending |
