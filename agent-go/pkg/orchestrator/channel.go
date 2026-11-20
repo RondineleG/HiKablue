@@ -42,6 +42,9 @@ type Channel struct {
 
 	streamEpoch     atomic.Value // string
 	appliedRevision uint64
+	// Command ids already applied on this channel, so a replayed command
+	// gets its original APPLIED ack instead of REVISION_REGRESSION.
+	appliedCommands sync.Map
 	// grpc-go forbids concurrent Send calls on one stream; the heartbeat
 	// goroutine and the command loop share this mutex.
 	sendMu sync.Mutex
@@ -75,10 +78,11 @@ func (c *Channel) Run(ctx context.Context, conn *grpc.ClientConn) error {
 	if err := stream.Send(register); err != nil {
 		return fmt.Errorf("orchestrator: send NodeRegister: %w", err)
 	}
-	// The stream epoch is the Unix-millis timestamp assigned to this stream;
-	// the first command tells us the server's authoritative value, until
-	// then fence on our own start time.
-	c.streamEpoch.Store(strconv.FormatInt(time.Now().UnixMilli(), 10))
+	// The stream epoch is assigned by the server (unix-millis at stream
+	// creation); fencing on a locally computed timestamp would reject the
+	// first command whenever the agent clock runs ahead. Adopt the value
+	// stamped on the first command instead (epochGreater below).
+	c.streamEpoch.Store("")
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- c.heartbeatLoop(ctx, stream) }()
@@ -99,6 +103,7 @@ func (c *Channel) Run(ctx context.Context, conn *grpc.ClientConn) error {
 				ack.Error = err.Error()
 			} else {
 				atomic.StoreUint64(&c.appliedRevision, cmd.Revision)
+				c.appliedCommands.Store(cmd.CommandId, struct{}{})
 				ack.AppliedRevision = cmd.Revision
 			}
 		}
@@ -139,6 +144,11 @@ func (c *Channel) evaluate(cmd *edgev1.ControlCommand, now time.Time) (
 	// Adopt the server's epoch on first valid command of this stream.
 	if epochGreater(cmd.StreamEpoch, c.currentEpoch()) {
 		c.streamEpoch.Store(cmd.StreamEpoch)
+	}
+	// A command this channel already applied is a replay (its ack was
+	// lost) — confirm it again without touching local state.
+	if _, applied := c.appliedCommands.Load(cmd.CommandId); applied {
+		return ack, false
 	}
 	// A command stamped for another backend instance means this process
 	// has been replaced; it must not apply anything anymore.
