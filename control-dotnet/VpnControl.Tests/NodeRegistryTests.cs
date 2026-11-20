@@ -108,40 +108,55 @@ public class NodeRegistryTests
     [Fact]
     public async Task ConcurrentHeartbeatsAndReadsNeverThrowOrTear()
     {
-        var registry = new NodeRegistry();
+        // Invariant under test: inside one snapshot, EngineHealthy must match
+        // the beat encoded in LastSeen (beat is even => healthy). The clock
+        // reads a ThreadLocal so each writer stamps its own beat into the
+        // timestamp it produces; setting it right before Record keeps the
+        // call synchronous on the same thread. If List()/Record() ever hand
+        // out the live Node, a reader can observe LastSeen from beat N next
+        // to EngineHealthy from beat N-1 — every beat flips parity, so any
+        // torn read in that window is caught.
+        var beatStamp = new ThreadLocal<long>();
+        var registry = new NodeRegistry(
+            () => DateTimeOffset.FromUnixTimeSeconds(beatStamp!.Value));
         var ids = Enumerable.Range(0, 16).Select(i => $"node-{i}").ToArray();
         var exceptions = new List<Exception>();
 
         var writer = Parallel.ForEachAsync(ids, async (id, ct) =>
         {
-            for (var beat = 0; beat < 100; beat++)
+            for (var beat = 0; beat < 1000; beat++)
             {
+                beatStamp!.Value = beat;
                 registry.Record(new Heartbeat(id, beat % 2 == 0,
                     new Dictionary<string, long> { ["rx_bytes"] = beat }));
                 await Task.Yield();
             }
         });
 
-        var reader = Task.Run(() =>
+        // Keep reading while the writers are beating: a live (unsnapshotted)
+        // node lets a heartbeat land between the two field reads, and every
+        // beat flips parity so the mismatch is caught.
+        var readers = Enumerable.Range(0, 4).Select(_ => Task.Run(() =>
         {
             try
             {
-                for (var i = 0; i < 200; i++)
+                while (!writer.IsCompleted)
                 {
-                    var nodes = registry.List();
-                    foreach (var n in nodes)
+                    foreach (var n in registry.List())
                     {
-                        var view = n.ToView();
-                        Assert.NotNull(view.NodeId);
-                        if (view.Metrics is not null)
-                            _ = view.Metrics["rx_bytes"]; // never torn mid-copy
+                        var seen = n.LastSeen;
+                        Thread.SpinWait(500);
+                        var healthy = n.EngineHealthy;
+                        Assert.Equal(seen.ToUnixTimeSeconds() % 2 == 0, healthy);
+                        if (n.Metrics is not null)
+                            Assert.True(n.Metrics.TryGetValue("rx_bytes", out long _));
                     }
                 }
             }
             catch (Exception ex) { lock (exceptions) { exceptions.Add(ex); } }
-        });
+        })).ToArray();
 
-        await Task.WhenAll(writer, reader);
+        await Task.WhenAll(new[] { writer }.Concat(readers));
         Assert.Empty(exceptions);
         Assert.Equal(ids.Length, registry.List().Count);
     }
