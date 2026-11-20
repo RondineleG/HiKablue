@@ -126,6 +126,14 @@ public sealed class NodeChannelService(
             """, ct);
 
         nodeRegistry.Record(new Models.Heartbeat(nodeId, true));
+
+        // Commands marked sent on a previous stream may have been lost
+        // with it (at-least-once): requeue them so the dispatcher
+        // re-delivers on this stream with fresh fencing fields.
+        await db.Database.ExecuteSqlAsync(
+            $"UPDATE outbox SET status = 'pending', next_retry_at = {now} WHERE node_id = {nodeId} AND status = 'sent'",
+            ct);
+
         await EnqueueSyncStateAsync(nodeId, ct);
     }
 
