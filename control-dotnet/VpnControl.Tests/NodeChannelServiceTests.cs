@@ -359,4 +359,35 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
             peers.Peers.Select(x => x.LabSessionId).OrderBy(x => x).ToArray());
         Assert.Equal("key-1", peers.Peers[0].KeyRef);
     }
+
+    [Fact]
+    public async Task RegisterRequeuesSentCommandsForRedelivery()
+    {
+        var row = await SeedCommandAsync("edge-1", "ProvisionPeer", """{"peer":{}}""");
+        await _service.OnRegisterAsync("edge-1",
+            new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b2" },
+            CancellationToken.None);
+        await using var db = NewDb();
+        Assert.Equal("pending",
+            (await db.Outbox.SingleAsync(o => o.CommandId == row.CommandId)).Status);
+        Assert.True(await db.Outbox.AnyAsync(o => o.CommandType == "SyncState"));
+    }
+
+    [Fact]
+    public async Task RevisionRegressionFailsCommandAndEnqueuesResync()
+    {
+        await _service.OnRegisterAsync("edge-1",
+            new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b1" },
+            CancellationToken.None);
+        var row = await SeedCommandAsync("edge-1", "ProvisionPeer", """{"peer":{}}""");
+        await _service.OnCommandAckAsync("edge-1", Stream(),
+            Ack(row, AckOutcome.Rejected, AckErrorCode.AckErrorRevisionRegression),
+            CancellationToken.None);
+        await using var db = NewDb();
+        Assert.Equal("failed",
+            (await db.Outbox.SingleAsync(o => o.CommandId == row.CommandId)).Status);
+        // One SyncState from the register, one from the regression resync.
+        Assert.Equal(2,
+            await db.Outbox.CountAsync(o => o.CommandType == "SyncState"));
+    }
 }

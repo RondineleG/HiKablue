@@ -379,6 +379,34 @@ func TestNewerEpochIsAdopted(t *testing.T) {
 	}
 }
 
+func TestReplayedAppliedCommandIsConfirmedWithoutRedispatch(t *testing.T) {
+	h := &stubHandler{}
+	c := newTestChannel(h)
+	c.streamEpoch.Store("1000")
+
+	cmd := command("1000", "backend-1", 3, time.Now().Add(time.Minute))
+	if _, dispatch := c.evaluate(cmd, time.Now()); !dispatch {
+		t.Fatal("first delivery must dispatch")
+	}
+	if err := c.dispatch(context.Background(), cmd); err != nil {
+		t.Fatal(err)
+	}
+	// Run records the applied command only after a successful dispatch.
+	c.appliedCommands.Store(cmd.CommandId, struct{}{})
+	c.appliedRevision = cmd.Revision
+
+	ack, dispatch := c.evaluate(cmd, time.Now())
+	if dispatch {
+		t.Fatal("replayed command must not be dispatched again")
+	}
+	if ack.Outcome != edgev1.AckOutcome_ACK_OUTCOME_APPLIED {
+		t.Fatalf("replayed command must be confirmed APPLIED, got %v", ack.Outcome)
+	}
+	if h.provisioned != 1 {
+		t.Fatalf("handler ran %d times, want 1", h.provisioned)
+	}
+}
+
 func TestCommandWithoutDeadlineOrRevisionDispatches(t *testing.T) {
 	h := &stubHandler{}
 	c := newTestChannel(h)
