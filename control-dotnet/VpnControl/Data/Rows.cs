@@ -26,6 +26,9 @@ public sealed class SessionRow
     // same key + same payload replays, same key + different payload → 409.
     public string? RequestHash { get; set; }
     public required string OwnerSubject { get; set; }
+    // Client key material reference, opaque to the control plane but
+    // persisted so the ProvisionPeer command can carry it to the backend.
+    public string? PeerPublicKey { get; set; }
     public SessionStatus Status { get; set; }
     public IPAddress? VirtualIp { get; set; }
     public required string NodeId { get; set; }

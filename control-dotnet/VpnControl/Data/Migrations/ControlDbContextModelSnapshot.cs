@@ -164,6 +164,9 @@ namespace VpnControl.Data.Migrations
                         .HasColumnType("text")
                         .HasColumnName("owner_subject");
 
+                    b.Property<string>("PeerPublicKey")
+                        .HasColumnName("peer_public_key");
+
                     b.Property<string>("RequestHash")
                         .HasColumnType("text")
                         .HasColumnName("request_hash");

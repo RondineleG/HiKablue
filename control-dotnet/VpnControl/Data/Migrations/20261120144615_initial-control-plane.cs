@@ -54,6 +54,7 @@ namespace VpnControl.Data.Migrations
                     idempotency_key = table.Column<string>(type: "text", nullable: true),
                     request_hash = table.Column<string>(type: "text", nullable: true),
                     owner_subject = table.Column<string>(type: "text", nullable: false),
+                    peer_public_key = table.Column<string>(type: "text", nullable: true),
                     status = table.Column<string>(type: "text", nullable: false),
                     virtual_ip = table.Column<IPAddress>(type: "inet", nullable: true),
                     node_id = table.Column<string>(type: "text", nullable: false),

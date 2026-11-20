@@ -175,6 +175,63 @@ public sealed class SessionServiceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task NonAlignedCidrMasksToNetworkAndNeverLeaksOutside()
+    {
+        BeatNode();
+        // 10.99.0.2/30 masks to network 10.99.0.0 — usable are .1 and .2
+        // only; .3 (broadcast) and .4 must never be leased.
+        var service = NewService(poolCidr: "10.99.0.2/30");
+        var r1 = await service.CreateSessionAsync(new CreateSessionRequest(), "alice", null);
+        var r2 = await service.CreateSessionAsync(new CreateSessionRequest(), "alice", null);
+        var ips = new[] { r1.Data!.VirtualIp, r2.Data!.VirtualIp };
+        Assert.All(ips, ip => Assert.Matches("^10\\.99\\.0\\.[12]$", ip!));
+        var r3 = await service.CreateSessionAsync(new CreateSessionRequest(), "alice", null);
+        Assert.Equal(EResultStatus.Unavailable, r3.Status);
+    }
+
+    [Fact]
+    public async Task TakenAddressIsSkippedAndNextCandidateReserved()
+    {
+        BeatNode();
+        // /30 = two usable (.1, .2). Whatever the seed leased must be seen
+        // as taken and skipped — the second session gets the other one.
+        var small = NewService(poolCidr: "10.99.0.0/30");
+        var seed = await small.CreateSessionAsync(new CreateSessionRequest(), "alice", null);
+        var second = await NewService(poolCidr: "10.99.0.0/30")
+            .CreateSessionAsync(new CreateSessionRequest(), "bob", null);
+        Assert.True(second.IsSuccess);
+        Assert.Matches("^10\\.99\\.0\\.[12]$", seed.Data!.VirtualIp!);
+        Assert.Matches("^10\\.99\\.0\\.[12]$", second.Data!.VirtualIp!);
+        Assert.NotEqual(seed.Data!.VirtualIp, second.Data!.VirtualIp);
+    }
+
+    [Fact]
+    public async Task ConcurrentSameIdempotencyKeyReplaysTheOriginal()
+    {
+        BeatNode();
+        var results = await Task.WhenAll(
+            NewService().CreateSessionAsync(new CreateSessionRequest(), "alice", "dup-key"),
+            NewService().CreateSessionAsync(new CreateSessionRequest(), "alice", "dup-key"));
+        Assert.All(results, r => Assert.True(r.IsSuccess));
+        Assert.Equal(results[0].Data!.SessionId, results[1].Data!.SessionId);
+        await using var db = NewDb();
+        Assert.Equal(1, await db.Sessions.CountAsync());
+    }
+
+    [Fact]
+    public async Task PeerPublicKeyIsPersistedAndCarriedInProvisionPayload()
+    {
+        BeatNode();
+        var created = await _service.CreateSessionAsync(
+            new CreateSessionRequest(PeerPublicKey: "wg-pub-abc"), "alice", null);
+        await using var db = NewDb();
+        Assert.Equal("wg-pub-abc",
+            await db.Sessions.Select(s => s.PeerPublicKey).SingleAsync());
+        var payload = await db.Outbox.Select(o => o.Payload).SingleAsync();
+        Assert.Contains("wg-pub-abc", payload);
+    }
+
+    [Fact]
     public async Task LabSessionIdsAreUniquePerNodeAndSequential()
     {
         BeatNode("node-a");
