@@ -1,3 +1,5 @@
+using Microsoft.EntityFrameworkCore;
+using VpnControl.Data;
 using VpnControl.Extensions;
 using VpnControl.Security;
 
@@ -18,7 +20,22 @@ builder.WebHost.UseUrls(LoopbackGuard.ListenUrls(builder.Configuration));
 
 builder.Services.AddOpenApi();
 builder.Services.AddVpnControl();
+
+// Milestone 3 store. The connection string is read lazily from the fully
+// composed configuration (test hosts inject it via ConfigureAppConfiguration,
+// which only runs at Build) — and the M1 heartbeat slice still starts when
+// none is configured: the context fails on first use instead of at boot.
+builder.Services.AddDbContext<ControlDbContext>((provider, options) =>
+    options.UseNpgsql(provider.GetRequiredService<IConfiguration>()["VpnControl:ConnectionString"]
+        ?? "Host=invalid.invalid;Database=vpn_control"));
+
 var app = builder.Build();
+
+if (!string.IsNullOrEmpty(app.Configuration["VpnControl:ConnectionString"]))
+{
+    await using var scope = app.Services.CreateAsyncScope();
+    await scope.ServiceProvider.GetRequiredService<ControlDbContext>().Database.MigrateAsync();
+}
 
 // Token check stays fail-closed — the process never reaches Run() without
 // it — but reads app.Configuration after Build so test hosts can inject

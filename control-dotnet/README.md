@@ -1,8 +1,7 @@
 # control-dotnet — vpn-control
 
-`vpn-control` (C#/.NET) will own authentication, IPAM, session lifecycle and
-auditing backed by PostgreSQL. Milestone 1 delivers only the telemetry
-intake, deliberately in-memory:
+`vpn-control` (C#/.NET) owns authentication, IPAM, session lifecycle and
+auditing backed by PostgreSQL. Today it delivers:
 
 - `POST /internal/heartbeats` — records a node-agent heartbeat
   (`{nodeId, engineHealthy, metrics?}`). Temporary HTTP transport: replaced
@@ -10,8 +9,31 @@ intake, deliberately in-memory:
 - `GET /v1/nodes` — lists nodes with `lastSeen` and `engineHealthy` tracked
   separately: a quiet node is stale, a beating node with a dead engine is
   degraded — different failures, different fields.
-- `VpnControl.Tests` — xunit tests for the registry, including the
-  missing-heartbeat-vs-engine-failure exercise.
+- `POST /v1/sessions` — allocates a session: picks an eligible (healthy,
+  beating) node, reserves a virtual IP and writes the `ProvisionPeer`
+  outbox command **in one transaction** (ADR-0001). Answers 202 with the
+  session view and its `statusUrl`. Honors `Idempotency-Key`: same key +
+  same payload replays the original session, same key + a different
+  payload answers 409.
+- `GET /v1/sessions/{id}` — session view for the owner or an admin.
+- `DELETE /v1/sessions/{id}` — moves the session to `revoking` and writes
+  the `RevokePeer` outbox command; the IP lease is released only after the
+  backend confirms removal.
+- `GET /health/live`, `GET /health/ready` — liveness, and readiness that
+  additionally proves PostgreSQL answers (`SELECT 1`).
+
+Caller identity is lab-grade: `X-Subject` names the owner (required on
+POST; GET/DELETE need it unless `X-Admin-Token` matches
+`VpnControl:AdminToken`). Session responses carry
+`Cache-Control: no-store`. Persistence lives in `Data/` (EF Core +
+Npgsql, schema in `initial-control-plane` migration per ADR-0001); the
+pool comes from `VpnControl:IpPoolCidr` (default `10.42.0.0/22`). With no
+`VpnControl:ConnectionString` configured the process still boots — the
+heartbeat slice stays usable and only DB-backed routes fail.
+- `VpnControl.Tests` — xunit tests: registry, HTTP contracts, and the
+  session service on real PostgreSQL via Testcontainers (last-IP
+  contention, idempotency replay/conflict, revoke lifecycle, owner/admin
+  reads).
 
 **Security:** the heartbeat endpoint is **lab-only** and answers only to a
 **shared secret**: every request must carry `X-Heartbeat-Token`, configured
@@ -41,8 +63,12 @@ VpnControl/
   Endpoints/Base/                   BaseEndPoint<TEntity> (UseCase → HTTP mapping)
   Endpoints/Internal/               lab-only intake (heartbeat)
   Endpoints/V1/Nodes/               public node list
-  UseCases/Nodes/                   IUseCase<TRequest, TResponse> implementations
-  Services/                         NodeService over NodeRegistry (in-memory)
+  Endpoints/V1/Sessions/            session create/read/revoke
+  Endpoints/HealthEndpoint.cs       /health/live + /health/ready
+  Data/                             ControlDbContext + rows + migrations (ADR-0001)
+  UseCases/{Nodes,Sessions}/        IUseCase<TRequest, TResponse> implementations
+  Services/                         NodeService over NodeRegistry (in-memory),
+                                    SessionService (IPAM + lifecycle on PostgreSQL)
   Entities/                         Node (+ Base/BaseEntity)
   Interfaces/                       IEndpointAsync, IUseCase, INodeService
   Requests/                         RequestResult / EResultStatus (OnForkHub result pattern)
@@ -66,6 +92,10 @@ Proteções ativas no Marco 1 (laboratório isolado):
 - Nós que param de enviar heartbeat expiram do registro após 10 minutos
   sem `LastSeen` novo.
 - O documento OpenAPI é servido em `/openapi/v1.json` (loopback apenas).
+- A identidade de chamada em `/v1/sessions` é por cabeçalho `X-Subject` —
+  mero rótulo de laboratório, sem verificação; autenticação real chega com
+  o marco de usuários. `X-Admin-Token` (`VpnControl:AdminToken`) permite
+  leitura/revogação administrativa.
 
 Limitação que permanece, deferida ao marco de control plane:
 

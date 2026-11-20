@@ -89,6 +89,7 @@ public abstract class BaseEndPoint<TEntity>
             EResultStatus.HasValidation => Results.UnprocessableEntity(response),
             EResultStatus.EntityAlreadyExists => Results.Conflict(response),
             EResultStatus.TooManyRequests => Results.Json(response, statusCode: StatusCodes.Status429TooManyRequests),
+            EResultStatus.Unavailable => Results.Json(response, statusCode: StatusCodes.Status503ServiceUnavailable),
             EResultStatus.HasError or EResultStatus.EntityHasError => Results.BadRequest(response),
             _ => Results.BadRequest(response)
         };
@@ -114,6 +115,7 @@ public abstract class BaseEndPoint<TEntity>
             EResultStatus.HasValidation => StatusCodes.Status422UnprocessableEntity,
             EResultStatus.EntityAlreadyExists => StatusCodes.Status409Conflict,
             EResultStatus.TooManyRequests => StatusCodes.Status429TooManyRequests,
+            EResultStatus.Unavailable => StatusCodes.Status503ServiceUnavailable,
             EResultStatus.HasError or EResultStatus.EntityHasError => StatusCodes.Status400BadRequest,
             _ => StatusCodes.Status400BadRequest
         };

@@ -1,0 +1,58 @@
+using System.Net;
+
+namespace VpnControl.Data;
+
+/// Persistence rows for the milestone-3 control plane (ADR-0001). These
+/// mirror the PostgreSQL schema 1:1 and stay separate from the domain
+/// entities in Entities/ used by the in-memory registry.
+
+public sealed class NodeRow
+{
+    public required string NodeId { get; set; }
+    public required string BackendInstanceId { get; set; }
+    public DateTimeOffset RegisteredAt { get; set; }
+    public DateTimeOffset? LastSeenAt { get; set; }
+    public bool EngineHealthy { get; set; }
+    // Per-node desired-state revision; bumped inside the same transaction
+    // that writes each outbox command.
+    public long DesiredRevision { get; set; }
+}
+
+public sealed class SessionRow
+{
+    public Guid SessionId { get; set; }
+    public string? IdempotencyKey { get; set; }
+    // SHA-256 (hex) of the canonical request payload + caller identity —
+    // same key + same payload replays, same key + different payload → 409.
+    public string? RequestHash { get; set; }
+    public required string OwnerSubject { get; set; }
+    public SessionStatus Status { get; set; }
+    public IPAddress? VirtualIp { get; set; }
+    public required string NodeId { get; set; }
+    public int LabSessionId { get; set; }
+    public long KeyEpoch { get; set; }
+    public DateTimeOffset ExpiresAt { get; set; }
+    public string? FailureReason { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset UpdatedAt { get; set; }
+}
+
+public sealed class IpLeaseRow
+{
+    public required IPAddress Address { get; set; }
+    public Guid? SessionId { get; set; }
+    public required string NodeId { get; set; }
+    public DateTimeOffset ReservedAt { get; set; }
+}
+
+public sealed class OutboxRow
+{
+    public Guid CommandId { get; set; }
+    public required string NodeId { get; set; }
+    public required string CommandType { get; set; }
+    public required string Payload { get; set; } // jsonb
+    public long Revision { get; set; }
+    public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset? DeliveredAt { get; set; }
+    public DateTimeOffset? AckedAt { get; set; }
+}
