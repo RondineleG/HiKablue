@@ -135,9 +135,12 @@ contrato prometía:
   `APPLIED` marca la fila `acked` (y un ack de `RevokePeer` borra el lease
   y revoca la sesión); `FENCED_STREAM`/`FENCED_BACKEND` fallan la fila,
   cierran el stream y encolan un `SyncState` de resincronización;
-  `DEADLINE_EXCEEDED`, `REVISION_REGRESSION` e `INVALID_PAYLOAD` fallan
-  la fila e incrementan el contador de comandos fallidos; cualquier otro
-  caso devuelve el comando a `pending` con `next_retry_at` de 250 ms.
+  `REVISION_REGRESSION` e `INVALID_PAYLOAD` marcan la fila como fallida.
+  En el primer intento, un rechazo por plazo marca la fila como fallida
+  y un error recuperable la devuelve a `pending` con un `next_retry_at`
+  de 250 ms. En un reenvío, esas respuestas pueden ser de un intento
+  anterior: el ACK no indica el número de intento. La fila sigue
+  `sent` hasta un `APPLIED` o la recuperación al vencer el plazo actual.
 - **`OutboxDispatcherWorker`.** Una transacción corta con
   `FOR UPDATE SKIP LOCKED` toma el comando pendiente más antiguo de cada
   nodo si ya toca enviarlo. Con un stream activo fija el epoch, el backend

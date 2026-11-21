@@ -136,9 +136,12 @@ prometia:
   `APPLIED` marca a linha `acked` (e um ack de `RevokePeer` apaga o lease
   e revoga a sessão); `FENCED_STREAM`/`FENCED_BACKEND` falham a linha,
   fecham o stream e enfileiram um `SyncState` de ressincronização;
-  `DEADLINE_EXCEEDED`, `REVISION_REGRESSION` e `INVALID_PAYLOAD` falham a
-  linha e incrementam o contador de comandos falhos; qualquer outro caso
-  devolve o comando para `pending` com `next_retry_at` de 250 ms.
+  `REVISION_REGRESSION` e `INVALID_PAYLOAD` marcam a linha como falha.
+  Na primeira tentativa, uma rejeição por prazo marca a linha como
+  falha e um erro recuperável volta a `pending` com `next_retry_at`
+  de 250 ms. No reenvio, essas respostas podem ser de uma tentativa
+  anterior: o ACK não inclui o número da tentativa. A linha continua
+  `sent` até um `APPLIED` ou a recuperação no prazo atual.
 - **`OutboxDispatcherWorker`.** Uma transação curta com
   `FOR UPDATE SKIP LOCKED` seleciona o comando em aberto mais antigo por
   nó, se já for hora de enviá-lo. Com stream ativo, carimba epoch, backend

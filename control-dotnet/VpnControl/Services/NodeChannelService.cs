@@ -210,6 +210,11 @@ public sealed class NodeChannelService(
                 // agent proved it is not the instance we dispatched to.
                 fence = resync = true;
                 break;
+            case AckOutcome.Rejected or AckOutcome.Error when row.Attempts > 1 &&
+                ack.ErrorCode == AckErrorCode.AckErrorDeadlineExceeded:
+                // The wire ACK does not identify the attempt. A deadline
+                // rejection may refer to an older send on this stream.
+                return;
             case AckOutcome.Rejected:
             case AckOutcome.Error when ack.ErrorCode
                 is AckErrorCode.AckErrorDeadlineExceeded
@@ -227,6 +232,12 @@ public sealed class NodeChannelService(
                 }
                 break;
             default: // ERROR with a retryable cause → back to pending
+                if (row.Attempts > 1)
+                {
+                    // Let the worker retry at the current deadline, rather
+                    // than discarding a newer attempt on a delayed error.
+                    return;
+                }
                 row.Status = "pending";
                 row.NextRetryAt = now.AddMilliseconds(250);
                 break;

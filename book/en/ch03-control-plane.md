@@ -130,10 +130,12 @@ contract promised:
   `APPLIED` marks the outbox row `acked`
   (and a `RevokePeer` ack deletes the lease and revokes the session);
   `FENCED_STREAM`/`FENCED_BACKEND` fail the row, close the stream and
-  enqueue a `SyncState` resync; `DEADLINE_EXCEEDED`,
-  `REVISION_REGRESSION`, `INVALID_PAYLOAD` fail the row and bump the
-  failed-commands counter; anything else returns the command to `pending`
-  with a 250 ms `next_retry_at`.
+  enqueue a `SyncState` resync; `REVISION_REGRESSION` and
+  `INVALID_PAYLOAD` fail the row. On the first attempt, a deadline
+  rejection fails the row and a retryable error returns it to `pending`
+  with a 250 ms `next_retry_at`. On redelivery, those responses may refer
+  to an older attempt: the ACK does not include an attempt number. The
+  row stays `sent` until `APPLIED` or recovery at the current deadline.
 - **`OutboxDispatcherWorker`.** A short `FOR UPDATE SKIP LOCKED`
   transaction picks the oldest outstanding command per node if it is due.
   With a live stream it stamps the epoch, backend and a 30 s deadline,

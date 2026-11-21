@@ -223,6 +223,31 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
         Assert.NotNull(outbox.NextRetryAt);
     }
 
+    [Theory]
+    [InlineData(AckOutcome.Rejected, AckErrorCode.AckErrorDeadlineExceeded)]
+    [InlineData(AckOutcome.Error, AckErrorCode.AckErrorInternal)]
+    public async Task AttemptSpecificAckCannotInvalidateRedeliveryOnTheSameStream(
+        AckOutcome outcome, AckErrorCode code)
+    {
+        var row = await SeedCommandAsync("edge-1", "ProvisionPeer", """{"peer":{}}""");
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        await using var db = NewDb();
+        await db.Outbox.ExecuteUpdateAsync(o => o
+            .SetProperty(r => r.Attempts, 2)
+            .SetProperty(r => r.Deadline, deadline));
+        var stream = Stream();
+
+        await _service.OnCommandAckAsync("edge-1", stream,
+            Ack(row, outcome, code), CancellationToken.None);
+        var during = await db.Outbox.AsNoTracking().SingleAsync();
+        Assert.Equal("sent", during.Status);
+        Assert.Null(during.NextRetryAt);
+
+        await _service.OnCommandAckAsync("edge-1", stream,
+            Ack(row, AckOutcome.Applied), CancellationToken.None);
+        Assert.Equal("acked", (await db.Outbox.AsNoTracking().SingleAsync()).Status);
+    }
+
     [Fact]
     public async Task RegisterBeyondCapacityThrowsResourceExhausted()
     {
