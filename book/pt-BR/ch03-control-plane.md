@@ -131,17 +131,30 @@ prometia:
   Heartbeats renovam `nodes.last_seen_at` e o registry em memória. Um
   `CommandAck` é correlacionado por `command_id` *e* verificado: um ack
   com outro `stream_epoch` ou `backend_instance_id` é ignorado.
+  O ACK também precisa corresponder a uma tentativa `sent` registrada;
+  o PostgreSQL bloqueia a linha enquanto aplica o resultado.
   `APPLIED` marca a linha `acked` (e um ack de `RevokePeer` apaga o lease
   e revoga a sessão); `FENCED_STREAM`/`FENCED_BACKEND` falham a linha,
   fecham o stream e enfileiram um `SyncState` de ressincronização;
   `DEADLINE_EXCEEDED`, `REVISION_REGRESSION` e `INVALID_PAYLOAD` falham a
   linha e incrementam o contador de comandos falhos; qualquer outro caso
   devolve o comando para `pending` com `next_retry_at` de 250 ms.
-- **`OutboxDispatcherWorker`.** A cada 100–250 ms ele puxa linhas
-  pendentes com `FOR UPDATE SKIP LOCKED`, cruza `node_id` com o stream
-  vivo, carimba epoch, backend e deadline de 30 s, envia o comando e
-  marca a linha `sent` com `attempts + 1`. Sem stream? A linha espera em
-  `next_retry_at`.
+- **`OutboxDispatcherWorker`.** Uma transação curta com
+  `FOR UPDATE SKIP LOCKED` seleciona o comando em aberto mais antigo por
+  nó, se já for hora de enviá-lo. Com stream ativo, carimba epoch, backend
+  e prazo de 30 s e grava `sent` com `attempts + 1` **antes** da escrita
+  gRPC. Escritas para nós diferentes são independentes. Falha na escrita
+  não prova que não houve entrega: uma tentativa sem ACK é refeita após
+  o prazo, com o mesmo ID, mesmo sem reconexão. Sem stream ativo, fica
+  em `pending` até `next_retry_at`. Após três tentativas sem confirmação,
+  o worker marca o comando `failed` sem liberar leases. A migration
+  `outbox-delivery-indexes` adiciona índices parciais para tentativas
+  vencidas e ordenação por nó.
+
+  **Exercício:** Execute `dotnet test control-dotnet/VpnControl.Tests --filter FullyQualifiedName~DispatcherDoesNotHoldLocksDuringWritesOrRollBackOtherNodes`
+  com o Docker ativo. Localize os dois escritores de teste: o stream
+  saudável deve conseguir confirmar o comando enquanto a outra escrita
+  permanece bloqueada.
 - **`LeaseReaperWorker`.** A cada 60 s: sessões com `expires_at` vencido
   cujo nó ficou mudo além da janela de quarentena (padrão 300 s) viram
   `quarantined`, seu lease é apagado e o log de auditoria registra
@@ -153,10 +166,19 @@ prometia:
   envia `NodeRegister` primeiro, bate heartbeat a cada 10 s numa
   goroutine (um `sendMu` serializa os `Send` concorrentes, que o grpc-go
   proíbe), e o `evaluate` verifica antes de despachar: `stream_epoch`
-  mais antigo → `FENCED_STREAM`, `backend_instance_id` alheio →
-  `FENCED_BACKEND`, `deadline` vencido → `DEADLINE_EXCEEDED`,
-  `revision` ≤ aplicada → `REVISION_REGRESSION`. Só então o payload
-  chega ao handler local.
+  inválido ou mais antigo → `FENCED_STREAM`, `backend_instance_id`
+  alheio → `FENCED_BACKEND`, `deadline` ausente ou inválido →
+  `INVALID_PAYLOAD`, prazo vencido → `DEADLINE_EXCEEDED`, e comando
+  novo com `revision` diferente de zero e ≤ aplicada →
+  `REVISION_REGRESSION`. Comandos novos exigem relógios sincronizados:
+  o prazo é absoluto, sem tolerância nem reinício ao recebê-lo. Um comando
+  já aplicado pode receber outro ACK `APPLIED` sem chamar o handler.
+
+  Reuse o `Channel` ou passe o mesmo `ReplayState` ao trocar o canal do
+  mesmo nó e backend. Isso mantém em memória a última revisão aplicada e
+  os IDs dos comandos. Um novo ID de backend começa do zero, e o registro
+  solicita reconciliação via `SyncState`. O estado não é salvo em disco;
+  o handler continua precisando ser idempotente.
 
 Verificado localmente: 16 novos testes C# (matriz de aceitação e rejeição
 SPIFFE, fencing, liberação do lease em ack de revogação) e 14 testes Go —
@@ -331,6 +353,11 @@ retorna o resultado dela. `TestRunCancelsStreamAfterReceiveFailure`,
 streams programados, sem endpoint ativo.
 `TestHeartbeatLoopLeavesReceiveAliveAfterEOF` também verifica que o
 contexto permanece ativo depois que o heartbeat termina.
+`TestHeartbeatEOFLeavesFinalStatusReadableOnGRPCTransport` usa gRPC real
+em uma conexão em memória: o servidor recebe um heartbeat enquanto está
+aberto e encerra com `PermissionDenied`. Após o EOF no envio seguinte,
+`Recv` ainda lê o status. O teste não reproduziu travamento na recepção;
+o keepalive do transporte continua como contingência.
 
 Duas reconexões podem ocorrer no mesmo milissegundo; o relógio pode recuar.
 `NodeStreamRegistry.Attach` calcula o seguinte dentro do mesmo bloqueio

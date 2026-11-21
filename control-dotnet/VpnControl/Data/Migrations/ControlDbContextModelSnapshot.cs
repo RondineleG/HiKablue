@@ -145,8 +145,14 @@ namespace VpnControl.Data.Migrations
 
                     b.HasKey("CommandId");
 
+                    b.HasIndex("Deadline")
+                        .HasFilter("status = 'sent'");
+
                     b.HasIndex("Status", "NextRetryAt")
                         .HasFilter("status = 'pending'");
+
+                    b.HasIndex("NodeId", "CreatedAt", "CommandId")
+                        .HasFilter("status IN ('pending', 'sent')");
 
                     b.ToTable("outbox", (string)null);
                 });

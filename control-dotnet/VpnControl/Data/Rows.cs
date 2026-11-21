@@ -58,7 +58,7 @@ public sealed class OutboxRow
     // Fencing fields stamped when the command is dispatched to a stream.
     public string? StreamEpoch { get; set; }
     public string? BackendInstanceId { get; set; }
-    // pending → sent → acked | failed (M3 dispatcher state machine).
+    // sent records a reserved attempt, not proof of delivery or application.
     public string Status { get; set; } = "pending";
     public int Attempts { get; set; }
     public DateTimeOffset? NextRetryAt { get; set; }
