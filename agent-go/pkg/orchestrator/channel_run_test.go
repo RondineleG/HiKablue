@@ -215,13 +215,29 @@ func TestHeartbeatLoopExitsOnSendError(t *testing.T) {
 	conn := bufconnNoService(t)
 	c := NewChannel(Config{BackendInstanceId: "b", HeartbeatInterval: time.Millisecond},
 		&stubHandler{healthy: true})
-	stream, err := edgev1.NewEdgeOrchestratorClient(conn).NodeChannel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := edgev1.NewEdgeOrchestratorClient(conn).NodeChannel(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// With no orchestrator registered the send fails fast.
-	if err := c.heartbeatLoop(context.Background(), stream); err == nil {
+	if err := c.heartbeatLoop(ctx, cancel, stream); err == nil {
 		t.Fatal("expected heartbeat send error")
+	}
+}
+
+func TestHeartbeatLoopLeavesReceiveAliveAfterEOF(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream := &lifecycleStream{heartbeatErr: io.EOF}
+	c := NewChannel(Config{HeartbeatInterval: time.Millisecond}, &stubHandler{})
+
+	if err := c.heartbeatLoop(ctx, cancel, stream); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected heartbeat EOF, got %v", err)
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("heartbeat EOF cancelled the receive context: %v", err)
 	}
 }
 

@@ -13,8 +13,6 @@ import (
 	edgev1 "github.com/RondineleG/HiKablue/agent-go/gen/edge/v1"
 	"github.com/golang/protobuf/ptypes"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // defaultHeartbeatInterval is how often NodeHeartbeat is sent on the
@@ -93,12 +91,7 @@ func (c *Channel) run(ctx context.Context, client edgev1.EdgeOrchestratorClient)
 	var heartbeatErr error
 	go func() {
 		defer close(heartbeatDone)
-		heartbeatErr = c.heartbeatLoop(ctx, stream)
-		// gRPC Send can return EOF before Recv delivers the final status.
-		// Leave the receive alive in that case.
-		if !errors.Is(heartbeatErr, io.EOF) {
-			cancel()
-		}
+		heartbeatErr = c.heartbeatLoop(ctx, cancel, stream)
 	}()
 	defer func() {
 		cancel()
@@ -227,7 +220,7 @@ func (c *Channel) currentEpoch() string {
 	return ""
 }
 
-func (c *Channel) heartbeatLoop(ctx context.Context,
+func (c *Channel) heartbeatLoop(ctx context.Context, cancel context.CancelFunc,
 	stream edgev1.EdgeOrchestrator_NodeChannelClient) error {
 	interval := c.cfg.HeartbeatInterval
 	if interval <= 0 {
@@ -251,8 +244,10 @@ func (c *Channel) heartbeatLoop(ctx context.Context,
 			err := stream.Send(msg)
 			c.sendMu.Unlock()
 			if err != nil {
-				if s, ok := status.FromError(err); ok && s.Code() == codes.Unavailable {
-					return fmt.Errorf("orchestrator: heartbeat send: %w", err)
+				// gRPC Send may return EOF before Recv delivers the final status.
+				// Leave the receive alive in that case.
+				if !errors.Is(err, io.EOF) {
+					cancel()
 				}
 				return fmt.Errorf("orchestrator: heartbeat send: %w", err)
 			}

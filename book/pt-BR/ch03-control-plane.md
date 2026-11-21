@@ -329,6 +329,8 @@ retorna o resultado dela. `TestRunCancelsStreamAfterReceiveFailure`,
 `TestRunHeartbeatFailureUnblocksReceive` e
 `TestRunPreservesServerStatusAfterHeartbeatEOF` testam esses casos com
 streams programados, sem endpoint ativo.
+`TestHeartbeatLoopLeavesReceiveAliveAfterEOF` também verifica que o
+contexto permanece ativo depois que o heartbeat termina.
 
 Duas reconexões podem ocorrer no mesmo milissegundo; o relógio pode recuar.
 `NodeStreamRegistry.Attach` calcula o seguinte dentro do mesmo bloqueio

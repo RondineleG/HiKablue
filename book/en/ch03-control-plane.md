@@ -306,6 +306,8 @@ status. `Run` leaves the receive active and reports its result instead.
 `TestRunHeartbeatFailureUnblocksReceive`, and
 `TestRunPreservesServerStatusAfterHeartbeatEOF` exercise these cases with
 scripted streams, without a live endpoint.
+`TestHeartbeatLoopLeavesReceiveAliveAfterEOF` also checks that the context
+is still active after the heartbeat returns.
 
 Two reconnects can occur in one millisecond; a clock can move backward.
 `NodeStreamRegistry.Attach` now computes this inside the same lock that
