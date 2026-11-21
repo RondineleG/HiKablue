@@ -20,6 +20,7 @@ use std::time::Duration;
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::signal::unix::{signal, SignalKind};
+use zeroize::Zeroizing;
 
 use crate::cli::Ipv4Cidr;
 use crate::crypto::{CryptoError, SessionState};
@@ -40,7 +41,6 @@ pub const MAX_MTU_ENCRYPTED: u16 = 1500 - 58;
 /// Same ceiling over an IPv6 outer: 40 IPv6 + 8 UDP + 30 = 78 bytes.
 pub const MAX_MTU_ENCRYPTED_V6: u16 = 1500 - 78;
 
-#[derive(Debug)]
 pub struct Config {
     pub bind: SocketAddr,
     /// Client only: the fixed remote endpoint.
@@ -55,7 +55,7 @@ pub struct Config {
     pub metrics_sock: PathBuf,
     pub metrics_group: Option<String>,
     /// Optional 32-byte session key enabling the AEAD wire format.
-    pub key: Option<[u8; 32]>,
+    pub key: Option<Zeroizing<[u8; 32]>>,
     /// Session index stamped on outbound packets; selects this side's
     /// derived direction key.
     pub sender_index: u32,
@@ -104,7 +104,7 @@ impl Config {
                 )));
             }
         }
-        if let Some(_key) = self.key {
+        if self.key.is_some() {
             if self.sender_index == 0 || self.peer_index == 0 {
                 return Err(invalid(
                     "sender_index and peer_index must both be nonzero when --key is set".into(),
@@ -320,7 +320,7 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
 
     let session = cfg
         .key
-        .map(|key| SessionState::new(key, cfg.sender_index, cfg.peer_index));
+        .map(|key| SessionState::from_lab_psk(key, cfg.sender_index, cfg.peer_index));
     // A datagram send of any kind resets the keepalive deadline — it only
     // fires while the stream is otherwise idle.
     let mut next_keepalive = tokio::time::Instant::now() + cfg.keepalive_interval;
@@ -371,7 +371,7 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
                         Ok(wire_len) => wire_len,
                         Err(CryptoError::NonceExhaustionNeedsRekey) => {
                             metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
-                            eprintln!("vpn-engine: session exhausted, needs rekey");
+                            eprintln!("vpn-engine: key epoch {} exhausted, needs rekey", session.key_epoch());
                             continue;
                         }
                         Err(err) => {
@@ -604,7 +604,7 @@ mod tests {
     #[test]
     fn keyed_config_rules() {
         let mut cfg = base();
-        cfg.key = Some([1u8; 32]);
+        cfg.key = Some(Zeroizing::new([1u8; 32]));
         // peer_index unset: required once --key is given.
         assert!(cfg.validate().is_err());
         cfg.peer_index = 2;
@@ -637,7 +637,7 @@ mod tests {
     #[test]
     fn keyed_mtu_limit_follows_outer_family() {
         let mut cfg = base();
-        cfg.key = Some([1u8; 32]);
+        cfg.key = Some(Zeroizing::new([1u8; 32]));
         cfg.peer_index = 2;
         // IPv4 outer (58B overhead): 1442 passes, 1443 is rejected.
         cfg.mtu = MAX_MTU_ENCRYPTED;
@@ -1053,7 +1053,7 @@ mod tests {
         let remote_addr = remote.local_addr().unwrap();
         let bind = free_port();
         let mut cfg = cfg_for(bind, Some(remote_addr), Some(OTHER_VIP), "crypt");
-        cfg.key = Some(LAB_KEY);
+        cfg.key = Some(Zeroizing::new(LAB_KEY));
         cfg.peer_index = 2;
         cfg.keepalive_interval = Duration::from_millis(60);
         let bind_addr = cfg.bind;
@@ -1075,7 +1075,7 @@ mod tests {
 
         // The remote seals a reply and it lands decrypted on TUN. Its
         // session uses complementary indexes: it stamps 2 and expects 1.
-        let peer_session = SessionState::new(LAB_KEY, 2, 1);
+        let peer_session = SessionState::from_lab_psk(Zeroizing::new(LAB_KEY), 2, 1);
         let reply = ipv4_packet(OTHER_VIP, LOCAL_VIP, b"in");
         let mut seal_buf = vec![0u8; HEADER_LEN + reply.len() + TAG_LEN + 32];
         seal_buf[HEADER_LEN..HEADER_LEN + reply.len()].copy_from_slice(&reply);
@@ -1150,7 +1150,7 @@ mod tests {
         let (tun, peer) = fake_tun();
         let bind = free_port();
         let mut cfg = cfg_for(bind, None, Some(PEER_VIP), "csrv");
-        cfg.key = Some(LAB_KEY);
+        cfg.key = Some(Zeroizing::new(LAB_KEY));
         cfg.sender_index = 2;
         cfg.peer_index = 1;
         cfg.keepalive_interval = Duration::from_millis(60);
@@ -1159,7 +1159,7 @@ mod tests {
         let good = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let stranger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         // The lab peer stamps index 1 and expects 2.
-        let peer_session = SessionState::new(LAB_KEY, 1, 2);
+        let peer_session = SessionState::from_lab_psk(Zeroizing::new(LAB_KEY), 1, 2);
 
         // Learn: an authenticated datagram carrying the peer's inner VIP
         // pins the endpoint and forwards to TUN.

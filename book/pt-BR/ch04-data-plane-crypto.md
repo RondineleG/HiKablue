@@ -65,13 +65,18 @@ chaves em papéis invertidos. O `Config::validate` exige índices
 distintos e não-nulos quando `--key` está presente — índices iguais
 colapsariam as duas direções numa chave só, recriando o problema.
 
+`key_epoch` identifica a geração das chaves em 64 bits. O motor guarda
+`egress_key` em `tx_key` (motor para par) e `ingress_key` em `rx_key`
+(par para motor). `Zeroizing` zera as chaves que a sessão possui ao
+descartá-la. Época zero marca o lab estático; essa limpeza não abrange
+os argumentos do processo.
+
 ## O contador que se recusa a morrer
 
 `SessionState::next_nonce` emite contadores de 1 para cima (o 0 é
-reservado). O `fetch_add` atômico garante unicidade mesmo sob selects
-concorrentes, e o primeiro selo que encostar em
-`u64::MAX − 65536` trava um latch: daí em diante *todo* `seal` retorna
-`NonceExhaustionNeedsRekey` — a sessão prefere parar a repetir nonce.
+reservado). `try_update` incrementa de forma atômica abaixo do último contador
+permitido. O contador fica no teto e retorna `NonceExhaustionNeedsRekey`
+em vez de emitir `u64::MAX - 65536` ou estourar.
 
 ## A janela de replay
 
@@ -123,6 +128,8 @@ retrocompatibilidade.
 
 ## O que foi verificado
 
+A execução original da fase 2 (r0):
+
 - `cargo test`: 86 testes — janela nas bordas ±2047/2048 e salto de
   5000, vetor RFC 8439 contra a saída do próprio crate, bit-flip no AAD
   sem tocar a janela, latch de exaustão, forged + replay dropados antes
@@ -133,18 +140,31 @@ retrocompatibilidade.
   (o lab usa o mesmo PSK dos dois lados, não entrega via controle) —
   esperado na fase de `key_epoch`.
 
+`r1` troca a comparação da biblioteca com ela mesma pelo
+[vetor publicado no RFC 8439, apêndice A.5](https://www.rfc-editor.org/rfc/rfc8439.html#appendix-A.5).
+Rode `cargo test --locked --manifest-path engine-rust/Cargo.toml` da raiz
+para verificar o IV, o cabeçalho autenticado, o teto concorrente e a
+troca de sessão com época acima de `u32::MAX`. Não cobre provisionamento,
+encaminhamento privilegiado ou conectividade de aplicações. O ajuste do
+máximo tamanho de segmento TCP (MSS) fica para o túnel completo: 1360
+para IPv4 interno com MTU 1400.
+
 ## Lendo o código
 
 ### `derive_key` — `engine-rust/src/crypto/session.rs`
 
 ```rust
-pub(crate) fn derive_key(key: &[u8; 32], index: u32) -> [u8; 32] {
+fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
     use blake2::Digest;
     let mut h = blake2::Blake2s256::new();
     h.update(b"hikablue-session-key-v1");
     h.update(index.to_be_bytes());
     h.update(key);
-    h.finalize().into()
+    let mut digest = h.finalize();
+    let mut derived = Zeroizing::new([0; 32]);
+    derived.copy_from_slice(&digest);
+    digest.as_mut_slice().zeroize();
+    derived
 }
 ```
 
@@ -158,11 +178,10 @@ pub(crate) fn derive_key(key: &[u8; 32], index: u32) -> [u8; 32] {
 - `index.to_be_bytes()` coloca o índice (big-endian) dentro do resumo —
   índice diferente, chave diferente. É o que separa as duas direções.
 - `h.update(key)` mistura o segredo por último.
-- `finalize().into()` devolve a chave derivada de 32 bytes.
+- `finalize()` gera o resumo; `copy_from_slice` copia para o buffer
+  protegido e `zeroize()` apaga os bytes temporários.
 
-`SessionState::new` chama isto duas vezes — com `local_index` para
-`tx_key` e `peer_index` para `rx_key` — e o `seal`/`open` nunca tocam o
-PSK original.
+`SessionState::from_lab_psk` deriva as chaves a partir dos índices local e remoto.
 
 ### `check` — `engine-rust/src/crypto/replay.rs`
 
@@ -203,15 +222,12 @@ PSK original.
   cifrados; aqui, os 14 bytes do cabeçalho. Mexer neles quebra a tag.
 - **AEAD** — "Authenticated Encryption with Associated Data": cifra +
   integridade numa operação só; aqui, ChaCha20-Poly1305 (RFC 8439).
-- **AtomicU64 / `fetch_add`** — inteiro atômico: incrementa e devolve o
-  valor anterior num passo indivisível, sem tranca — é como o contador
-  de nonce fica único sob concorrência.
+- **AtomicU64 / `try_update`** — Atualização atômica condicional; duas chamadas não compartilham nonce.
 - **BLAKE2s-256** — função hash de 32 bytes usada para derivar a chave
   de cada direção do PSK + índice.
 - **`derive_key`** — a função acima: transforma (rótulo, índice, PSK)
   na chave de uma direção.
-- **`fetch_add(1)` / latch** — o contador `tx_counter`; o *latch* é a
-  trava que, uma vez disparada, rejeita todo `seal` para sempre.
+- **Latch** — O contador fica no teto e rejeita novos envios.
 - **Headroom / tailroom** — espaço reservado antes/depois do payload no
   buffer: 14B na frente pro cabeçalho, 16B atrás pra tag — sem
   realocar.
@@ -253,6 +269,7 @@ E um desafio: `last_seq = 4100`. O pacote com `seq = 2051` passa em
 
 ## Revisões
 
+- `r1` — Época de 64 bits, descarte de chaves, teto de nonces e vetor RFC.
 - `r0` — AEAD, janela de replay, latch de nonce, ingresso simétrico,
   `--key`/`--sender-index`/`--peer-index`/`--keepalive-secs`, métricas
   de ingresso separadas.

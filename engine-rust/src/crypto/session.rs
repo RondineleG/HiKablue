@@ -1,4 +1,4 @@
-//! Per-peer session state: the symmetric key, send counter and receive
+//! Per-peer session state: directional keys, send counter and receive
 //! anti-replay window.
 //!
 //! Sealing and opening are zero-copy: `seal` writes header + ciphertext +
@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Tag};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::wire::{frame, Header, HEADER_LEN, TAG_LEN};
 
@@ -28,13 +28,17 @@ pub const NONCE_EXHAUSTION_MARGIN: u64 = 65536;
 /// key and the same counter value under each direction is safe (spec:
 /// "separate keys per direction"). With identical indexes both derivations
 /// coincide; `Config::validate` requires distinct indexes when keyed.
-pub(crate) fn derive_key(key: &[u8; 32], index: u32) -> [u8; 32] {
+fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
     use blake2::Digest;
     let mut h = blake2::Blake2s256::new();
     h.update(b"hikablue-session-key-v1");
     h.update(index.to_be_bytes());
     h.update(key);
-    h.finalize().into()
+    let mut digest = h.finalize();
+    let mut derived = Zeroizing::new([0; 32]);
+    derived.copy_from_slice(&digest);
+    digest.as_mut_slice().zeroize();
+    derived
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,9 +73,10 @@ impl std::fmt::Display for CryptoError {
 impl std::error::Error for CryptoError {}
 
 pub struct SessionState {
-    /// `derive_key(psk, local_index)` — the send direction.
+    key_epoch: u64,
+    /// Engine → peer (the control contract's egress_key).
     tx_key: Zeroizing<[u8; 32]>,
-    /// `derive_key(key, peer_index)` — the receive direction.
+    /// Peer → engine (the control contract's ingress_key).
     rx_key: Zeroizing<[u8; 32]>,
     /// Index we stamp on outbound packets.
     local_index: u32,
@@ -79,40 +84,58 @@ pub struct SessionState {
     peer_index: u32,
     tx_counter: AtomicU64,
     rx_replay: Mutex<AntiReplayWindow>,
-    /// Once tripped, every seal call fails — the latch only clears on a
-    /// fresh SessionState after rekey.
-    exhausted: AtomicU64,
 }
 
 impl SessionState {
-    pub fn new(key: [u8; 32], local_index: u32, peer_index: u32) -> Self {
+    /// Starts fresh counters for already validated directional material.
+    /// A rekey must replace the session with a new epoch, fresh keys and
+    /// fresh wire indexes, never recreate it on a control-stream reconnect.
+    pub fn new(
+        key_epoch: u64,
+        tx_key: Zeroizing<[u8; 32]>,
+        rx_key: Zeroizing<[u8; 32]>,
+        local_index: u32,
+        peer_index: u32,
+    ) -> Self {
         Self {
-            tx_key: Zeroizing::new(derive_key(&key, local_index)),
-            rx_key: Zeroizing::new(derive_key(&key, peer_index)),
+            key_epoch,
+            tx_key,
+            rx_key,
             local_index,
             peer_index,
             tx_counter: AtomicU64::new(0),
             rx_replay: Mutex::new(AntiReplayWindow::new()),
-            exhausted: AtomicU64::new(0),
         }
+    }
+
+    pub fn from_lab_psk(psk: Zeroizing<[u8; 32]>, local_index: u32, peer_index: u32) -> Self {
+        // Epoch zero labels static lab keys, not control-plane provisioning.
+        Self::new(
+            0,
+            derive_key(&psk, local_index),
+            derive_key(&psk, peer_index),
+            local_index,
+            peer_index,
+        )
+    }
+
+    pub fn key_epoch(&self) -> u64 {
+        self.key_epoch
     }
 
     /// Allocates the next outbound nonce or latches the session dead when
     /// the counter approaches wraparound.
     fn next_nonce(&self) -> Result<u64, CryptoError> {
-        // The latch short-circuits before touching the counter.
-        if self.exhausted.load(Ordering::Relaxed) != 0 {
-            return Err(CryptoError::NonceExhaustionNeedsRekey);
-        }
-        // Starts at 1: sequence 0 is reserved by the replay rules.
-        let seq = self.tx_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        if seq >= u64::MAX - NONCE_EXHAUSTION_MARGIN {
-            self.exhausted.store(1, Ordering::Relaxed);
-            return Err(CryptoError::NonceExhaustionNeedsRekey);
-        }
-        Ok(seq)
+        const LAST_NONCE: u64 = u64::MAX - NONCE_EXHAUSTION_MARGIN - 1;
+        // Keep the last issued nonce at the ceiling; contending callers
+        // cannot advance it or wrap around after exhaustion.
+        self.tx_counter
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |seq| {
+                (seq < LAST_NONCE).then(|| seq + 1)
+            })
+            .map(|prev| prev + 1)
+            .map_err(|_| CryptoError::NonceExhaustionNeedsRekey)
     }
-
     /// Encrypts `buf[HEADER_LEN..HEADER_LEN+len]` in place, prepends the
     /// header and appends the tag. Returns the total wire length.
     ///
@@ -188,12 +211,6 @@ impl SessionState {
         }
         Ok((header, ct_len))
     }
-
-    /// Drops the replay state — required when the session is rekeyed.
-    #[allow(dead_code)] // wired to control-plane rekey in a later milestone
-    pub fn rekey(&self, key: [u8; 32]) -> Self {
-        Self::new(key, self.local_index, self.peer_index)
-    }
 }
 
 #[cfg(test)]
@@ -203,8 +220,12 @@ mod tests {
 
     const KEY: [u8; 32] = [7u8; 32];
 
+    fn lab_session(local_index: u32, peer_index: u32) -> SessionState {
+        SessionState::from_lab_psk(Zeroizing::new(KEY), local_index, peer_index)
+    }
+
     fn session() -> SessionState {
-        SessionState::new(KEY, 1, 1)
+        lab_session(1, 1)
     }
 
     /// Plaintext sitting past the 14-byte headroom, as run_loop stages it.
@@ -248,41 +269,40 @@ mod tests {
 
     #[test]
     fn rfc8439_vector_matches_iv_mapping() {
-        // RFC 8439 §A.5 vector: key 80..9f, nonce 070000004041424344454647,
-        // aad 50515253c0c1c2c3c4c5c6c7. Our aead_nonce() for counter
-        // 0x43424140_47464544... — instead of reshaping the vector, prove
-        // the mapping by comparing against the crate's own output with the
-        // same 12-byte IV and AAD on a minimal plaintext.
-        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-        let key = [0xA5u8; 32];
-        let counter: u64 = 0x0700000041424344; // lands at iv[4..]
-        let iv = frame::aead_nonce(counter);
-        // Sealing runs under the derived direction key, not the raw PSK.
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&derive_key(&key, 1)));
-        let pt = b"wire";
-        let aad = [0u8; HEADER_LEN];
-        let expected = cipher
-            .encrypt((&iv).into(), Payload { msg: pt, aad: &aad })
+        fn hex(s: &str) -> Vec<u8> {
+            s.as_bytes()
+                .chunks_exact(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect()
+        }
+        // RFC 8439 Appendix A.5 uses its own AAD, not a HiKablue header.
+        let key = hex("1c9240a5eb55d38af333888604f6b5f0473917c1402b80099dca5cbc207075c0");
+        let aad = hex("f33388860000000000004e91");
+        let tag = hex("eead9d67890cbb22392336fea1851f38");
+        let mut ciphertext = hex(concat!(
+            "64a0861575861af460f062c79be643bd5e805cfd345cf389f108670ac76c8cb2",
+            "4c6cfc18755d43eea09ee94e382d26b0bdb7b73c321b0100d4f03b7f355894cf",
+            "332f830e710b97ce98c8a84abd0b948114ad176e008d33bd60f982b1ff37c855",
+            "9797a06ef4f0ef61c186324e2b3506383606907b6a7c02b0f9f6157b53c867e4",
+            "b9166c767b804d46a59b5216cde7a4e99040c5a40433225ee282a1b0a06c523e",
+            "af4534d7f83fa1155b0047718cbc546a0d072b04b3564eea1b422273f548271a",
+            "0bb2316053fa76991955ebd63159434ecebb4e466dae5a1073a6727627097a10",
+            "49e617d91d361094fa68f0ff77987130305beaba2eda04df997b714d6c6f2c29",
+            "a6ad5cb4022b02709b"
+        ));
+        let iv = frame::aead_nonce(0x0807_0605_0403_0201);
+        assert_eq!(iv, [0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        cipher
+            .decrypt_in_place_detached((&iv).into(), &aad, &mut ciphertext, Tag::from_slice(&tag))
             .unwrap();
-
-        let sess = SessionState::new(key, 1, 1);
-        sess.tx_counter.store(counter - 1, Ordering::Relaxed);
-        let mut buf = staged(pt);
-        buf[..HEADER_LEN].copy_from_slice(&aad); // zeroed AAD == zero header
-                                                 // Encode the real header — AAD is the encoded form, not zeros, so
-                                                 // reproduce it through seal and compare ciphertext+tag instead.
-        let wire_len = sess.seal(&mut buf, pt.len(), MSG_DATA).unwrap();
-        let expected2 = cipher
-            .encrypt(
-                (&iv).into(),
-                Payload {
-                    msg: pt,
-                    aad: &buf[..HEADER_LEN],
-                },
-            )
-            .unwrap();
-        assert_eq!(&buf[HEADER_LEN..wire_len], expected2.as_slice());
-        assert_eq!(expected.len(), pt.len() + TAG_LEN);
+        assert_eq!(
+            ciphertext,
+            b"Internet-Drafts are draft documents valid for a maximum of six months \
+              and may be updated, replaced, or obsoleted by other documents at any time. \
+              It is inappropriate to use Internet-Drafts as reference material or to cite \
+              them other than as /\xe2\x80\x9cwork in progress./\xe2\x80\x9d"
+        );
     }
 
     #[test]
@@ -291,26 +311,18 @@ mod tests {
         let b = session();
         let mut buf = staged(b"payload");
         let wire_len = a.seal(&mut buf, 7, MSG_DATA).unwrap();
-        buf[2] ^= 1; // flip a bit in sender_index (part of AAD)
-                     // sender_index mismatch wins over auth: still rejected, replay free.
-        match b.open(&mut buf, wire_len) {
-            Err(CryptoError::WrongPeerIndex) | Err(CryptoError::Authentication) => {}
-            other => panic!("expected rejection, got {other:?}"),
+        // A valid type flip changes AAD but not the nonce; a flip in the
+        // high counter byte changes both. Neither may advance the window.
+        for (offset, bit) in [(0, MSG_DATA ^ MSG_KEEPALIVE), (6, 0x80)] {
+            let mut tampered = buf.clone();
+            tampered[offset] ^= bit;
+            assert_eq!(
+                b.open(&mut tampered, wire_len),
+                Err(CryptoError::Authentication)
+            );
+            assert_eq!(b.rx_replay.lock().unwrap().last_seq(), 0);
         }
-        // The forged nonce must not have claimed a replay slot.
-        assert_eq!(b.rx_replay.lock().unwrap().last_seq(), 0);
-
-        // Flip inside the nonce field — passes index check, dies at the tag.
-        let mut buf2 = staged(b"payload");
-        let w2 = a.seal(&mut buf2, 7, MSG_DATA).unwrap();
-        buf2[10] ^= 1;
-        buf2[10] ^= 1; // restore… use a fresh forgery instead: flip type.
-        buf2[0] ^= 0x01;
-        match b.open(&mut buf2, w2) {
-            Err(CryptoError::BadHeader) | Err(CryptoError::Authentication) => {}
-            other => panic!("expected rejection, got {other:?}"),
-        }
-        assert_eq!(b.rx_replay.lock().unwrap().last_seq(), 0);
+        assert_eq!(b.open(&mut buf, wire_len).unwrap().0.nonce, 1);
     }
 
     #[test]
@@ -348,6 +360,36 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_nonce_allocation_stops_at_the_ceiling() {
+        let session = session();
+        let last = u64::MAX - NONCE_EXHAUSTION_MARGIN - 1;
+        session.tx_counter.store(last - 2, Ordering::Relaxed);
+        let barrier = std::sync::Barrier::new(8);
+        let results = std::thread::scope(|scope| {
+            let (session, barrier) = (&session, &barrier);
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        session.next_nonce()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let mut issued: Vec<_> = results.iter().filter_map(|result| result.ok()).collect();
+        issued.sort_unstable();
+        assert_eq!(issued, [last - 1, last]);
+        assert!(results
+            .into_iter()
+            .all(|result| result.is_ok() || result == Err(CryptoError::NonceExhaustionNeedsRekey)));
+        assert_eq!(session.tx_counter.load(Ordering::Relaxed), last);
+    }
+
+    #[test]
     fn seal_rejects_buffer_without_headroom_or_tag_room() {
         let sess = session();
         let mut short = [0u8; HEADER_LEN + 4 + TAG_LEN - 1];
@@ -378,7 +420,7 @@ mod tests {
 
     #[test]
     fn wrong_peer_index_is_rejected_before_decrypt() {
-        let a = SessionState::new(KEY, 9, 1);
+        let a = lab_session(9, 1);
         let b = session(); // expects peer_index 1
         let mut buf = staged(b"m");
         let wire_len = a.seal(&mut buf, 1, MSG_DATA).unwrap();
@@ -400,9 +442,9 @@ mod tests {
         // The two directions must not share a key: the derivation binds
         // the key to the sender's index, so sealing under index 1 opens
         // for the peer expecting 1 — and both directions roundtrip.
-        assert_ne!(derive_key(&KEY, 1), derive_key(&KEY, 2));
-        let a = SessionState::new(KEY, 1, 2);
-        let b = SessionState::new(KEY, 2, 1);
+        assert_ne!(*derive_key(&KEY, 1), *derive_key(&KEY, 2));
+        let a = lab_session(1, 2);
+        let b = lab_session(2, 1);
         let mut buf = staged(b"dir");
         let wire_len = a.seal(&mut buf, 3, MSG_DATA).unwrap();
         let (header, pt) = b.open(&mut buf, wire_len).unwrap();
@@ -421,8 +463,8 @@ mod tests {
         // Two copies of the same authenticated datagram raced through
         // open(): exactly one succeeds, the other gets Duplicate — the
         // post-authentication check+update runs under one lock.
-        let sealer = SessionState::new(KEY, 2, 1);
-        let rx = SessionState::new(KEY, 1, 2);
+        let sealer = lab_session(2, 1);
+        let rx = lab_session(1, 2);
         let mut buf = staged(b"race");
         let wire_len = sealer.seal(&mut buf, 4, MSG_DATA).unwrap();
         let wire: Vec<u8> = buf[..wire_len].to_vec();
@@ -475,16 +517,37 @@ mod tests {
     }
 
     #[test]
-    fn rekey_resets_counters_and_replay() {
-        let a = session();
-        let mut buf = staged(b"q");
-        a.seal(&mut buf, 1, MSG_DATA).unwrap();
-        let fresh = a.rekey([9u8; 32]);
-        let mut buf2 = staged(b"q");
-        let w = fresh.seal(&mut buf2, 1, MSG_DATA).unwrap();
-        // Nonce restarted at 1 under the new key.
-        assert_eq!(&buf2[6..14], &1u64.to_be_bytes());
-        let (header, _) = fresh.open(&mut buf2, w).unwrap();
-        assert_eq!(header.nonce, 1);
+    fn replacement_keeps_full_epoch_and_uses_fresh_directional_keys() {
+        let epoch = u64::from(u32::MAX) + 1;
+        let make = |epoch, tx, rx, local, peer| {
+            SessionState::new(
+                epoch,
+                Zeroizing::new([tx; 32]),
+                Zeroizing::new([rx; 32]),
+                local,
+                peer,
+            )
+        };
+        let mut sender = make(epoch, 3, 4, 1, 2);
+        let mut receiver = make(epoch, 4, 3, 2, 1);
+        let mut old_wire = staged(b"x");
+        let old_len = sender.seal(&mut old_wire, 1, MSG_DATA).unwrap();
+        assert!(receiver.open(&mut old_wire.clone(), old_len).is_ok());
+
+        sender = make(epoch + 1, 5, 6, 3, 4);
+        receiver = make(epoch + 1, 6, 5, 4, 3);
+        assert_eq!(sender.key_epoch(), epoch + 1);
+        assert_eq!(receiver.key_epoch(), epoch + 1);
+        assert_eq!(
+            receiver.open(&mut old_wire, old_len),
+            Err(CryptoError::WrongPeerIndex)
+        );
+
+        for (tx, rx) in [(&sender, &receiver), (&receiver, &sender)] {
+            let mut fresh = staged(b"y");
+            let len = tx.seal(&mut fresh, 1, MSG_DATA).unwrap();
+            assert_eq!(rx.open(&mut fresh, len).unwrap().0.nonce, 1);
+            assert_eq!(fresh[HEADER_LEN], b'y');
+        }
     }
 }

@@ -65,13 +65,18 @@ roles. `Config::validate` requires distinct, nonzero indexes when
 `--key` is set — equal indexes would collapse both directions onto one
 key, recreating the problem.
 
+`key_epoch` is a 64-bit key generation identifier. The engine stores
+`egress_key` in `tx_key` (engine to peer) and `ingress_key` in `rx_key`
+(peer to engine). `Zeroizing` wipes the owned keys when the session is
+dropped. The static lab constructor uses epoch zero; process arguments
+are not covered by this cleanup.
+
 ## The counter that refuses to die
 
 `SessionState::next_nonce` emits counters from 1 upward (0 is
-reserved). The atomic `fetch_add` keeps them unique under concurrent
-selects, and the first seal to touch `u64::MAX − 65536` trips a latch:
-from then on *every* `seal` returns `NonceExhaustionNeedsRekey` — the
-session would rather stop than repeat a nonce.
+reserved). `try_update` atomically increments below the last allowed counter.
+The counter stays at the ceiling and returns `NonceExhaustionNeedsRekey`
+instead of issuing `u64::MAX - 65536` or wrapping.
 
 ## The replay window
 
@@ -121,6 +126,8 @@ compatibility.
 
 ## What was verified
 
+The original Phase 2 run (r0):
+
 - `cargo test`: 86 tests — window boundaries ±2047/2048 and a 5000-seq
   leap, RFC 8439 vector against the crate's own output, AAD bit-flip
   leaving the window untouched, exhaustion latch, forged + replay drops
@@ -130,18 +137,31 @@ compatibility.
 - **Not verified**: cross-process key derivation via control-plane
   delivery (the lab shares one PSK) — expected in the `key_epoch` phase.
 
+`r1` replaces the original library self-comparison with the published
+[RFC 8439 Appendix A.5 vector](https://www.rfc-editor.org/rfc/rfc8439.html#appendix-A.5).
+Run `cargo test --locked --manifest-path engine-rust/Cargo.toml` at the
+repo root to check the IV, authenticated header, concurrent nonce ceiling
+and session replacement above `u32::MAX`. Provisioning, privileged
+forwarding and application connectivity are not covered. TCP maximum
+segment size (MSS) clamping stays in the full-tunnel phase: 1360 at
+MTU 1400 for inner IPv4.
+
 ## Reading the code
 
 ### `derive_key` — `engine-rust/src/crypto/session.rs`
 
 ```rust
-pub(crate) fn derive_key(key: &[u8; 32], index: u32) -> [u8; 32] {
+fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
     use blake2::Digest;
     let mut h = blake2::Blake2s256::new();
     h.update(b"hikablue-session-key-v1");
     h.update(index.to_be_bytes());
     h.update(key);
-    h.finalize().into()
+    let mut digest = h.finalize();
+    let mut derived = Zeroizing::new([0; 32]);
+    derived.copy_from_slice(&digest);
+    digest.as_mut_slice().zeroize();
+    derived
 }
 ```
 
@@ -157,11 +177,10 @@ pub(crate) fn derive_key(key: &[u8; 32], index: u32) -> [u8; 32] {
   different index, different key. That is what splits the two
   directions.
 - `h.update(key)` folds in the secret last.
-- `finalize().into()` returns the 32-byte derived key.
+- `finalize()` produces the digest; `copy_from_slice` copies it to the
+  guarded buffer and `zeroize()` wipes the temporary bytes.
 
-`SessionState::new` calls this twice — with `local_index` for `tx_key`
-and `peer_index` for `rx_key` — and `seal`/`open` never touch the raw
-PSK.
+`SessionState::from_lab_psk` derives keys from the local and peer indexes.
 
 ### `check` — `engine-rust/src/crypto/replay.rs`
 
@@ -203,15 +222,12 @@ PSK.
 - **AEAD** — "Authenticated Encryption with Associated Data":
   encryption + integrity in one operation; here, ChaCha20-Poly1305
   (RFC 8439).
-- **AtomicU64 / `fetch_add`** — atomic integer: increments and returns
-  the old value in one indivisible step, lock-free — that is how the
-  nonce counter stays unique under concurrency.
+- **AtomicU64 / `try_update`** — Atomic conditional update; concurrent callers cannot share a nonce.
 - **BLAKE2s-256** — the 32-byte hash function used to derive each
   direction's key from PSK + index.
 - **`derive_key`** — the function above: turns (label, index, PSK) into
   one direction's key.
-- **`fetch_add(1)` / latch** — the `tx_counter` counter; the *latch* is
-  the tripwire that, once fired, rejects every `seal` forever.
+- **Latch** — Exhausted counter stays at its ceiling and rejects further sends.
 - **Headroom / tailroom** — space reserved before/after the payload in
   the buffer: 14B up front for the header, 16B at the back for the tag
   — no reallocating.
@@ -254,6 +270,7 @@ pass `check()`? Hint: compute `diff` and compare with `WINDOW_SIZE`
 
 ## Revisions
 
+- `r1` — 64-bit epoch, zeroizing keys, concurrent nonce ceiling and RFC vector.
 - `r0` — AEAD, replay window, nonce latch, symmetric ingress,
   `--key`/`--sender-index`/`--peer-index`/`--keepalive-secs`, split
   ingress metrics.
