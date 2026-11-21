@@ -24,7 +24,8 @@ Name branches `feat/<slug>` for additive work and `fix/<slug>` for bug fixes. Us
   migrations under `control-dotnet/VpnControl/Data/Migrations/`:
   `initial-control-plane` (nodes, sessions, ip_leases, outbox) and
   `outbox-dispatch` (stream_epoch, backend_instance_id, status, attempts,
-  next_retry_at, deadline on outbox). Apply with `dotnet ef database
+  next_retry_at, deadline on outbox), and `outbox-delivery-indexes`
+  (deadline and per-node ordering indexes). Apply with `dotnet ef database
   update` or `db.Database.MigrateAsync()`. The Go orchestration client is
   delivered as `agent-go/pkg/orchestrator` (mTLS channel, fencing, ACKs);
   wiring it into `cmd/vpn-agent` — which still fetches M1 metrics once

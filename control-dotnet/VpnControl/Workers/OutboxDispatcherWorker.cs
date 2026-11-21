@@ -9,12 +9,8 @@ using VpnControl.Services;
 namespace VpnControl.Workers;
 
 /// <summary>
-/// Drains the outbox into live NodeChannel streams (M3 spec §6): every
-/// ~150 ms it claims pending rows with FOR UPDATE SKIP LOCKED, matches
-/// each node's active stream, writes the ControlCommand with stamped
-/// fencing fields and marks the row sent. At-least-once: rows stay
-/// pending until an ACK arrives, so a dead stream never loses a command —
-/// the next stream's dispatch picks it up after the stale row is retried.
+/// Claims due commands in PostgreSQL before writing to live NodeChannel
+/// streams. An unacknowledged attempt is eligible again after its deadline.
 /// </summary>
 public sealed class OutboxDispatcherWorker(
     IServiceScopeFactory scopeFactory,
@@ -23,7 +19,9 @@ public sealed class OutboxDispatcherWorker(
     ILogger<OutboxDispatcherWorker> logger) : BackgroundService
 {
     private const int BatchSize = 32;
+    private const int MaxAttempts = 3;
     private static readonly TimeSpan CommandDeadline = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(250);
 
     private TimeSpan Interval
     {
@@ -56,29 +54,90 @@ public sealed class OutboxDispatcherWorker(
 
     public async Task<int> DispatchOnceAsync(CancellationToken ct)
     {
+        var claims = await ClaimAsync(ct);
+        var sent = await Task.WhenAll(claims.Select(c => SendAsync(c, ct)));
+        return sent.Count(ok => ok);
+    }
+
+    private sealed record DispatchClaim(OutboxRow Row, ActiveStream Stream, ControlCommand Command);
+
+    private async Task<bool> SendAsync(DispatchClaim claim, CancellationToken ct)
+    {
+        var (row, stream, command) = claim;
+        var remaining = command.Deadline.ToDateTimeOffset() - DateTimeOffset.UtcNow;
+        if (remaining <= TimeSpan.Zero ||
+            !streams.TryGet(row.NodeId, out var current) ||
+            !ReferenceEquals(current, stream) || stream.Closed.IsCancellationRequested)
+        {
+            return false;
+        }
+
+        using var write = CancellationTokenSource.CreateLinkedTokenSource(ct, stream.Closed.Token);
+        write.CancelAfter(remaining);
+        try
+        {
+            await stream.Writer.WriteAsync(command, write.Token);
+        }
+        catch (Exception ex) when (!ct.IsCancellationRequested)
+        {
+            // Failure does not prove that the agent did not receive the command.
+            logger.LogWarning(ex, "outbox write failed for {CommandId} on node {NodeId}",
+                row.CommandId, row.NodeId);
+            return false;
+        }
+
+        ControlMetrics.CommandDispatched();
+        var delivered = DateTimeOffset.UtcNow;
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<ControlDbContext>();
+        await db.Outbox
+            .Where(o => o.CommandId == row.CommandId && o.Attempts == row.Attempts)
+            .ExecuteUpdateAsync(o => o.SetProperty(r => r.DeliveredAt, delivered), ct);
+        return true;
+    }
+
+    private async Task<List<DispatchClaim>> ClaimAsync(CancellationToken ct)
+    {
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<ControlDbContext>();
         var now = DateTimeOffset.UtcNow;
-
         await using var tx = await db.Database.BeginTransactionAsync(ct);
-        var pending = await db.Outbox
+        var due = await db.Outbox
             .FromSql($"""
-                SELECT * FROM outbox
-                WHERE status = 'pending'
-                  AND (next_retry_at IS NULL OR next_retry_at <= {now})
-                ORDER BY created_at
+                SELECT candidate.* FROM outbox candidate
+                WHERE ((candidate.status = 'pending'
+                     AND (candidate.next_retry_at IS NULL OR candidate.next_retry_at <= {now}))
+                    OR (candidate.status = 'sent' AND candidate.deadline <= {now}))
+                  AND NOT EXISTS (
+                    SELECT 1 FROM outbox earlier
+                    WHERE earlier.node_id = candidate.node_id
+                      AND earlier.status IN ('pending', 'sent')
+                      AND (earlier.created_at, earlier.command_id) <
+                          (candidate.created_at, candidate.command_id)
+                  )
+                ORDER BY candidate.created_at, candidate.command_id
                 LIMIT {BatchSize}
-                FOR UPDATE SKIP LOCKED
+                FOR UPDATE OF candidate SKIP LOCKED
                 """)
             .ToListAsync(ct);
 
-        var sent = 0;
-        foreach (var row in pending)
+        var claims = new List<DispatchClaim>(due.Count);
+        foreach (var row in due)
         {
-            if (!streams.TryGet(row.NodeId, out var stream))
+            if (row.Attempts >= MaxAttempts)
             {
-                // No live stream: retry on the next pass.
-                row.NextRetryAt = now.AddMilliseconds(250);
+                row.Status = "failed";
+                row.NextRetryAt = null;
+                ControlMetrics.CommandFailed();
+                logger.LogWarning("outbox command {CommandId} exhausted delivery attempts for node {NodeId}",
+                    row.CommandId, row.NodeId);
+                continue;
+            }
+
+            if (!streams.TryGet(row.NodeId, out var stream) || stream.Closed.IsCancellationRequested)
+            {
+                row.Status = "pending";
+                row.NextRetryAt = now + RetryDelay;
                 continue;
             }
 
@@ -92,20 +151,19 @@ public sealed class OutboxDispatcherWorker(
                 continue;
             }
 
-            await stream.Writer.WriteAsync(command, ct);
             row.Status = "sent";
             row.Attempts += 1;
-            row.DeliveredAt = now;
+            row.DeliveredAt = null;
             row.StreamEpoch = stream.StreamEpoch;
             row.BackendInstanceId = stream.BackendInstanceId;
-            row.Deadline = now + CommandDeadline;
-            sent++;
-            ControlMetrics.CommandDispatched();
+            row.Deadline = command.Deadline.ToDateTimeOffset();
+            row.NextRetryAt = null;
+            claims.Add(new(row, stream, command));
         }
 
         await db.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);
-        return sent;
+        return claims;
     }
 
     /// Rebuilds a ControlCommand from the JSONB payload per command type.

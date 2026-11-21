@@ -63,7 +63,7 @@ func (f *fakeOrchestrator) NodeChannel(
 
 // bufconnServer starts a fake orchestrator on an in-memory pipe and returns
 // a client conn pointed at it.
-func bufconnServer(t *testing.T, f *fakeOrchestrator) *grpc.ClientConn {
+func bufconnServer(t *testing.T, f edgev1.EdgeOrchestratorServer) *grpc.ClientConn {
 	t.Helper()
 	lis := bufconn.Listen(1 << 20)
 	srv := grpc.NewServer()
@@ -143,6 +143,69 @@ func TestRunRegistersDispatchesAndAcks(t *testing.T) {
 	case <-runDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not return after context cancel")
+	}
+}
+
+func TestReplayStatePersistsAcrossChannelsButNotBackendReplacement(t *testing.T) {
+	cfg := Config{NodeId: "edge-1", BackendInstanceId: "backend-1"}
+	cfg.ReplayState = NewReplayState(cfg.NodeId, cfg.BackendInstanceId)
+	h := &stubHandler{}
+	run := func(cfg Config, cmd *edgev1.ControlCommand, wantRegistered, wantApplied uint64) {
+		t.Helper()
+		fake := &fakeOrchestrator{
+			gotRegister: make(chan *edgev1.NodeRegister, 1),
+			gotAck:      make(chan *edgev1.CommandAck, 1),
+			commands:    []*edgev1.ControlCommand{cmd},
+		}
+		conn := bufconnServer(t, fake)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- NewChannel(cfg, h).Run(ctx, conn) }()
+		select {
+		case reg := <-fake.gotRegister:
+			if reg.AppliedRevision != wantRegistered || reg.BackendInstanceId != cfg.BackendInstanceId {
+				t.Fatalf("unexpected reconnect register: %v", reg)
+			}
+		case <-ctx.Done():
+			t.Fatal("no register")
+		}
+		select {
+		case ack := <-fake.gotAck:
+			if ack.Outcome != edgev1.AckOutcome_ACK_OUTCOME_APPLIED || ack.AppliedRevision != wantApplied {
+				t.Fatalf("unexpected reconnect ACK: %v", ack)
+			}
+		case <-ctx.Done():
+			t.Fatal("no reconnect ACK")
+		}
+		cancel()
+		<-done
+	}
+
+	now := time.Now()
+	run(cfg, command("1000", cfg.BackendInstanceId, 7, now.Add(time.Minute)), 0, 7)
+	run(cfg, command("1001", cfg.BackendInstanceId, 7, now.Add(time.Minute)), 7, 7)
+	if h.provisioned != 1 {
+		t.Fatalf("reconnected channel reapplied a command: %d provisions", h.provisioned)
+	}
+
+	cfg.BackendInstanceId = "backend-2"
+	snapshot := command("1002", cfg.BackendInstanceId, 1, now.Add(time.Minute))
+	snapshot.Payload = &edgev1.ControlCommand_SyncState{SyncState: &edgev1.SyncState{}}
+	run(cfg, snapshot, 0, 1)
+	if h.synced != 1 {
+		t.Fatal("replacement backend did not reconcile")
+	}
+}
+
+func TestChannelCannotShareReplayStateAcrossConcurrentRuns(t *testing.T) {
+	cfg := Config{NodeId: "edge-1", BackendInstanceId: "backend-1"}
+	cfg.ReplayState = NewReplayState(cfg.NodeId, cfg.BackendInstanceId)
+	first := NewChannel(cfg, &stubHandler{})
+	first.replay.runMu.Lock()
+	defer first.replay.runMu.Unlock()
+	if err := NewChannel(cfg, &stubHandler{}).run(context.Background(), nil); err == nil {
+		t.Fatal("second channel unexpectedly took ownership of replay state")
 	}
 }
 
@@ -328,5 +391,56 @@ func TestRunPreservesServerStatusAfterHeartbeatEOF(t *testing.T) {
 	defer cancel()
 	if err := c.run(ctx, lifecycleClient{stream}); !errors.Is(err, stream.recvErr) {
 		t.Fatalf("expected server status %v, got %v", stream.recvErr, err)
+	}
+}
+
+type delayedStatusServer struct {
+	edgev1.UnimplementedEdgeOrchestratorServer
+	firstHeartbeat chan struct{}
+	finish         chan struct{}
+}
+
+func (s *delayedStatusServer) NodeChannel(stream edgev1.EdgeOrchestrator_NodeChannelServer) error {
+	for {
+		msg, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		if msg.GetHeartbeat() != nil {
+			close(s.firstHeartbeat)
+			break
+		}
+	}
+	select {
+	case <-s.finish:
+		return status.Error(codes.PermissionDenied, "node is not allowed")
+	case <-stream.Context().Done():
+		return stream.Context().Err()
+	}
+}
+
+func TestHeartbeatEOFLeavesFinalStatusReadableOnGRPCTransport(t *testing.T) {
+	server := &delayedStatusServer{firstHeartbeat: make(chan struct{}), finish: make(chan struct{})}
+	conn := bufconnServer(t, server)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := edgev1.NewEdgeOrchestratorClient(conn).NodeChannel(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := NewChannel(Config{HeartbeatInterval: time.Millisecond}, &stubHandler{})
+	done := make(chan error, 1)
+	go func() { done <- c.heartbeatLoop(ctx, cancel, stream) }()
+	select {
+	case <-server.firstHeartbeat:
+	case <-ctx.Done():
+		t.Fatal("heartbeat did not reach the open stream")
+	}
+	close(server.finish)
+	if err := <-done; !errors.Is(err, io.EOF) {
+		t.Fatalf("expected heartbeat send EOF, got %v", err)
+	}
+	if _, err := stream.Recv(); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("expected final server status after EOF, got %v", err)
 	}
 }

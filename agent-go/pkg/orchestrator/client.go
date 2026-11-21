@@ -28,14 +28,17 @@ type Config struct {
 	KeyPath  string
 	// NodeId is the SPIFFE node id embedded in the certificate SAN.
 	NodeId string
-	// BackendInstanceId identifies this running agent instance; regenerated
-	// on every process start when left empty.
+	// BackendInstanceId identifies the running backend. The caller provides
+	// a new ID when the backend restarts or loses its applied state.
 	BackendInstanceId string
 	// AgentVersion is reported on NodeRegister.
 	AgentVersion string
 	// HeartbeatInterval overrides the 10s default heartbeat cadence
 	// (mainly for tests).
 	HeartbeatInterval time.Duration
+	// ReplayState optionally preserves in-memory command history across
+	// replacement Channels for the same node and backend instance.
+	ReplayState *ReplayState
 }
 
 // NewMTLSConfig builds the TLS config for the lab PKI: the lab CA as the
