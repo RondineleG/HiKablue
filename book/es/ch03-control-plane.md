@@ -324,11 +324,15 @@ defer func() {
 La línea 1 programa la limpieza para cada retorno posterior al inicio del
 heartbeat. La línea 2 cancela solo el contexto hijo, desbloqueando la E/S
 gRPC y el temporizador. La línea 3 espera al cierre del canal de finalización.
-La línea 4 invoca la función diferida al retornar. El heartbeat también
-llama a `cancel()` cuando falla; `Run` informa ese error en vez de esperar
-indefinidamente en `Recv`. `TestRunCancelsStreamAfterReceiveFailure` y
-`TestRunHeartbeatFailureUnblocksReceive` prueban ambas direcciones con un
-stream programado, sin un endpoint vivo.
+La línea 4 invoca la función diferida al retornar. Un fallo de envío del
+heartbeat normalmente cancela la ejecución para desbloquear `Recv`. La
+excepción es `io.EOF`: gRPC puede dejar de aceptar envíos antes de que
+`Recv` entregue el estado final del servidor. `Run` deja activa la
+recepción y devuelve su resultado.
+`TestRunCancelsStreamAfterReceiveFailure`,
+`TestRunHeartbeatFailureUnblocksReceive` y
+`TestRunPreservesServerStatusAfterHeartbeatEOF` prueban estos casos con
+streams programados, sin un endpoint vivo.
 
 Dos reconexiones pueden ocurrir en un milisegundo; el reloj puede retroceder.
 `NodeStreamRegistry.Attach` calcula lo siguiente bajo el mismo bloqueo que
@@ -349,7 +353,8 @@ un registro/proceso**, no es un protocolo persistente entre control planes.
 
 **Términos:** `context.WithCancel` crea un ámbito hijo de cancelación;
 `defer` ejecuta limpieza al retornar; `<-heartbeatDone` espera al cierre de
-un canal; `Recv` lee una trama gRPC; `TimeProvider` proporciona el reloj;
+un canal; `Recv` lee una trama gRPC o el estado final; `io.EOF` indica
+el fin de un stream; `TimeProvider` proporciona el reloj;
 `Math.Max` elige el mayor número; `checked` detecta desbordamientos; un
 bloqueo serializa el acceso al estado compartido.
 
@@ -358,10 +363,14 @@ desde la raíz del repositorio, ejecutar
 `dotnet test control-dotnet/VpnControl.Tests --filter FullyQualifiedName~NodeStreamRegistryTests`.
 Ambas comprobaciones focalizadas pasaron en la VM Ubuntu de desarrollo.
 Demuestran vida del stream/fencing, no reenvío de paquetes ni conectividad
-de aplicación. El nuevo workflow de PR `Quality gate` ejecuta
-`bash tests/checks.sh` con toolchains fijadas, PostgreSQL en Docker y los
-tres umbrales de cobertura ≥90%. Omite el lab privilegiado; el validador
-sigue exigiendo ramas `fix/<slug>` o `feat/<slug>`.
+de aplicación. El workflow de PR `Quality gate` está configurado para
+comprobar el formato y vet de Go, compilar .NET y ejecutar
+`COVERAGE_GATE=1 bash tests/coverage.sh` (tests con cobertura ≥90% para
+Rust, Go y .NET, incluido PostgreSQL en Docker). En el PR #15 el workflow
+no se inició por un bloqueo de facturación de GitHub; la evidencia anterior
+es local. `bash tests/checks.sh` sigue siendo el gate local completo sin
+privilegios. El validador independiente sigue exigiendo ramas
+`fix/<slug>` o `feat/<slug>`.
 
 **Ejercicio:** congelar el reloj de prueba, conectar un sustituto y retirar
 el epoch antiguo. Pista: usar

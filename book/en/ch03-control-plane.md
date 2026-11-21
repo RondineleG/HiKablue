@@ -298,11 +298,14 @@ defer func() {
 Line 1 schedules cleanup on every return after the heartbeat starts.
 Line 2 cancels only this run's child context, unblocking gRPC I/O and the
 ticker. Line 3 waits for the heartbeat's completion channel to close.
-Line 4 invokes the deferred function on return. The heartbeat also calls
-`cancel()` on failure; `Run` reports that error instead of waiting forever
-in `Recv`. `TestRunCancelsStreamAfterReceiveFailure` and
-`TestRunHeartbeatFailureUnblocksReceive` use a scripted stream to test
-both directions without a live endpoint.
+Line 4 invokes the deferred function on return. A heartbeat send failure
+normally cancels the run to unblock `Recv`. The exception is `io.EOF`:
+gRPC can stop accepting sends before `Recv` delivers the server's final
+status. `Run` leaves the receive active and reports its result instead.
+`TestRunCancelsStreamAfterReceiveFailure`,
+`TestRunHeartbeatFailureUnblocksReceive`, and
+`TestRunPreservesServerStatusAfterHeartbeatEOF` exercise these cases with
+scripted streams, without a live endpoint.
 
 Two reconnects can occur in one millisecond; a clock can move backward.
 `NodeStreamRegistry.Attach` now computes this inside the same lock that
@@ -324,7 +327,8 @@ multi-control-plane fencing protocol.
 
 **Terms:** `context.WithCancel` creates a child cancellation scope;
 `defer` runs cleanup on return; `<-heartbeatDone` waits for a channel
-close; `Recv` reads a gRPC frame; `TimeProvider` supplies the clock;
+close; `Recv` reads a gRPC frame or the final status; `io.EOF` signals
+the end of a stream; `TimeProvider` supplies the clock;
 `Math.Max` selects the larger number; `checked` detects arithmetic
 overflow; a lock serializes access to shared state.
 
@@ -333,10 +337,12 @@ from the repository root, run
 `dotnet test control-dotnet/VpnControl.Tests --filter FullyQualifiedName~NodeStreamRegistryTests`.
 Both focused checks passed on the Ubuntu development VM. They prove
 stream lifetime/fencing, not packet forwarding or application connectivity.
-The new `Quality gate` PR workflow runs `bash tests/checks.sh` with pinned
-toolchains, Docker-backed PostgreSQL tests and all three ≥90% coverage
-gates. It skips the privileged lab, and the branch validator still
-requires `fix/<slug>` or `feat/<slug>`.
+The `Quality gate` PR workflow is configured for Go formatting and vet,
+.NET build, and `COVERAGE_GATE=1 bash tests/coverage.sh` (tests with coverage
+≥90% for Rust, Go and .NET, including PostgreSQL via Docker). The workflow
+did not start on PR #15 due to a GitHub billing lock; the evidence above is
+local. `bash tests/checks.sh` remains the full unprivileged local gate.
+The separate branch validator still requires `fix/<slug>` or `feat/<slug>`.
 
 **Exercise:** freeze the test clock, attach a replacement, then detach the
 old epoch. Hint: use `SameMillisecondReconnectGetsANewEpochAndSurvivesOldDetach`;

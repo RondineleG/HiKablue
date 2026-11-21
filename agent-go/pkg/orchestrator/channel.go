@@ -94,7 +94,11 @@ func (c *Channel) run(ctx context.Context, client edgev1.EdgeOrchestratorClient)
 	go func() {
 		defer close(heartbeatDone)
 		heartbeatErr = c.heartbeatLoop(ctx, stream)
-		cancel()
+		// gRPC Send can return EOF before Recv delivers the final status.
+		// Leave the receive alive in that case.
+		if !errors.Is(heartbeatErr, io.EOF) {
+			cancel()
+		}
 	}()
 	defer func() {
 		cancel()
@@ -107,6 +111,7 @@ func (c *Channel) run(ctx context.Context, client edgev1.EdgeOrchestratorClient)
 			cancel()
 			<-heartbeatDone
 			if heartbeatErr != nil &&
+				!errors.Is(heartbeatErr, io.EOF) &&
 				!errors.Is(heartbeatErr, context.Canceled) &&
 				!errors.Is(heartbeatErr, context.DeadlineExceeded) {
 				return heartbeatErr

@@ -16,7 +16,7 @@ HiKablue follows one packet end to end: from a Linux client's TUN interface, thr
 │  client    │───────────▶│   vpn-control    │  sessions, IPs,
 │  vpn-cli   │            │    (C#/.NET)     │  revocation, state
 └─────┬──────┘            └────────▲─────────┘
-      │                          │ gRPC + mTLS (library; CLI wiring pending)
+      │                          │ gRPC + mTLS (library; vpn-agent wiring pending)
       │ UDP (test traffic)  ┌────┴──────┐
       │                     │ vpn-agent │
       ▼                     │   (Go)    │
@@ -70,10 +70,14 @@ The lab steps use `sudo` only where TUN creation and namespaces require it, run 
 Run the gate on a `fix/<slug>` or `feat/<slug>` branch. On `main`, the
 branch validator deliberately fails; it does not indicate a compilation or
 test failure. Do not override `BRANCH_NAME` to bypass this guard. The
-`Quality gate` GitHub Actions workflow runs this same non-privileged gate
-for every PR targeting `main`, including Go, .NET (real PostgreSQL through
-Testcontainers/Docker), and all three coverage thresholds. It does not
-claim privileged forwarding or application-connectivity validation.
+`Quality gate` GitHub Actions workflow is configured for PRs targeting
+`main`: it checks Go formatting and vet, builds .NET, and runs tests with
+coverage ≥90% per component (Rust, Go, and .NET with PostgreSQL via
+Testcontainers/Docker). Existing workflows handle Rust fmt/clippy/tests/build,
+shell lint, ebook parity, commit validation, and diff safety separately.
+For [PR #15](https://github.com/RondineleG/HiKablue/pull/15), GitHub Actions
+jobs did not start due to a billing lock; verification was local. The
+workflow does not validate privileged forwarding or application connectivity.
 
 ## The Journey of my VPN
 

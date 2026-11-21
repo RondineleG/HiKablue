@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"testing"
@@ -11,6 +12,8 @@ import (
 
 	edgev1 "github.com/RondineleG/HiKablue/agent-go/gen/edge/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
 
@@ -234,19 +237,30 @@ func (c lifecycleClient) NodeChannel(ctx context.Context,
 
 type lifecycleStream struct {
 	grpc.ClientStream
-	ctx          context.Context
-	recvErr      error
-	heartbeatErr error
+	ctx           context.Context
+	recvErr       error
+	heartbeatErr  error
+	heartbeatSent chan struct{}
 }
 
 func (s *lifecycleStream) Send(msg *edgev1.AgentMessage) error {
 	if msg.GetHeartbeat() != nil {
+		if s.heartbeatSent != nil {
+			close(s.heartbeatSent)
+		}
 		return s.heartbeatErr
 	}
 	return nil
 }
 
 func (s *lifecycleStream) Recv() (*edgev1.ControlCommand, error) {
+	if s.heartbeatSent != nil {
+		select {
+		case <-s.heartbeatSent:
+		case <-s.ctx.Done():
+			return nil, s.ctx.Err()
+		}
+	}
 	if s.recvErr != nil {
 		return nil, s.recvErr
 	}
@@ -284,5 +298,19 @@ func TestRunHeartbeatFailureUnblocksReceive(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("heartbeat failure left Run blocked in Recv")
+	}
+}
+
+func TestRunPreservesServerStatusAfterHeartbeatEOF(t *testing.T) {
+	stream := &lifecycleStream{
+		recvErr:       status.Error(codes.PermissionDenied, "node is not allowed"),
+		heartbeatErr:  io.EOF,
+		heartbeatSent: make(chan struct{}),
+	}
+	c := NewChannel(Config{HeartbeatInterval: time.Millisecond}, &stubHandler{})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := c.run(ctx, lifecycleClient{stream}); !errors.Is(err, stream.recvErr) {
+		t.Fatalf("expected server status %v, got %v", stream.recvErr, err)
 	}
 }

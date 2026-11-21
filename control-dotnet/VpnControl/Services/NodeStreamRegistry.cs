@@ -45,10 +45,7 @@ public sealed class NodeStreamRegistry(TimeProvider? timeProvider = null)
             _streams.TryGetValue(nodeId, out replaced);
             _streams[nodeId] = stream;
         }
-        // Cancel outside the dictionary's internal lock: the cancelled
-        // stream's continuation can run inline and calls Detach, which
-        // needs the same bucket lock — cancelling inside the update
-        // delegate can deadlock.
+        // Cancel after releasing the attach lock: cancellation callbacks can run inline.
         replaced?.Closed.Cancel();
         return stream;
     }
