@@ -16,13 +16,13 @@ HiKablue follows one packet end to end: from a Linux client's TUN interface, thr
 │  client    │───────────▶│   vpn-control    │  sessions, IPs,
 │  vpn-cli   │            │    (C#/.NET)     │  revocation, state
 └─────┬──────┘            └────────▲─────────┘
-      │                          │ gRPC + mTLS (planned)
+      │                          │ gRPC + mTLS (library; CLI wiring pending)
       │ UDP (test traffic)  ┌────┴──────┐
       │                     │ vpn-agent │
       ▼                     │   (Go)    │
 ┌────────────┐   Unix sock  └───────────┘
 │ vpn-engine │◀──────────────────┘
-│   (Rust)   │  GetMetrics + engine control
+│   (Rust)   │  GetMetrics (peer control pending)
 └─────┬──────┘
       │ TUN
       ▼
@@ -33,10 +33,10 @@ Tunneled traffic flows client → engine (UDP in the lab) — the agent stays on
 
 | Component | Role | Status |
 |---|---|---|
-| `engine-rust/` | Forwards IPv4 packets between TUN and UDP; serves `GetMetrics` on a hardened Unix socket (`0660` + `--metrics-group`, length-prefixed JSON envelope, deadlines, connection cap) | Implemented |
-| `agent-go/` | Fetches engine metrics with context deadlines; will apply node configuration and report applied state | Metrics fetcher implemented |
-| `control-dotnet/` | In-memory node registry behind loopback-only HTTP (`POST /internal/heartbeats`, `GET /v1/nodes`); real auth and PostgreSQL arrive with the gRPC control plane | Lab service implemented |
-| `proto/` | gRPC `NodeChannel` definitions | Placeholder |
+| `engine-rust/` | IPv4 TUN ↔ UDP, hardened `GetMetrics` Unix socket, optional lab ChaCha20-Poly1305 with per-direction keys and replay protection | M4 phase 2 delivered; dynamic peer control pending |
+| `agent-go/` | Metrics-fetcher binary plus `pkg/orchestrator` (mTLS channel, register/heartbeat/ACK, fencing) | Library delivered; binary wiring and backend command handler deferred to M4 |
+| `control-dotnet/` | PostgreSQL/EF Core, IPAM, session API, SPIFFE mTLS `NodeChannel`, outbox and lease reaper; loopback-only lab REST/legacy heartbeat remains | M3 components delivered; gRPC lab integration pending |
+| `proto/` | gRPC `NodeChannel` definitions and generated Go/C# bindings | Delivered in M3 |
 
 The custom UDP transport exists **only for isolated lab exercises** with test traffic. The roadmap specifies a WireGuard backend before real traffic is carried.
 
@@ -49,7 +49,7 @@ Keep this table current: every milestone change set updates the status and links
 | 0 | Foundation — monorepo + toolchains | **Delivered** — Rust, Go, and C# all run real components; versions pinned (`rust-toolchain.toml`, `global.json`, `go.mod` + `.go-version`) |
 | 1 | **Telemetry** — metrics socket, Go fetcher, C# heartbeat registry | **Delivered** — [PR #6](https://github.com/RondineleG/HiKablue/pull/6); hardened in [PR #8](https://github.com/RondineleG/HiKablue/pull/8) (registry snapshots, heartbeat token auth, payload limits, node expiry, coverage-gate self-tests) |
 | 2 | Raw TUN ↔ UDP tunnel | **Delivered** in [PR #4](https://github.com/RondineleG/HiKablue/pull/4) — ping verified both ways on Debian 12/13 (delivered out of order, ahead of milestone 1) |
-| 3 | Control plane — PostgreSQL, IPAM, session states, outbox; gRPC `NodeChannel` over mTLS replaces the HTTP heartbeat | **Delivered** — contracts + lab CA + IPAM design in [PR #11](https://github.com/RondineleG/HiKablue/pull/11); EF Core persistence, IPAM and `/v1/sessions` in [PR #12](https://github.com/RondineleG/HiKablue/pull/12); `NodeChannel` with SPIFFE mTLS, outbox dispatcher, lease reaper and the Go `pkg/orchestrator` client in [PR #13](https://github.com/RondineleG/HiKablue/pull/13) |
+| 3 | Control plane — PostgreSQL, IPAM, session states, outbox; gRPC `NodeChannel` over mTLS | **Components delivered** — contracts + lab CA + IPAM design in [PR #11](https://github.com/RondineleG/HiKablue/pull/11); EF Core persistence, IPAM and `/v1/sessions` in [PR #12](https://github.com/RondineleG/HiKablue/pull/12); `NodeChannel` with SPIFFE mTLS, outbox dispatcher, lease reaper and the Go `pkg/orchestrator` client in [PR #13](https://github.com/RondineleG/HiKablue/pull/13). Binary wiring, HTTP heartbeat retirement and cross-process gRPC acceptance remain deferred to M4 |
 | 4 | End-to-end session — encrypted Rust backend, CLI, peer operations, local expiration, reconciliation | **In progress** — Phase 2 data-plane crypto delivered in [PR #14](https://github.com/RondineleG/HiKablue/pull/14): ChaCha20-Poly1305 AEAD wire format (14B header + 16B tag), per-direction keys, 2048-packet replay window with atomic acceptance, nonce-exhaustion latch, symmetric inner-VIP ingress, lab `--key` mode |
 | 5 | Deployment and recovery — Debian install automation, restarts, stream loss, route rollback | Pending |
 | 6 | WireGuard — agent backend + client configuration, split tunneling | Pending |
@@ -67,6 +67,14 @@ bash tests/checks.sh --lab    # full gate: TUN/UDP ping + telemetry E2E + resour
 
 The lab steps use `sudo` only where TUN creation and namespaces require it, run in `mktemp`-isolated directories, refuse to touch resources they did not create, and clean up after themselves.
 
+Run the gate on a `fix/<slug>` or `feat/<slug>` branch. On `main`, the
+branch validator deliberately fails; it does not indicate a compilation or
+test failure. Do not override `BRANCH_NAME` to bypass this guard. The
+`Quality gate` GitHub Actions workflow runs this same non-privileged gate
+for every PR targeting `main`, including Go, .NET (real PostgreSQL through
+Testcontainers/Docker), and all three coverage thresholds. It does not
+claim privileged forwarding or application-connectivity validation.
+
 ## The Journey of my VPN
 
 The living ebook ships in **English, Spanish, and Brazilian Portuguese**, updated in the same change set as each milestone. Chapters map requirements to code and tests, explain the decisions and tradeoffs, and end with a reproducible lab exercise. Revision notes preserve the history when later chapters replace earlier approaches.
@@ -75,6 +83,8 @@ The living ebook ships in **English, Spanish, and Brazilian Portuguese**, update
 |---|---|---|---|
 | 1 — Raw TUN ↔ UDP | [read](book/en/ch01-raw-tun-udp.md) | [leer](book/es/ch01-raw-tun-udp.md) | [ler](book/pt-BR/ch01-raw-tun-udp.md) |
 | 2 — Telemetry loop | [read](book/en/ch02-telemetry-loop.md) | [leer](book/es/ch02-telemetry-loop.md) | [ler](book/pt-BR/ch02-telemetry-loop.md) |
+| 3 — Control plane | [read](book/en/ch03-control-plane.md) | [leer](book/es/ch03-control-plane.md) | [ler](book/pt-BR/ch03-control-plane.md) |
+| 4 — Data-plane crypto | [read](book/en/ch04-data-plane-crypto.md) | [leer](book/es/ch04-data-plane-crypto.md) | [ler](book/pt-BR/ch04-data-plane-crypto.md) |
 
 ## Project documents
 

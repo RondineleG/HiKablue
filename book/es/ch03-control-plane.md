@@ -123,7 +123,8 @@ contrato prometía:
   y debe coincidir con `register.node_id`, de modo que un certificado
   solo puede hablar como sí mismo.
 - **`NodeChannelService`.** El primer frame debe ser `NodeRegister`;
-  `stream_epoch` es el timestamp Unix-millis al conectar, y
+  `stream_epoch` es un ID numérico monótono iniciado con milisegundos Unix,
+  asignado al conectar (véase r2 abajo), y
   `NodeStreamRegistry` reemplaza atómicamente cualquier stream anterior
   (su CancellationTokenSource se cancela — el interruptor de fencing).
   Los heartbeats refrescan `nodes.last_seen_at` y el registro en memoria.
@@ -306,6 +307,67 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   compilación `protoc` limpia.
 - Cobertura: C# ≥ 95% de líneas.
 
+## r2 — Vida del stream y reconexiones
+
+Un fallo de recepción debe detener el heartbeat aunque el llamador siga
+vivo. Un fallo del heartbeat también debe cancelar una recepción bloqueada.
+En `agent-go/pkg/orchestrator/channel.go`, cada ejecución posee un contexto
+hijo y espera a su heartbeat antes de retornar:
+
+```go
+defer func() {
+	cancel()
+	<-heartbeatDone
+}()
+```
+
+La línea 1 programa la limpieza para cada retorno posterior al inicio del
+heartbeat. La línea 2 cancela solo el contexto hijo, desbloqueando la E/S
+gRPC y el temporizador. La línea 3 espera al cierre del canal de finalización.
+La línea 4 invoca la función diferida al retornar. El heartbeat también
+llama a `cancel()` cuando falla; `Run` informa ese error en vez de esperar
+indefinidamente en `Recv`. `TestRunCancelsStreamAfterReceiveFailure` y
+`TestRunHeartbeatFailureUnblocksReceive` prueban ambas direcciones con un
+stream programado, sin un endpoint vivo.
+
+Dos reconexiones pueden ocurrir en un milisegundo; el reloj puede retroceder.
+`NodeStreamRegistry.Attach` calcula lo siguiente bajo el mismo bloqueo que
+publica el stream sustituto:
+
+```csharp
+_lastEpoch = Math.Max(_timeProvider.GetUtcNow().ToUnixTimeMilliseconds(),
+    checked(_lastEpoch + 1));
+```
+
+La línea 1 obtiene los milisegundos Unix de un reloj inyectable. La línea 2
+elige al menos el ID anterior más uno; `checked` lanza una excepción en vez
+de desbordar. La asignación del epoch y la sustitución se serializan; la
+cancelación permanece fuera del bloqueo. El `Detach` antiguo no elimina al
+sucesor. `NodeStreamRegistryTests` cubre reloj congelado, retroceso del reloj,
+limpieza obsoleta y conexiones concurrentes. La monotonía vale **dentro de
+un registro/proceso**, no es un protocolo persistente entre control planes.
+
+**Términos:** `context.WithCancel` crea un ámbito hijo de cancelación;
+`defer` ejecuta limpieza al retornar; `<-heartbeatDone` espera al cierre de
+un canal; `Recv` lee una trama gRPC; `TimeProvider` proporciona el reloj;
+`Math.Max` elige el mayor número; `checked` detecta desbordamientos; un
+bloqueo serializa el acceso al estado compartido.
+
+**Reproducir:** desde `agent-go`, ejecutar `go test -race ./pkg/orchestrator`;
+desde la raíz del repositorio, ejecutar
+`dotnet test control-dotnet/VpnControl.Tests --filter FullyQualifiedName~NodeStreamRegistryTests`.
+Ambas comprobaciones focalizadas pasaron en la VM Ubuntu de desarrollo.
+Demuestran vida del stream/fencing, no reenvío de paquetes ni conectividad
+de aplicación. El nuevo workflow de PR `Quality gate` ejecuta
+`bash tests/checks.sh` con toolchains fijadas, PostgreSQL en Docker y los
+tres umbrales de cobertura ≥90%. Omite el lab privilegiado; el validador
+sigue exigiendo ramas `fix/<slug>` o `feat/<slug>`.
+
+**Ejercicio:** congelar el reloj de prueba, conectar un sustituto y retirar
+el epoch antiguo. Pista: usar
+`SameMillisecondReconnectGetsANewEpochAndSurvivesOldDetach`; comprobar que el
+segundo epoch es mayor y `TryGet` aún lo devuelve. No cambiar el reloj del host.
+
 ## Revisiones
 
 - `r0` — contratos (proto, AckErrorCode, campos de fencing), CA de
@@ -319,3 +381,6 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   register/heartbeat/ack, fencing). Esquema de outbox ampliado
   (`stream_epoch`, `backend_instance_id`, `status`, `attempts`,
   `next_retry_at`, `deadline` — migración `outbox-dispatch`).
+- `r2` — cancelación del contexto hijo y espera del heartbeat; epochs
+  monótonos dentro del proceso; regresiones y gate de calidad/cobertura
+  para PRs. No se afirma un nuevo hito ni resultado de red en vivo.

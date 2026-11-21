@@ -119,7 +119,8 @@ contract promised:
   and must equal `register.node_id`, so a certificate can only ever speak
   as itself.
 - **`NodeChannelService`.** The first frame must be `NodeRegister`;
-  `stream_epoch` is the Unix-millis timestamp at attach, `NodeStreamRegistry`
+  `stream_epoch` is a monotonic numeric ID seeded from Unix milliseconds,
+  allocated at attach (see r2 below). `NodeStreamRegistry`
   atomically replaces any previous stream (its CancellationTokenSource is
   cancelled — the fencing switch). Heartbeats refresh `nodes.last_seen_at`
   and the in-memory registry. A `CommandAck` is correlated by
@@ -280,6 +281,68 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
 - `openssl verify` on lab PKI artifacts; `protoc` compile clean.
 - Coverage: C# ≥ 95% line.
 
+## r2 — Stream lifetime and reconnect hardening
+
+A failed receive must stop the heartbeat even if the caller stays alive.
+A failed heartbeat must also cancel a blocked receive. In
+`agent-go/pkg/orchestrator/channel.go`, the run owns a child context and
+waits for its heartbeat before returning:
+
+```go
+defer func() {
+	cancel()
+	<-heartbeatDone
+}()
+```
+
+Line 1 schedules cleanup on every return after the heartbeat starts.
+Line 2 cancels only this run's child context, unblocking gRPC I/O and the
+ticker. Line 3 waits for the heartbeat's completion channel to close.
+Line 4 invokes the deferred function on return. The heartbeat also calls
+`cancel()` on failure; `Run` reports that error instead of waiting forever
+in `Recv`. `TestRunCancelsStreamAfterReceiveFailure` and
+`TestRunHeartbeatFailureUnblocksReceive` use a scripted stream to test
+both directions without a live endpoint.
+
+Two reconnects can occur in one millisecond; a clock can move backward.
+`NodeStreamRegistry.Attach` now computes this inside the same lock that
+publishes the replacement stream:
+
+```csharp
+_lastEpoch = Math.Max(_timeProvider.GetUtcNow().ToUnixTimeMilliseconds(),
+    checked(_lastEpoch + 1));
+```
+
+Line 1 takes the current Unix milliseconds from an injectable clock.
+Line 2 chooses at least the previous ID plus one; `checked` throws rather
+than wrapping at integer overflow. Epoch allocation and stream replacement
+are serialized, while cancellation stays outside the lock. An old stream's
+`Detach` cannot remove its successor. `NodeStreamRegistryTests` covers a
+frozen clock, clock rollback, stale cleanup and concurrent attaches.
+This is monotonic **within one registry/process**, not a durable,
+multi-control-plane fencing protocol.
+
+**Terms:** `context.WithCancel` creates a child cancellation scope;
+`defer` runs cleanup on return; `<-heartbeatDone` waits for a channel
+close; `Recv` reads a gRPC frame; `TimeProvider` supplies the clock;
+`Math.Max` selects the larger number; `checked` detects arithmetic
+overflow; a lock serializes access to shared state.
+
+**Reproduce:** from `agent-go`, run `go test -race ./pkg/orchestrator`;
+from the repository root, run
+`dotnet test control-dotnet/VpnControl.Tests --filter FullyQualifiedName~NodeStreamRegistryTests`.
+Both focused checks passed on the Ubuntu development VM. They prove
+stream lifetime/fencing, not packet forwarding or application connectivity.
+The new `Quality gate` PR workflow runs `bash tests/checks.sh` with pinned
+toolchains, Docker-backed PostgreSQL tests and all three ≥90% coverage
+gates. It skips the privileged lab, and the branch validator still
+requires `fix/<slug>` or `feat/<slug>`.
+
+**Exercise:** freeze the test clock, attach a replacement, then detach the
+old epoch. Hint: use `SameMillisecondReconnectGetsANewEpochAndSurvivesOldDetach`;
+check that the second epoch is larger and `TryGet` still returns it.
+Do not test this by changing the host clock.
+
 ## Revisions
 
 - `r0` — contracts (proto, AckErrorCode, fencing fields), lab CA, ADR-0001
@@ -291,3 +354,6 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   `pkg/orchestrator` (mTLS dial, register/heartbeat/ack loop, fencing).
   Outbox schema extended (`stream_epoch`, `backend_instance_id`, `status`,
   `attempts`, `next_retry_at`, `deadline` — migration `outbox-dispatch`).
+- `r2` — child-context cancellation and heartbeat join; monotonic
+  process-local stream epochs; regression tests and a PR quality/coverage
+  gate. No new milestone acceptance or live-network result is claimed.

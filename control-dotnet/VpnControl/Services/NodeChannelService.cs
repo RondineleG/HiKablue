@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Google.Protobuf;
@@ -63,12 +62,10 @@ public sealed class NodeChannelService(
                 "register node_id does not match the certificate identity"));
         }
 
-        var streamEpoch = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-            .ToString(CultureInfo.InvariantCulture);
         var closed = new CancellationTokenSource();
-        var active = new ActiveStream(streamEpoch, register.BackendInstanceId,
+        var active = streams.Attach(nodeId, register.BackendInstanceId,
             responseStream, closed);
-        streams.Attach(nodeId, active);
+        var streamEpoch = active.StreamEpoch;
 
         try
         {

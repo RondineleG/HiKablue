@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using Grpc.Core;
 using VpnControl.Proto;
 
@@ -18,26 +19,38 @@ public sealed record ActiveStream(
 /// entries for the life of each stream. A newer stream replaces a stale
 /// one and cancels it — fencing by construction.
 /// </summary>
-public sealed class NodeStreamRegistry
+public sealed class NodeStreamRegistry(TimeProvider? timeProvider = null)
 {
     private readonly ConcurrentDictionary<string, ActiveStream> _streams = new();
+    private readonly TimeProvider _timeProvider = timeProvider ?? TimeProvider.System;
+    private readonly object _attachLock = new();
+    private long _lastEpoch;
 
     /// Registers the stream; if a previous stream for the node is still
     /// attached it is cancelled so the agent cannot be fed from two
     /// streams at once.
-    public void Attach(string nodeId, ActiveStream stream)
+    public ActiveStream Attach(string nodeId, string backendInstanceId,
+        IServerStreamWriter<ControlCommand> writer, CancellationTokenSource closed)
     {
-        ActiveStream? replaced = null;
-        _streams.AddOrUpdate(nodeId, stream, (_, old) =>
+        ActiveStream? replaced;
+        ActiveStream stream;
+        lock (_attachLock)
         {
-            replaced = old;
-            return stream;
-        });
+            // Allocate and publish together: even a stopped/backward clock
+            // or concurrent reconnect cannot reuse or regress an epoch.
+            _lastEpoch = Math.Max(_timeProvider.GetUtcNow().ToUnixTimeMilliseconds(),
+                checked(_lastEpoch + 1));
+            stream = new ActiveStream(_lastEpoch.ToString(CultureInfo.InvariantCulture),
+                backendInstanceId, writer, closed);
+            _streams.TryGetValue(nodeId, out replaced);
+            _streams[nodeId] = stream;
+        }
         // Cancel outside the dictionary's internal lock: the cancelled
         // stream's continuation can run inline and calls Detach, which
         // needs the same bucket lock — cancelling inside the update
         // delegate can deadlock.
         replaced?.Closed.Cancel();
+        return stream;
     }
 
     public bool TryGet(string nodeId, out ActiveStream stream) =>

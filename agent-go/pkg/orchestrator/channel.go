@@ -61,7 +61,12 @@ func NewChannel(cfg Config, h Handler) *Channel {
 // fails. It sends NodeRegister first, heartbeats in a goroutine, and
 // dispatches commands with the spec fencing rules.
 func (c *Channel) Run(ctx context.Context, conn *grpc.ClientConn) error {
-	client := edgev1.NewEdgeOrchestratorClient(conn)
+	return c.run(ctx, edgev1.NewEdgeOrchestratorClient(conn))
+}
+
+func (c *Channel) run(ctx context.Context, client edgev1.EdgeOrchestratorClient) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	stream, err := client.NodeChannel(ctx)
 	if err != nil {
 		return fmt.Errorf("orchestrator: open NodeChannel: %w", err)
@@ -78,18 +83,34 @@ func (c *Channel) Run(ctx context.Context, conn *grpc.ClientConn) error {
 	if err := stream.Send(register); err != nil {
 		return fmt.Errorf("orchestrator: send NodeRegister: %w", err)
 	}
-	// The stream epoch is assigned by the server (unix-millis at stream
-	// creation); fencing on a locally computed timestamp would reject the
+	// The numeric stream epoch is assigned monotonically by the server;
+	// fencing on a locally computed timestamp would reject the
 	// first command whenever the agent clock runs ahead. Adopt the value
 	// stamped on the first command instead (epochGreater below).
 	c.streamEpoch.Store("")
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- c.heartbeatLoop(ctx, stream) }()
+	heartbeatDone := make(chan struct{})
+	var heartbeatErr error
+	go func() {
+		defer close(heartbeatDone)
+		heartbeatErr = c.heartbeatLoop(ctx, stream)
+		cancel()
+	}()
+	defer func() {
+		cancel()
+		<-heartbeatDone
+	}()
 
 	for {
 		cmd, err := stream.Recv()
 		if err != nil {
+			cancel()
+			<-heartbeatDone
+			if heartbeatErr != nil &&
+				!errors.Is(heartbeatErr, context.Canceled) &&
+				!errors.Is(heartbeatErr, context.DeadlineExceeded) {
+				return heartbeatErr
+			}
 			if errors.Is(err, io.EOF) {
 				err = fmt.Errorf("orchestrator: stream closed by server")
 			}
@@ -234,7 +255,7 @@ func (c *Channel) heartbeatLoop(ctx context.Context,
 	}
 }
 
-// epochLess compares two Unix-millis epoch strings numerically when
+// epochLess compares two numeric epoch strings numerically when
 // possible, lexically otherwise.
 func epochLess(a, b string) bool {
 	ai, aerr := strconv.ParseInt(a, 10, 64)

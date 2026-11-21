@@ -20,13 +20,19 @@ Name branches `feat/<slug>` for additive work and `fix/<slug>` for bug fixes. Us
 
 ## Milestone status
 
-- **Milestone 3 (control plane) delivered.** Schema lives in EF Core
+- **Milestone 3 (control-plane components) delivered.** Schema lives in EF Core
   migrations under `control-dotnet/VpnControl/Data/Migrations/`:
   `initial-control-plane` (nodes, sessions, ip_leases, outbox) and
   `outbox-dispatch` (stream_epoch, backend_instance_id, status, attempts,
   next_retry_at, deadline on outbox). Apply with `dotnet ef database
   update` or `db.Database.MigrateAsync()`. The Go orchestration client is
   delivered as `agent-go/pkg/orchestrator` (mTLS channel, fencing, ACKs);
-  wiring it into `cmd/vpn-agent` — which still runs the M1 metrics/HTTP
-  heartbeat loop — is deferred to the milestone-4 integration work along
+  wiring it into `cmd/vpn-agent` — which still fetches M1 metrics once
+  (the lab harness posts the HTTP heartbeat) — is deferred to milestone-4 integration along
   with the end-to-end gRPC lab.
+- **Milestone 4 in progress; phase 2 delivered (PR #14).** Rust has the
+  versioned AEAD wire format, directional keys, atomic replay acceptance,
+  nonce-exhaustion latch and symmetric inner-VIP validation in lab `--key`
+  mode. Dynamic peer operations, key lifecycle integration, CLI, local
+  expiration and reconciliation remain pending. Do not treat phase 2 as
+  end-to-end session acceptance or advance milestones 5–6.

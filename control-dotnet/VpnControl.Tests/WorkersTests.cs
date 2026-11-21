@@ -91,16 +91,15 @@ public sealed class WorkersTests : IAsyncLifetime
     {
         var row = await SeedPendingAsync();
         var writer = new CollectWriter();
-        _streams.Attach("edge-1",
-            new ActiveStream("epoch-1", "backend-1", writer,
-                new CancellationTokenSource()));
+        var active = _streams.Attach("edge-1", "backend-1", writer,
+            new CancellationTokenSource());
 
         var sent = await NewDispatcher().DispatchOnceAsync(CancellationToken.None);
 
         Assert.Equal(1, sent);
         var cmd = Assert.Single(writer.Sent);
         Assert.Equal(row.CommandId.ToString(), cmd.CommandId);
-        Assert.Equal("epoch-1", cmd.StreamEpoch);
+        Assert.Equal(active.StreamEpoch, cmd.StreamEpoch);
         Assert.Equal("backend-1", cmd.BackendInstanceId);
         Assert.Equal("user_revoked", cmd.RevokePeer.Reason);
         Assert.Equal(2UL, cmd.Revision);
@@ -130,8 +129,7 @@ public sealed class WorkersTests : IAsyncLifetime
     {
         await SeedPendingAsync(payload: "{\"bogus\":true}");
         var writer = new CollectWriter();
-        _streams.Attach("edge-1",
-            new ActiveStream("e", "b", writer, new CancellationTokenSource()));
+        _streams.Attach("edge-1", "b", writer, new CancellationTokenSource());
         var sent = await NewDispatcher().DispatchOnceAsync(CancellationToken.None);
         Assert.Equal(0, sent);
         await using var db = NewDb();
@@ -259,8 +257,7 @@ public sealed class WorkersTests : IAsyncLifetime
     {
         await SeedPendingAsync();
         var writer = new CollectWriter();
-        _streams.Attach("edge-1",
-            new ActiveStream("e1", "b1", writer, new CancellationTokenSource()));
+        _streams.Attach("edge-1", "b1", writer, new CancellationTokenSource());
         var worker = NewDispatcher();
         await worker.StartAsync(CancellationToken.None);
         await WaitForAsync(async () =>

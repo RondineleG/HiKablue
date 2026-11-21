@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"net"
 	"os"
 	"testing"
@@ -218,5 +219,70 @@ func TestHeartbeatLoopExitsOnSendError(t *testing.T) {
 	// With no orchestrator registered the send fails fast.
 	if err := c.heartbeatLoop(context.Background(), stream); err == nil {
 		t.Fatal("expected heartbeat send error")
+	}
+}
+
+type lifecycleClient struct {
+	stream *lifecycleStream
+}
+
+func (c lifecycleClient) NodeChannel(ctx context.Context,
+	_ ...grpc.CallOption) (edgev1.EdgeOrchestrator_NodeChannelClient, error) {
+	c.stream.ctx = ctx
+	return c.stream, nil
+}
+
+type lifecycleStream struct {
+	grpc.ClientStream
+	ctx          context.Context
+	recvErr      error
+	heartbeatErr error
+}
+
+func (s *lifecycleStream) Send(msg *edgev1.AgentMessage) error {
+	if msg.GetHeartbeat() != nil {
+		return s.heartbeatErr
+	}
+	return nil
+}
+
+func (s *lifecycleStream) Recv() (*edgev1.ControlCommand, error) {
+	if s.recvErr != nil {
+		return nil, s.recvErr
+	}
+	<-s.ctx.Done()
+	return nil, s.ctx.Err()
+}
+
+func TestRunCancelsStreamAfterReceiveFailure(t *testing.T) {
+	stream := &lifecycleStream{recvErr: errors.New("receive failed")}
+	c := NewChannel(Config{HeartbeatInterval: time.Hour}, &stubHandler{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := c.run(ctx, lifecycleClient{stream}); !errors.Is(err, stream.recvErr) {
+		t.Fatalf("expected receive error, got %v", err)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("Run cancelled its caller")
+	}
+	if stream.ctx.Err() == nil {
+		t.Fatal("Run returned without cancelling the stream and heartbeat")
+	}
+}
+
+func TestRunHeartbeatFailureUnblocksReceive(t *testing.T) {
+	stream := &lifecycleStream{heartbeatErr: errors.New("heartbeat failed")}
+	c := NewChannel(Config{HeartbeatInterval: time.Millisecond}, &stubHandler{})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- c.run(ctx, lifecycleClient{stream}) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, stream.heartbeatErr) {
+			t.Fatalf("expected heartbeat error, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat failure left Run blocked in Recv")
 	}
 }

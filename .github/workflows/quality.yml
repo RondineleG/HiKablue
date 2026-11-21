@@ -1,0 +1,50 @@
+name: Quality gate
+
+on:
+  pull_request:
+    # Match the existing CI scope: stacked PRs validate locally until retargeted.
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Go, .NET and coverage gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent-go/.go-version
+          cache-dependency-path: agent-go/go.sum
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Pinned Rust toolchain and coverage tools
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-rust
+
+      - name: Gate prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck iproute2 python3
+          docker info
+
+      - name: All non-privileged checks (PostgreSQL via Testcontainers)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BRANCH_NAME: ${{ github.head_ref }}
+        run: bash tests/checks.sh

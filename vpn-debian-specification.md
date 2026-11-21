@@ -138,9 +138,24 @@ are preserved rather than renumbered:
   `go.mod` + `.go-version`), and all three languages run real components.
   `proto/` contracts and PostgreSQL are milestone-3 scope, not leftover
   foundation work.
-- **3–6 — pending**, with dependencies: control plane and sessions build on
-  telemetry plumbing and the engine's control socket; full tunneling and
-  the HTTP check depend on the deferred forwarding/NAT work above.
+- **3 · Control-plane components — delivered** in PRs
+  [#11](https://github.com/RondineleG/HiKablue/pull/11),
+  [#12](https://github.com/RondineleG/HiKablue/pull/12) and
+  [#13](https://github.com/RondineleG/HiKablue/pull/13): contracts, lab CA,
+  PostgreSQL/EF Core, IPAM, sessions/outbox, SPIFFE mTLS `NodeChannel`,
+  dispatcher/reaper, and the Go orchestration library. Wiring that library
+  into the metrics-fetcher binary, applying commands to the Rust backend,
+  retiring the HTTP heartbeat and the cross-process gRPC lab remain
+  explicitly deferred to milestone 4; the full milestone-3 demonstration
+  is not yet an observed end-to-end result.
+- **4 · End-to-end session — in progress.** Phase 2 crypto shipped in
+  [PR #14](https://github.com/RondineleG/HiKablue/pull/14): AEAD framing,
+  directional keys, atomic replay acceptance, nonce-exhaustion latch and
+  symmetric inner-VIP checks in lab `--key` mode. CLI, dynamic peers,
+  restart-safe key lifecycle, local expiration and reconciliation remain.
+- **5–6 — pending.** Deployment/recovery and WireGuard follow the
+  end-to-end session work. Full tunneling and the HTTP check still depend
+  on the deferred forwarding/NAT work above.
 
 ### First implementation session
 

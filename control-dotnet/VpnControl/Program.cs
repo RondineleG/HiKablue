@@ -7,14 +7,13 @@ using VpnControl.Security;
 using VpnControl.Services;
 using VpnControl.Workers;
 
-// Milestone 1 slice of vpn-control: a local heartbeat intake plus a node
-// list, both backed by an in-memory registry. The HTTP heartbeat is
-// deliberately temporary — it is replaced by the gRPC NodeChannel stream
-// (with mTLS identity) in the control-plane milestone.
+// M3 adds persistent sessions and the mTLS NodeChannel alongside the M1
+// in-memory heartbeat registry. The legacy HTTP heartbeat stays until
+// the agent binary is wired to gRPC during M4 integration.
 //
 // SECURITY: the heartbeat endpoint answers only to the shared
-// X-Heartbeat-Token secret (a lab stand-in until the gRPC NodeChannel
-// carries mTLS identity) and must never face a network: the service
+// X-Heartbeat-Token secret (not the NodeChannel's mTLS identity) and must
+// never face a network: the service
 // refuses to start without a token or on any non-loopback URL, however
 // the URL is configured.
 var builder = WebApplication.CreateBuilder(args);
