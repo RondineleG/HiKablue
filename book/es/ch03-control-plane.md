@@ -123,23 +123,39 @@ contrato prometía:
   y debe coincidir con `register.node_id`, de modo que un certificado
   solo puede hablar como sí mismo.
 - **`NodeChannelService`.** El primer frame debe ser `NodeRegister`;
-  `stream_epoch` es el timestamp Unix-millis al conectar, y
+  `stream_epoch` es un ID numérico monótono iniciado con milisegundos Unix,
+  asignado al conectar (véase r2 abajo), y
   `NodeStreamRegistry` reemplaza atómicamente cualquier stream anterior
   (su CancellationTokenSource se cancela — el interruptor de fencing).
   Los heartbeats refrescan `nodes.last_seen_at` y el registro en memoria.
   Un `CommandAck` se correlaciona por `command_id` *y* se verifica: un
   ack con otro `stream_epoch` o `backend_instance_id` se ignora.
+  El ACK también debe coincidir con un intento `sent` guardado;
+  PostgreSQL bloquea esa fila mientras aplica el resultado.
   `APPLIED` marca la fila `acked` (y un ack de `RevokePeer` borra el lease
   y revoca la sesión); `FENCED_STREAM`/`FENCED_BACKEND` fallan la fila,
   cierran el stream y encolan un `SyncState` de resincronización;
-  `DEADLINE_EXCEEDED`, `REVISION_REGRESSION` e `INVALID_PAYLOAD` fallan
-  la fila e incrementan el contador de comandos fallidos; cualquier otro
-  caso devuelve el comando a `pending` con `next_retry_at` de 250 ms.
-- **`OutboxDispatcherWorker`.** Cada 100–250 ms toma filas pendientes con
-  `FOR UPDATE SKIP LOCKED`, cruza `node_id` con el stream vivo, estampa
-  epoch, backend y deadline de 30 s, envía el comando y marca la fila
-  `sent` con `attempts + 1`. ¿Sin stream? La fila espera en
-  `next_retry_at`.
+  `REVISION_REGRESSION` e `INVALID_PAYLOAD` marcan la fila como fallida.
+  En el primer intento, un rechazo por plazo marca la fila como fallida
+  y un error recuperable la devuelve a `pending` con un `next_retry_at`
+  de 250 ms. En un reenvío, esas respuestas pueden ser de un intento
+  anterior: el ACK no indica el número de intento. La fila sigue
+  `sent` hasta un `APPLIED` o la recuperación al vencer el plazo actual.
+- **`OutboxDispatcherWorker`.** Una transacción corta con
+  `FOR UPDATE SKIP LOCKED` toma el comando pendiente más antiguo de cada
+  nodo si ya toca enviarlo. Con un stream activo fija el epoch, el backend
+  y un plazo de 30 s, y confirma `sent` con `attempts + 1` **antes** de
+  escribir en gRPC. Las escrituras a distintos nodos son independientes.
+  Una escritura fallida no prueba que no hubo entrega: un intento sin
+  ACK se reintenta tras vencer su plazo, con el mismo ID, incluso sin
+  reconexión. Sin stream activo, espera en `pending` hasta `next_retry_at`.
+  Tras tres intentos sin confirmación, el worker marca el comando
+  `failed` sin liberar ningún lease. La migración `outbox-delivery-indexes`
+  añade índices parciales para intentos vencidos y el orden por nodo.
+
+  **Ejercicio:** Ejecuta `dotnet test control-dotnet/VpnControl.Tests --filter FullyQualifiedName~DispatcherDoesNotHoldLocksDuringWritesOrRollBackOtherNodes`
+  con Docker activo. Localiza los dos escritores de prueba: el stream
+  sano debe poder enviar su ACK mientras la otra escritura sigue bloqueada.
 - **`LeaseReaperWorker`.** Cada 60 s: las sesiones con `expires_at`
   vencido cuyo nodo lleva mudo más que la ventana de cuarentena (300 s
   por defecto) pasan a `quarantined`, su lease se borra y el log de
@@ -151,10 +167,20 @@ contrato prometía:
   cliente), keepalive 30 s/10 s y backoff de reconexión. `Channel.Run`
   envía `NodeRegister` primero, hace heartbeat cada 10 s en una goroutine
   (un `sendMu` serializa los `Send` concurrentes, que grpc-go prohíbe), y
-  `evaluate` verifica antes de despachar: `stream_epoch` más viejo →
-  `FENCED_STREAM`, `backend_instance_id` ajeno → `FENCED_BACKEND`,
-  `deadline` vencido → `DEADLINE_EXCEEDED`, `revision` ≤ aplicada →
-  `REVISION_REGRESSION`. Solo entonces el payload llega al handler local.
+  `evaluate` verifica antes de despachar: `stream_epoch` inválido o
+  anterior → `FENCED_STREAM`, `backend_instance_id` ajeno →
+  `FENCED_BACKEND`, `deadline` ausente o inválido → `INVALID_PAYLOAD`,
+  plazo vencido → `DEADLINE_EXCEEDED`, y un comando nuevo con
+  `revision` no nula ≤ aplicada → `REVISION_REGRESSION`. Los comandos
+  nuevos requieren relojes sincronizados: el plazo es absoluto, sin margen
+  ni reinicio al recibirlo. Un comando ya aplicado puede recibir otro
+  ACK `APPLIED` sin volver a llamar al handler.
+
+  Reutiliza `Channel` o pasa el mismo `ReplayState` al reemplazar el canal
+  del mismo nodo y backend. Así se mantienen en memoria la última revisión
+  aplicada y los IDs de comandos. Un nuevo ID de backend empieza de cero;
+  el registro solicita reconciliación mediante `SyncState`. No se
+  guarda en disco, por lo que el handler debe seguir siendo idempotente.
 
 Verificado localmente: 16 nuevos tests de C# (matriz de aceptación y
 rechazo SPIFFE, fencing, liberación del lease ante ack de revocación) y
@@ -306,6 +332,83 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   compilación `protoc` limpia.
 - Cobertura: C# ≥ 95% de líneas.
 
+## r2 — Vida del stream y reconexiones
+
+Un fallo de recepción debe detener el heartbeat aunque el llamador siga
+vivo. Un fallo del heartbeat también debe cancelar una recepción bloqueada.
+En `agent-go/pkg/orchestrator/channel.go`, cada ejecución posee un contexto
+hijo y espera a su heartbeat antes de retornar:
+
+```go
+defer func() {
+	cancel()
+	<-heartbeatDone
+}()
+```
+
+La línea 1 programa la limpieza para cada retorno posterior al inicio del
+heartbeat. La línea 2 cancela solo el contexto hijo, desbloqueando la E/S
+gRPC y el temporizador. La línea 3 espera al cierre del canal de finalización.
+La línea 4 invoca la función diferida al retornar. Un fallo de envío del
+heartbeat normalmente cancela la ejecución para desbloquear `Recv`. La
+excepción es `io.EOF`: gRPC puede dejar de aceptar envíos antes de que
+`Recv` entregue el estado final del servidor. `Run` deja activa la
+recepción y devuelve su resultado.
+`TestRunCancelsStreamAfterReceiveFailure`,
+`TestRunHeartbeatFailureUnblocksReceive` y
+`TestRunPreservesServerStatusAfterHeartbeatEOF` prueban estos casos con
+streams programados, sin un endpoint vivo.
+`TestHeartbeatLoopLeavesReceiveAliveAfterEOF` también comprueba que el
+contexto sigue activo después de que termine el heartbeat.
+`TestHeartbeatEOFLeavesFinalStatusReadableOnGRPCTransport` usa gRPC real
+en una conexión en memoria: el servidor recibe un heartbeat mientras
+está abierto y cierra con `PermissionDenied`. Tras el EOF en el envío
+siguiente, `Recv` todavía lee ese estado. No se reprodujo un bloqueo de
+recepción; se conserva el keepalive del transporte como respaldo.
+
+Dos reconexiones pueden ocurrir en un milisegundo; el reloj puede retroceder.
+`NodeStreamRegistry.Attach` calcula lo siguiente bajo el mismo bloqueo que
+publica el stream sustituto:
+
+```csharp
+_lastEpoch = Math.Max(_timeProvider.GetUtcNow().ToUnixTimeMilliseconds(),
+    checked(_lastEpoch + 1));
+```
+
+La línea 1 obtiene los milisegundos Unix de un reloj inyectable. La línea 2
+elige al menos el ID anterior más uno; `checked` lanza una excepción en vez
+de desbordar. La asignación del epoch y la sustitución se serializan; la
+cancelación permanece fuera del bloqueo. El `Detach` antiguo no elimina al
+sucesor. `NodeStreamRegistryTests` cubre reloj congelado, retroceso del reloj,
+limpieza obsoleta y conexiones concurrentes. La monotonía vale **dentro de
+un registro/proceso**, no es un protocolo persistente entre control planes.
+
+**Términos:** `context.WithCancel` crea un ámbito hijo de cancelación;
+`defer` ejecuta limpieza al retornar; `<-heartbeatDone` espera al cierre de
+un canal; `Recv` lee una trama gRPC o el estado final; `io.EOF` indica
+el fin de un stream; `TimeProvider` proporciona el reloj;
+`Math.Max` elige el mayor número; `checked` detecta desbordamientos; un
+bloqueo serializa el acceso al estado compartido.
+
+**Reproducir:** desde `agent-go`, ejecutar `go test -race ./pkg/orchestrator`;
+desde la raíz del repositorio, ejecutar
+`dotnet test control-dotnet/VpnControl.Tests --filter FullyQualifiedName~NodeStreamRegistryTests`.
+Ambas comprobaciones focalizadas pasaron en la VM Ubuntu de desarrollo.
+Demuestran vida del stream/fencing, no reenvío de paquetes ni conectividad
+de aplicación. El workflow de PR `Quality gate` está configurado para
+comprobar el formato y vet de Go, compilar .NET y ejecutar
+`COVERAGE_GATE=1 bash tests/coverage.sh` (tests con cobertura ≥90% para
+Rust, Go y .NET, incluido PostgreSQL en Docker). En el PR #15 el workflow
+no se inició por un bloqueo de facturación de GitHub; la evidencia anterior
+es local. `bash tests/checks.sh` sigue siendo el gate local completo sin
+privilegios. El validador independiente sigue exigiendo ramas
+`fix/<slug>` o `feat/<slug>`.
+
+**Ejercicio:** congelar el reloj de prueba, conectar un sustituto y retirar
+el epoch antiguo. Pista: usar
+`SameMillisecondReconnectGetsANewEpochAndSurvivesOldDetach`; comprobar que el
+segundo epoch es mayor y `TryGet` aún lo devuelve. No cambiar el reloj del host.
+
 ## Revisiones
 
 - `r0` — contratos (proto, AckErrorCode, campos de fencing), CA de
@@ -319,3 +422,6 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   register/heartbeat/ack, fencing). Esquema de outbox ampliado
   (`stream_epoch`, `backend_instance_id`, `status`, `attempts`,
   `next_retry_at`, `deadline` — migración `outbox-dispatch`).
+- `r2` — cancelación del contexto hijo y espera del heartbeat; epochs
+  monótonos dentro del proceso; regresiones y gate de calidad/cobertura
+  para PRs. No se afirma un nuevo hito ni resultado de red en vivo.

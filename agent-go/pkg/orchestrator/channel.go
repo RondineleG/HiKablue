@@ -11,10 +11,7 @@ import (
 	"time"
 
 	edgev1 "github.com/RondineleG/HiKablue/agent-go/gen/edge/v1"
-	"github.com/golang/protobuf/ptypes"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // defaultHeartbeatInterval is how often NodeHeartbeat is sent on the
@@ -33,18 +30,33 @@ type Handler interface {
 	EngineHealthy() bool
 }
 
-// Channel runs one NodeChannel stream against the control plane. Reconnects
-// create a new Channel with a fresh stream epoch.
-type Channel struct {
-	cfg       Config
-	handler   Handler
-	heartBeat func(ctx context.Context) (healthy bool, metrics map[string]int64)
-
-	streamEpoch     atomic.Value // string
+// ReplayState keeps command history in memory for one node/backend pair.
+// Reuse it only while that backend retains its applied state. The Go
+// process does not persist this history; handlers must remain idempotent.
+type ReplayState struct {
 	appliedRevision uint64
-	// Command ids already applied on this channel, so a replayed command
-	// gets its original APPLIED ack instead of REVISION_REGRESSION.
-	appliedCommands sync.Map
+	nodeID          string
+	backendID       string
+	runMu           sync.Mutex
+	appliedCommands map[string]struct{}
+}
+
+// NewReplayState binds an empty replay history to a running backend.
+func NewReplayState(nodeID, backendInstanceID string) *ReplayState {
+	return &ReplayState{
+		nodeID:          nodeID,
+		backendID:       backendInstanceID,
+		appliedCommands: make(map[string]struct{}),
+	}
+}
+
+// Channel runs one NodeChannel stream at a time. A subsequent Run resets
+// the stream epoch, not the replay history of its backend.
+type Channel struct {
+	cfg         Config
+	handler     Handler
+	replay      *ReplayState
+	streamEpoch uint64
 	// grpc-go forbids concurrent Send calls on one stream; the heartbeat
 	// goroutine and the command loop share this mutex.
 	sendMu sync.Mutex
@@ -52,16 +64,28 @@ type Channel struct {
 
 // NewChannel returns a Channel for the given config and command handler.
 func NewChannel(cfg Config, h Handler) *Channel {
-	c := &Channel{cfg: cfg, handler: h}
-	c.streamEpoch.Store("")
-	return c
+	replay := cfg.ReplayState
+	if replay == nil || replay.nodeID != cfg.NodeId || replay.backendID != cfg.BackendInstanceId ||
+		cfg.NodeId == "" || cfg.BackendInstanceId == "" {
+		replay = NewReplayState(cfg.NodeId, cfg.BackendInstanceId)
+	}
+	return &Channel{cfg: cfg, handler: h, replay: replay}
 }
 
 // Run keeps one NodeChannel alive until ctx is cancelled or the stream
 // fails. It sends NodeRegister first, heartbeats in a goroutine, and
 // dispatches commands with the spec fencing rules.
 func (c *Channel) Run(ctx context.Context, conn *grpc.ClientConn) error {
-	client := edgev1.NewEdgeOrchestratorClient(conn)
+	return c.run(ctx, edgev1.NewEdgeOrchestratorClient(conn))
+}
+
+func (c *Channel) run(ctx context.Context, client edgev1.EdgeOrchestratorClient) error {
+	if !c.replay.runMu.TryLock() {
+		return fmt.Errorf("orchestrator: backend already has an active channel")
+	}
+	defer c.replay.runMu.Unlock()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	stream, err := client.NodeChannel(ctx)
 	if err != nil {
 		return fmt.Errorf("orchestrator: open NodeChannel: %w", err)
@@ -72,24 +96,39 @@ func (c *Channel) Run(ctx context.Context, conn *grpc.ClientConn) error {
 			NodeId:            c.cfg.NodeId,
 			BackendInstanceId: c.cfg.BackendInstanceId,
 			AgentVersion:      c.cfg.AgentVersion,
-			AppliedRevision:   atomic.LoadUint64(&c.appliedRevision),
+			AppliedRevision:   atomic.LoadUint64(&c.replay.appliedRevision),
 		},
 	}}
 	if err := stream.Send(register); err != nil {
 		return fmt.Errorf("orchestrator: send NodeRegister: %w", err)
 	}
-	// The stream epoch is assigned by the server (unix-millis at stream
-	// creation); fencing on a locally computed timestamp would reject the
-	// first command whenever the agent clock runs ahead. Adopt the value
-	// stamped on the first command instead (epochGreater below).
-	c.streamEpoch.Store("")
+	// The numeric stream epoch is assigned monotonically by the server;
+	// fencing on a locally computed timestamp would reject the
+	// first command whenever the agent clock runs ahead.
+	c.streamEpoch = 0
 
-	errCh := make(chan error, 1)
-	go func() { errCh <- c.heartbeatLoop(ctx, stream) }()
+	heartbeatDone := make(chan struct{})
+	var heartbeatErr error
+	go func() {
+		defer close(heartbeatDone)
+		heartbeatErr = c.heartbeatLoop(ctx, cancel, stream)
+	}()
+	defer func() {
+		cancel()
+		<-heartbeatDone
+	}()
 
 	for {
 		cmd, err := stream.Recv()
 		if err != nil {
+			cancel()
+			<-heartbeatDone
+			if heartbeatErr != nil &&
+				!errors.Is(heartbeatErr, io.EOF) &&
+				!errors.Is(heartbeatErr, context.Canceled) &&
+				!errors.Is(heartbeatErr, context.DeadlineExceeded) {
+				return heartbeatErr
+			}
 			if errors.Is(err, io.EOF) {
 				err = fmt.Errorf("orchestrator: stream closed by server")
 			}
@@ -102,9 +141,11 @@ func (c *Channel) Run(ctx context.Context, conn *grpc.ClientConn) error {
 				ack.ErrorCode = edgev1.AckErrorCode_ACK_ERROR_INTERNAL
 				ack.Error = err.Error()
 			} else {
-				atomic.StoreUint64(&c.appliedRevision, cmd.Revision)
-				c.appliedCommands.Store(cmd.CommandId, struct{}{})
-				ack.AppliedRevision = cmd.Revision
+				if cmd.Revision > ack.AppliedRevision {
+					atomic.StoreUint64(&c.replay.appliedRevision, cmd.Revision)
+					ack.AppliedRevision = cmd.Revision
+				}
+				c.replay.appliedCommands[cmd.CommandId] = struct{}{}
 			}
 		}
 		if ack != nil {
@@ -129,54 +170,59 @@ func (c *Channel) evaluate(cmd *edgev1.ControlCommand, now time.Time) (
 		CommandId:         cmd.CommandId,
 		StreamEpoch:       cmd.StreamEpoch,
 		BackendInstanceId: c.cfg.BackendInstanceId,
-		AppliedRevision:   atomic.LoadUint64(&c.appliedRevision),
+		AppliedRevision:   atomic.LoadUint64(&c.replay.appliedRevision),
 		Outcome:           edgev1.AckOutcome_ACK_OUTCOME_APPLIED,
 	}
 
-	// Fence stale streams: an epoch older than the current stream's means the
-	// control plane has already fenced this stream off; reject, don't apply.
-	if epochLess(cmd.StreamEpoch, c.currentEpoch()) {
+	epoch, err := strconv.ParseUint(cmd.StreamEpoch, 10, 63)
+	if err != nil || epoch == 0 {
+		ack.Outcome = edgev1.AckOutcome_ACK_OUTCOME_REJECTED
+		ack.ErrorCode = edgev1.AckErrorCode_ACK_ERROR_FENCED_STREAM
+		ack.Error = "invalid stream_epoch"
+		return ack, false
+	}
+	if epoch < c.streamEpoch {
 		ack.Outcome = edgev1.AckOutcome_ACK_OUTCOME_REJECTED
 		ack.ErrorCode = edgev1.AckErrorCode_ACK_ERROR_FENCED_STREAM
 		ack.Error = "stale stream_epoch"
 		return ack, false
 	}
-	// Adopt the server's epoch on first valid command of this stream.
-	if epochGreater(cmd.StreamEpoch, c.currentEpoch()) {
-		c.streamEpoch.Store(cmd.StreamEpoch)
-	}
-	// A command this channel already applied is a replay (its ack was
-	// lost) — confirm it again without touching local state.
-	if _, applied := c.appliedCommands.Load(cmd.CommandId); applied {
-		return ack, false
-	}
 	// A command stamped for another backend instance means this process
 	// has been replaced; it must not apply anything anymore.
-	if cmd.BackendInstanceId != "" && cmd.BackendInstanceId != c.cfg.BackendInstanceId {
+	if cmd.BackendInstanceId != c.cfg.BackendInstanceId {
 		ack.Outcome = edgev1.AckOutcome_ACK_OUTCOME_REJECTED
 		ack.ErrorCode = edgev1.AckErrorCode_ACK_ERROR_FENCED_BACKEND
 		ack.Error = "command targets a replaced backend instance"
 		return ack, false
 	}
-	// Deadline fencing: expired commands must not change local state.
-	if cmd.Deadline != nil {
-		deadline, err := ptypes.Timestamp(cmd.Deadline)
-		if err == nil && now.After(deadline) {
-			ack.Outcome = edgev1.AckOutcome_ACK_OUTCOME_REJECTED
-			ack.ErrorCode = edgev1.AckErrorCode_ACK_ERROR_DEADLINE_EXCEEDED
-			ack.Error = fmt.Sprintf("deadline %s already expired", deadline.UTC())
-			return ack, false
-		}
+	if err := cmd.Deadline.CheckValid(); err != nil {
+		ack.Outcome = edgev1.AckOutcome_ACK_OUTCOME_REJECTED
+		ack.ErrorCode = edgev1.AckErrorCode_ACK_ERROR_INVALID_PAYLOAD
+		ack.Error = "missing or invalid deadline"
+		return ack, false
+	}
+	// An already-applied command can be confirmed without applying anything.
+	if _, applied := c.replay.appliedCommands[cmd.CommandId]; applied {
+		c.streamEpoch = epoch
+		return ack, false
+	}
+	deadline := cmd.Deadline.AsTime()
+	if !now.Before(deadline) {
+		ack.Outcome = edgev1.AckOutcome_ACK_OUTCOME_REJECTED
+		ack.ErrorCode = edgev1.AckErrorCode_ACK_ERROR_DEADLINE_EXCEEDED
+		ack.Error = fmt.Sprintf("deadline %s already expired", deadline)
+		return ack, false
 	}
 	// Revision fencing: a revision at or below the last applied one is a
 	// replay/regression — acknowledge it without re-applying state.
-	if cmd.Revision != 0 && cmd.Revision <= atomic.LoadUint64(&c.appliedRevision) {
+	if cmd.Revision != 0 && cmd.Revision <= ack.AppliedRevision {
 		ack.Outcome = edgev1.AckOutcome_ACK_OUTCOME_REJECTED
 		ack.ErrorCode = edgev1.AckErrorCode_ACK_ERROR_REVISION_REGRESSION
 		ack.Error = fmt.Sprintf("revision %d <= applied %d",
-			cmd.Revision, atomic.LoadUint64(&c.appliedRevision))
+			cmd.Revision, ack.AppliedRevision)
 		return ack, false
 	}
+	c.streamEpoch = epoch
 	return ack, true
 }
 
@@ -194,14 +240,7 @@ func (c *Channel) dispatch(ctx context.Context, cmd *edgev1.ControlCommand) erro
 	}
 }
 
-func (c *Channel) currentEpoch() string {
-	if s, ok := c.streamEpoch.Load().(string); ok {
-		return s
-	}
-	return ""
-}
-
-func (c *Channel) heartbeatLoop(ctx context.Context,
+func (c *Channel) heartbeatLoop(ctx context.Context, cancel context.CancelFunc,
 	stream edgev1.EdgeOrchestrator_NodeChannelClient) error {
 	interval := c.cfg.HeartbeatInterval
 	if interval <= 0 {
@@ -217,7 +256,7 @@ func (c *Channel) heartbeatLoop(ctx context.Context,
 			msg := &edgev1.AgentMessage{Payload: &edgev1.AgentMessage_Heartbeat{
 				Heartbeat: &edgev1.NodeHeartbeat{
 					BackendInstanceId: c.cfg.BackendInstanceId,
-					AppliedRevision:   atomic.LoadUint64(&c.appliedRevision),
+					AppliedRevision:   atomic.LoadUint64(&c.replay.appliedRevision),
 					EngineHealthy:     c.handler.EngineHealthy(),
 				},
 			}}
@@ -225,31 +264,13 @@ func (c *Channel) heartbeatLoop(ctx context.Context,
 			err := stream.Send(msg)
 			c.sendMu.Unlock()
 			if err != nil {
-				if s, ok := status.FromError(err); ok && s.Code() == codes.Unavailable {
-					return fmt.Errorf("orchestrator: heartbeat send: %w", err)
+				// gRPC Send may return EOF before Recv delivers the final status.
+				// Leave the receive alive in that case.
+				if !errors.Is(err, io.EOF) {
+					cancel()
 				}
 				return fmt.Errorf("orchestrator: heartbeat send: %w", err)
 			}
 		}
 	}
-}
-
-// epochLess compares two Unix-millis epoch strings numerically when
-// possible, lexically otherwise.
-func epochLess(a, b string) bool {
-	ai, aerr := strconv.ParseInt(a, 10, 64)
-	bi, berr := strconv.ParseInt(b, 10, 64)
-	if aerr == nil && berr == nil {
-		return ai < bi
-	}
-	return a < b
-}
-
-func epochGreater(a, b string) bool {
-	ai, aerr := strconv.ParseInt(a, 10, 64)
-	bi, berr := strconv.ParseInt(b, 10, 64)
-	if aerr == nil && berr == nil {
-		return ai > bi
-	}
-	return a > b
 }

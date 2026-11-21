@@ -97,6 +97,9 @@ public sealed class ControlDbContext(DbContextOptions<ControlDbContext> options)
             e.Property(o => o.CreatedAt).HasColumnName("created_at");
             e.HasIndex(o => new { o.Status, o.NextRetryAt })
                 .HasFilter("status = 'pending'");
+            e.HasIndex(o => o.Deadline).HasFilter("status = 'sent'");
+            e.HasIndex(o => new { o.NodeId, o.CreatedAt, o.CommandId })
+                .HasFilter("status IN ('pending', 'sent')");
             e.Property(o => o.DeliveredAt).HasColumnName("delivered_at");
             e.Property(o => o.AckedAt).HasColumnName("acked_at");
         });

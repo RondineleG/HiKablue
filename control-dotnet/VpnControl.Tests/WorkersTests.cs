@@ -56,29 +56,33 @@ public sealed class WorkersTests : IAsyncLifetime
             { ["VpnControl:QuarantineSeconds"] = "300" }).Build(),
         NullLogger<LeaseReaperWorker>.Instance);
 
-    private sealed class CollectWriter : IServerStreamWriter<ControlCommand>
+    private sealed class CollectWriter(Func<ControlCommand, CancellationToken, Task>? beforeWrite = null)
+        : IServerStreamWriter<ControlCommand>
     {
         public List<ControlCommand> Sent { get; } = new();
         public WriteOptions? WriteOptions { get; set; }
-        public Task WriteAsync(ControlCommand message)
-        {
-            Sent.Add(message);
-            return Task.CompletedTask;
-        }
+        public Task WriteAsync(ControlCommand message) => WriteAsync(message, CancellationToken.None);
 
-        public Task WriteAsync(ControlCommand message, CancellationToken ct) =>
-            WriteAsync(message);
+        public async Task WriteAsync(ControlCommand message, CancellationToken ct)
+        {
+            if (beforeWrite is not null)
+            {
+                await beforeWrite(message, ct);
+            }
+            Sent.Add(message);
+        }
     }
 
     private async Task<OutboxRow> SeedPendingAsync(string nodeId = "edge-1",
         string type = "RevokePeer",
-        string payload = """{"session_id":"00000000-0000-0000-0000-0000000000aa","lab_session_id":3,"reason":"user_revoked"}""")
+        string payload = """{"session_id":"00000000-0000-0000-0000-0000000000aa","lab_session_id":3,"reason":"user_revoked"}""",
+        DateTimeOffset? createdAt = null)
     {
         await using var db = NewDb();
         var row = new OutboxRow
         {
             CommandId = Guid.NewGuid(), NodeId = nodeId, CommandType = type,
-            Payload = payload, Revision = 2, CreatedAt = DateTimeOffset.UtcNow,
+            Payload = payload, Revision = 2, CreatedAt = createdAt ?? DateTimeOffset.UtcNow,
             Status = "pending"
         };
         db.Outbox.Add(row);
@@ -91,16 +95,15 @@ public sealed class WorkersTests : IAsyncLifetime
     {
         var row = await SeedPendingAsync();
         var writer = new CollectWriter();
-        _streams.Attach("edge-1",
-            new ActiveStream("epoch-1", "backend-1", writer,
-                new CancellationTokenSource()));
+        var active = _streams.Attach("edge-1", "backend-1", writer,
+            new CancellationTokenSource());
 
         var sent = await NewDispatcher().DispatchOnceAsync(CancellationToken.None);
 
         Assert.Equal(1, sent);
         var cmd = Assert.Single(writer.Sent);
         Assert.Equal(row.CommandId.ToString(), cmd.CommandId);
-        Assert.Equal("epoch-1", cmd.StreamEpoch);
+        Assert.Equal(active.StreamEpoch, cmd.StreamEpoch);
         Assert.Equal("backend-1", cmd.BackendInstanceId);
         Assert.Equal("user_revoked", cmd.RevokePeer.Reason);
         Assert.Equal(2UL, cmd.Revision);
@@ -125,13 +128,139 @@ public sealed class WorkersTests : IAsyncLifetime
         Assert.NotNull(row.NextRetryAt);
     }
 
+    private async Task ExpireAttemptAsync(Guid commandId)
+    {
+        await using var db = NewDb();
+        await db.Outbox.Where(o => o.CommandId == commandId)
+            .ExecuteUpdateAsync(o => o.SetProperty(r => r.Deadline, DateTimeOffset.UtcNow.AddSeconds(-1)));
+    }
+
+    [Fact]
+    public async Task DispatcherRetriesExpiredAttemptsInOrderWithoutReconnect()
+    {
+        var first = await SeedPendingAsync(createdAt: DateTimeOffset.UtcNow.AddMinutes(-1));
+        var second = await SeedPendingAsync();
+        var writer = new CollectWriter();
+        var active = _streams.Attach(first.NodeId, "b1", writer, new CancellationTokenSource());
+        var dispatcher = NewDispatcher();
+
+        Assert.Equal(1, await dispatcher.DispatchOnceAsync(CancellationToken.None));
+        Assert.Equal(0, await dispatcher.DispatchOnceAsync(CancellationToken.None));
+        Assert.Equal(first.CommandId.ToString(), Assert.Single(writer.Sent).CommandId);
+
+        await ExpireAttemptAsync(first.CommandId);
+        Assert.Equal(1, await dispatcher.DispatchOnceAsync(CancellationToken.None));
+        Assert.Equal(2, writer.Sent.Count);
+        Assert.Equal(writer.Sent[0].CommandId, writer.Sent[1].CommandId);
+        Assert.Equal(active.StreamEpoch, writer.Sent[1].StreamEpoch);
+        Assert.True(writer.Sent[1].Deadline.ToDateTimeOffset() > DateTimeOffset.UtcNow);
+
+        await using (var db = NewDb())
+        {
+            var retry = await db.Outbox.AsNoTracking().SingleAsync(o => o.CommandId == first.CommandId);
+            Assert.Equal("sent", retry.Status);
+            Assert.Equal(2, retry.Attempts);
+            Assert.Equal("pending", (await db.Outbox.SingleAsync(o => o.CommandId == second.CommandId)).Status);
+
+            var service = new NodeChannelService(db, _streams, new NodeRegistry(),
+                NullLogger<NodeChannelService>.Instance);
+            await service.OnCommandAckAsync(first.NodeId, active, new CommandAck
+            {
+                CommandId = retry.CommandId.ToString(), StreamEpoch = active.StreamEpoch,
+                BackendInstanceId = active.BackendInstanceId, Outcome = AckOutcome.Applied
+            }, CancellationToken.None);
+        }
+        Assert.Equal(1, await dispatcher.DispatchOnceAsync(CancellationToken.None));
+        Assert.Equal(second.CommandId.ToString(), writer.Sent[2].CommandId);
+    }
+
+    [Theory]
+    [InlineData(1, "pending")]
+    [InlineData(3, "failed")]
+    public async Task DispatcherRecoversExpiredAttemptsWithNoLiveStream(int attempts, string expected)
+    {
+        var row = await SeedPendingAsync();
+        await using var db = NewDb();
+        await db.Outbox.ExecuteUpdateAsync(o => o.SetProperty(r => r.Status, "sent")
+            .SetProperty(r => r.Attempts, attempts));
+        await ExpireAttemptAsync(row.CommandId);
+
+        Assert.Equal(0, await NewDispatcher().DispatchOnceAsync(CancellationToken.None));
+
+        var stored = await db.Outbox.SingleAsync();
+        Assert.Equal(expected, stored.Status);
+        Assert.Equal(attempts, stored.Attempts);
+        Assert.Equal(expected == "pending", stored.NextRetryAt.HasValue);
+    }
+
+    [Fact]
+    public async Task DispatcherDoesNotHoldLocksDuringWritesOrRollBackOtherNodes()
+    {
+        var broken = await SeedPendingAsync("broken", createdAt: DateTimeOffset.UtcNow.AddMinutes(-1));
+        var healthy = await SeedPendingAsync();
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var unblock = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var applied = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var brokenWriter = new CollectWriter(async (_, ct) =>
+        {
+            started.SetResult();
+            await unblock.Task.WaitAsync(ct);
+            throw new IOException("stream closed");
+        });
+        _streams.Attach(broken.NodeId, "b1", brokenWriter, new CancellationTokenSource());
+        ActiveStream active = null!;
+        var healthyWriter = new CollectWriter(async (command, ct) =>
+        {
+            await using var ackDb = NewDb();
+            var service = new NodeChannelService(ackDb, _streams, new NodeRegistry(),
+                NullLogger<NodeChannelService>.Instance);
+            await service.OnCommandAckAsync(healthy.NodeId, active, new CommandAck
+            {
+                CommandId = command.CommandId, StreamEpoch = command.StreamEpoch,
+                BackendInstanceId = command.BackendInstanceId, Outcome = AckOutcome.Applied
+            }, ct);
+            Assert.Equal("acked", (await ackDb.Outbox.AsNoTracking()
+                .SingleAsync(o => o.CommandId == healthy.CommandId, ct)).Status);
+            applied.SetResult();
+        });
+        active = _streams.Attach(healthy.NodeId, "b2", healthyWriter, new CancellationTokenSource());
+
+        var dispatch = NewDispatcher().DispatchOnceAsync(timeout.Token);
+        try
+        {
+            await started.Task.WaitAsync(timeout.Token);
+            await applied.Task.WaitAsync(timeout.Token);
+            Assert.Equal(0, await NewDispatcher().DispatchOnceAsync(timeout.Token));
+        }
+        finally
+        {
+            unblock.TrySetResult();
+            Assert.Equal(1, await dispatch);
+        }
+
+        Assert.Single(healthyWriter.Sent);
+        Assert.Empty(brokenWriter.Sent);
+        await using var db = NewDb();
+        var rows = await db.Outbox.ToDictionaryAsync(o => o.CommandId);
+        Assert.Equal("acked", rows[healthy.CommandId].Status);
+        Assert.NotNull(rows[healthy.CommandId].DeliveredAt);
+        Assert.Equal("sent", rows[broken.CommandId].Status);
+        Assert.Null(rows[broken.CommandId].DeliveredAt);
+
+        await ExpireAttemptAsync(broken.CommandId);
+        var retryWriter = new CollectWriter();
+        _streams.Attach(broken.NodeId, "b3", retryWriter, new CancellationTokenSource());
+        Assert.Equal(1, await NewDispatcher().DispatchOnceAsync(timeout.Token));
+        Assert.Equal(broken.CommandId.ToString(), Assert.Single(retryWriter.Sent).CommandId);
+    }
+
     [Fact]
     public async Task DispatcherFailsUnparseablePayloads()
     {
         await SeedPendingAsync(payload: "{\"bogus\":true}");
         var writer = new CollectWriter();
-        _streams.Attach("edge-1",
-            new ActiveStream("e", "b", writer, new CancellationTokenSource()));
+        _streams.Attach("edge-1", "b", writer, new CancellationTokenSource());
         var sent = await NewDispatcher().DispatchOnceAsync(CancellationToken.None);
         Assert.Equal(0, sent);
         await using var db = NewDb();
@@ -259,14 +388,13 @@ public sealed class WorkersTests : IAsyncLifetime
     {
         await SeedPendingAsync();
         var writer = new CollectWriter();
-        _streams.Attach("edge-1",
-            new ActiveStream("e1", "b1", writer, new CancellationTokenSource()));
+        _streams.Attach("edge-1", "b1", writer, new CancellationTokenSource());
         var worker = NewDispatcher();
         await worker.StartAsync(CancellationToken.None);
         await WaitForAsync(async () =>
         {
             await using var db = NewDb();
-            return await db.Outbox.AnyAsync(o => o.Status == "sent");
+            return await db.Outbox.AnyAsync(o => o.DeliveredAt != null);
         });
         await worker.StopAsync(CancellationToken.None);
         await using var verify = NewDb();

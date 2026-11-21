@@ -282,7 +282,7 @@ func command(epoch, backend string, revision uint64,
 func TestExpiredDeadlineRejectsWithoutStateChange(t *testing.T) {
 	h := &stubHandler{healthy: true}
 	c := newTestChannel(h)
-	c.streamEpoch.Store("1000")
+	c.streamEpoch = 1000
 
 	cmd := command("1000", "backend-1", 5, time.Now().Add(-time.Minute))
 	ack, dispatch := c.evaluate(cmd, time.Now())
@@ -303,7 +303,7 @@ func TestExpiredDeadlineRejectsWithoutStateChange(t *testing.T) {
 func TestStaleStreamEpochIsFenced(t *testing.T) {
 	h := &stubHandler{}
 	c := newTestChannel(h)
-	c.streamEpoch.Store("2000")
+	c.streamEpoch = 2000
 
 	cmd := command("1000", "backend-1", 5, time.Now().Add(time.Minute))
 	ack, dispatch := c.evaluate(cmd, time.Now())
@@ -315,8 +315,8 @@ func TestStaleStreamEpochIsFenced(t *testing.T) {
 func TestRevisionRegressionIsRejected(t *testing.T) {
 	h := &stubHandler{}
 	c := newTestChannel(h)
-	c.streamEpoch.Store("1000")
-	c.appliedRevision = 5
+	c.streamEpoch = 1000
+	c.replay.appliedRevision = 5
 
 	cmd := command("1000", "backend-1", 5, time.Now().Add(time.Minute))
 	ack, dispatch := c.evaluate(cmd, time.Now())
@@ -328,7 +328,7 @@ func TestRevisionRegressionIsRejected(t *testing.T) {
 func TestValidCommandDispatchesAndAcksApplied(t *testing.T) {
 	h := &stubHandler{}
 	c := newTestChannel(h)
-	c.streamEpoch.Store("1000")
+	c.streamEpoch = 1000
 
 	cmd := command("1000", "backend-1", 3, time.Now().Add(time.Minute))
 	ack, dispatch := c.evaluate(cmd, time.Now())
@@ -355,7 +355,7 @@ func TestHandlerErrorProducesErrorAck(t *testing.T) {
 func TestForeignBackendCommandIsFenced(t *testing.T) {
 	h := &stubHandler{}
 	c := newTestChannel(h)
-	c.streamEpoch.Store("1000")
+	c.streamEpoch = 1000
 
 	cmd := command("1000", "other-backend", 5, time.Now().Add(time.Minute))
 	ack, dispatch := c.evaluate(cmd, time.Now())
@@ -367,22 +367,22 @@ func TestForeignBackendCommandIsFenced(t *testing.T) {
 func TestNewerEpochIsAdopted(t *testing.T) {
 	h := &stubHandler{}
 	c := newTestChannel(h)
-	c.streamEpoch.Store("1000")
+	c.streamEpoch = 999
 
-	cmd := command("2000", "backend-1", 1, time.Now().Add(time.Minute))
+	cmd := command("1000", "backend-1", 1, time.Now().Add(time.Minute))
 	_, dispatch := c.evaluate(cmd, time.Now())
 	if !dispatch {
 		t.Fatal("newer epoch command should dispatch")
 	}
-	if got := c.currentEpoch(); got != "2000" {
-		t.Fatalf("expected adopted epoch 2000, got %s", got)
+	if got := c.streamEpoch; got != 1000 {
+		t.Fatalf("expected adopted epoch 1000, got %d", got)
 	}
 }
 
 func TestReplayedAppliedCommandIsConfirmedWithoutRedispatch(t *testing.T) {
 	h := &stubHandler{}
 	c := newTestChannel(h)
-	c.streamEpoch.Store("1000")
+	c.streamEpoch = 1000
 
 	cmd := command("1000", "backend-1", 3, time.Now().Add(time.Minute))
 	if _, dispatch := c.evaluate(cmd, time.Now()); !dispatch {
@@ -392,8 +392,8 @@ func TestReplayedAppliedCommandIsConfirmedWithoutRedispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Run records the applied command only after a successful dispatch.
-	c.appliedCommands.Store(cmd.CommandId, struct{}{})
-	c.appliedRevision = cmd.Revision
+	c.replay.appliedCommands[cmd.CommandId] = struct{}{}
+	c.replay.appliedRevision = cmd.Revision
 
 	ack, dispatch := c.evaluate(cmd, time.Now())
 	if dispatch {
@@ -407,13 +407,13 @@ func TestReplayedAppliedCommandIsConfirmedWithoutRedispatch(t *testing.T) {
 	}
 }
 
-func TestCommandWithoutDeadlineOrRevisionDispatches(t *testing.T) {
+func TestCommandWithoutRevisionDispatches(t *testing.T) {
 	h := &stubHandler{}
 	c := newTestChannel(h)
-	c.streamEpoch.Store("1000")
-	if _, dispatch := c.evaluate(command("1000", "backend-1", 0, time.Time{}),
+	c.streamEpoch = 1000
+	if _, dispatch := c.evaluate(command("1000", "backend-1", 0, time.Now().Add(time.Minute)),
 		time.Now()); !dispatch {
-		t.Fatal("missing deadline/revision should still dispatch")
+		t.Fatal("missing revision should still dispatch")
 	}
 }
 
@@ -436,12 +436,19 @@ func TestDispatchCoversRevokeSyncAndUnknown(t *testing.T) {
 	}
 }
 
-func TestEpochHelpersFallBackToLexicalCompare(t *testing.T) {
-	if !epochLess("abc", "abd") || epochLess("abd", "abc") {
-		t.Fatal("lexical compare failed")
-	}
-	if !epochGreater("abd", "abc") || epochGreater("abc", "abd") {
-		t.Fatal("lexical greater failed")
+func TestInvalidEpochIsRejectedBeforeAdoptingOrConfirmingReplay(t *testing.T) {
+	for _, epoch := range []string{"", "0", "-1", "abc", "1000x", "9223372036854775808"} {
+		t.Run(epoch, func(t *testing.T) {
+			now := time.Now()
+			c := newTestChannel(&stubHandler{})
+			cmd := command(epoch, "backend-1", 5, now.Add(time.Minute))
+			c.replay.appliedCommands[cmd.CommandId] = struct{}{}
+			ack, dispatch := c.evaluate(cmd, now)
+			if dispatch || ack.Outcome != edgev1.AckOutcome_ACK_OUTCOME_REJECTED ||
+				ack.ErrorCode != edgev1.AckErrorCode_ACK_ERROR_FENCED_STREAM || c.streamEpoch != 0 {
+				t.Fatalf("bad epoch changed fencing or bypassed replay validation: %v", ack)
+			}
+		})
 	}
 }
 
@@ -467,20 +474,33 @@ func TestNewMTLSConfigErrors(t *testing.T) {
 	}
 }
 
-func TestMalformedDeadlineDoesNotFence(t *testing.T) {
-	h := &stubHandler{}
-	c := newTestChannel(h)
-	c.streamEpoch.Store("1000")
-	cmd := command("1000", "backend-1", 1, time.Time{})
-	cmd.Deadline = &timestamppb.Timestamp{Seconds: -1e15, Nanos: -2e9}
-	if _, dispatch := c.evaluate(cmd, time.Now()); !dispatch {
-		t.Fatal("unparseable deadline should not fence the command")
+func TestInvalidDeadlineIsRejected(t *testing.T) {
+	for name, deadline := range map[string]*timestamppb.Timestamp{
+		"missing":     nil,
+		"bad seconds": {Seconds: -1e15},
+		"bad nanos":   {Nanos: -2e9},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := newTestChannel(&stubHandler{})
+			cmd := command("1000", "backend-1", 1, time.Time{})
+			cmd.Deadline = deadline
+			ack, dispatch := c.evaluate(cmd, time.Now())
+			if dispatch || ack.ErrorCode != edgev1.AckErrorCode_ACK_ERROR_INVALID_PAYLOAD || c.streamEpoch != 0 {
+				t.Fatalf("invalid deadline not rejected: %v", ack)
+			}
+		})
 	}
 }
 
-func TestCurrentEpochDefaultsWhenUnset(t *testing.T) {
+func TestDeadlineIsAnExclusiveAbsoluteBoundary(t *testing.T) {
+	now := time.Now()
 	c := newTestChannel(&stubHandler{})
-	if got := c.currentEpoch(); got != "" {
-		t.Fatalf("expected empty epoch, got %s", got)
+	cmd := command("1000", "backend-1", 1, now)
+	if ack, dispatch := c.evaluate(cmd, now.Add(-time.Nanosecond)); !dispatch {
+		t.Fatalf("command rejected before its deadline: %v", ack)
+	}
+	if ack, dispatch := c.evaluate(cmd, now); dispatch ||
+		ack.ErrorCode != edgev1.AckErrorCode_ACK_ERROR_DEADLINE_EXCEEDED {
+		t.Fatalf("command accepted at its deadline: %v", ack)
 	}
 }

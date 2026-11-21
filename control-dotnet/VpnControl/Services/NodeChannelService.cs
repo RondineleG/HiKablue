@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Google.Protobuf;
@@ -63,26 +62,25 @@ public sealed class NodeChannelService(
                 "register node_id does not match the certificate identity"));
         }
 
-        var streamEpoch = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
-            .ToString(CultureInfo.InvariantCulture);
         var closed = new CancellationTokenSource();
-        var active = new ActiveStream(streamEpoch, register.BackendInstanceId,
+        var active = streams.Attach(nodeId, register.BackendInstanceId,
             responseStream, closed);
-        streams.Attach(nodeId, active);
+        var streamEpoch = active.StreamEpoch;
 
         try
         {
-            await OnRegisterAsync(nodeId, register, ct);
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(
                 ct, closed.Token);
+            await OnRegisterAsync(nodeId, register, linked.Token, streamEpoch);
             while (await requestStream.MoveNext(linked.Token))
             {
-                await DispatchAsync(nodeId, active, requestStream.Current, ct);
+                await DispatchAsync(nodeId, active, requestStream.Current, linked.Token);
             }
         }
         finally
         {
             streams.Detach(nodeId, streamEpoch);
+            closed.Cancel();
             logger.LogInformation("node {NodeId} stream {Epoch} closed", nodeId, streamEpoch);
         }
     }
@@ -105,7 +103,7 @@ public sealed class NodeChannelService(
     /// always converges to full desired state.
     /// </summary>
     public async Task OnRegisterAsync(string nodeId, NodeRegister register,
-        CancellationToken ct)
+        CancellationToken ct, string? streamEpoch = null)
     {
         var count = await db.Nodes.CountAsync(ct);
         var exists = await db.Nodes.AnyAsync(n => n.NodeId == nodeId, ct);
@@ -130,9 +128,11 @@ public sealed class NodeChannelService(
         // Commands marked sent on a previous stream may have been lost
         // with it (at-least-once): requeue them so the dispatcher
         // re-delivers on this stream with fresh fencing fields.
-        await db.Database.ExecuteSqlAsync(
-            $"UPDATE outbox SET status = 'pending', next_retry_at = {now} WHERE node_id = {nodeId} AND status = 'sent'",
-            ct);
+        await db.Outbox
+            .Where(o => o.NodeId == nodeId && o.Status == "sent" &&
+                (streamEpoch == null || o.StreamEpoch != streamEpoch))
+            .ExecuteUpdateAsync(o => o.SetProperty(r => r.Status, "pending")
+                .SetProperty(r => r.NextRetryAt, now), ct);
 
         await EnqueueSyncStateAsync(nodeId, ct);
     }
@@ -172,18 +172,29 @@ public sealed class NodeChannelService(
             return;
         }
 
-        var row = await db.Outbox
-            .FirstOrDefaultAsync(o => o.CommandId == commandId && o.NodeId == nodeId, ct);
-        if (row is null || row.Status is "acked" or "failed")
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        // Lock the dispatch attempt before evaluating an ACK. This context
+        // spans the stream, so read the database instead of tracked values.
+        var rows = await db.Outbox.FromSql($"""
+            SELECT * FROM outbox WHERE command_id = {commandId} AND node_id = {nodeId}
+            FOR UPDATE
+            """).AsNoTracking().ToListAsync(ct);
+        var row = rows.SingleOrDefault();
+        if (row is not { Status: "sent" } || active.Closed.IsCancellationRequested ||
+            row.StreamEpoch != ack.StreamEpoch || row.BackendInstanceId != ack.BackendInstanceId)
         {
             return;
         }
-        // This context lives for the whole stream, so the tracked row may
-        // still show a stale status (e.g. "pending" while the dispatcher
-        // already re-sent it). Reload so the write below is a real change.
-        await db.Entry(row).ReloadAsync(ct);
+        var tracked = db.Outbox.Local.FirstOrDefault(o => o.CommandId == commandId);
+        if (tracked is not null)
+        {
+            db.Entry(tracked).State = EntityState.Detached;
+        }
+        db.Outbox.Attach(row);
 
         var now = DateTimeOffset.UtcNow;
+        var fence = false;
+        var resync = false;
         switch (ack.Outcome)
         {
             case AckOutcome.Applied:
@@ -197,9 +208,13 @@ public sealed class NodeChannelService(
                 ControlMetrics.CommandFailed();
                 // Stop feeding this stream and push a full resync: the
                 // agent proved it is not the instance we dispatched to.
-                active.Closed.Cancel();
-                await EnqueueSyncStateAsync(nodeId, ct);
+                fence = resync = true;
                 break;
+            case AckOutcome.Rejected or AckOutcome.Error when row.Attempts > 1 &&
+                ack.ErrorCode == AckErrorCode.AckErrorDeadlineExceeded:
+                // The wire ACK does not identify the attempt. A deadline
+                // rejection may refer to an older send on this stream.
+                return;
             case AckOutcome.Rejected:
             case AckOutcome.Error when ack.ErrorCode
                 is AckErrorCode.AckErrorDeadlineExceeded
@@ -213,15 +228,30 @@ public sealed class NodeChannelService(
                     // A regressed command can never be retried in place —
                     // the desired state must converge through a snapshot
                     // instead, which re-delivers anything still pending.
-                    await EnqueueSyncStateAsync(nodeId, ct);
+                    resync = true;
                 }
                 break;
             default: // ERROR with a retryable cause → back to pending
+                if (row.Attempts > 1)
+                {
+                    // Let the worker retry at the current deadline, rather
+                    // than discarding a newer attempt on a delayed error.
+                    return;
+                }
                 row.Status = "pending";
                 row.NextRetryAt = now.AddMilliseconds(250);
                 break;
         }
+        if (resync)
+        {
+            await EnqueueSyncStateCoreAsync(nodeId, ct);
+        }
         await db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+        if (fence)
+        {
+            active.Closed.Cancel();
+        }
     }
 
     /// Confirmed-revoke side effect: the lease is only released once the
@@ -270,10 +300,17 @@ public sealed class NodeChannelService(
     /// count/length/sha256 (proto contract, spec §5 snapshot validation).
     public async Task EnqueueSyncStateAsync(string nodeId, CancellationToken ct)
     {
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+        await EnqueueSyncStateCoreAsync(nodeId, ct);
+        await db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+    }
+
+    private async Task EnqueueSyncStateCoreAsync(string nodeId, CancellationToken ct)
+    {
         // Serialize against provisioning: session creation locks this same
         // row FOR UPDATE, so the peer set and the bumped revision always
         // describe one consistent point in time.
-        await using var tx = await db.Database.BeginTransactionAsync(ct);
         await db.Database.ExecuteSqlAsync(
             $"SELECT node_id FROM nodes WHERE node_id = {nodeId} FOR UPDATE", ct);
 
@@ -333,7 +370,5 @@ public sealed class NodeChannelService(
                 force = false
             })
         });
-        await db.SaveChangesAsync(ct);
-        await tx.CommitAsync(ct);
     }
 }

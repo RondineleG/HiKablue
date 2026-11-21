@@ -1,0 +1,57 @@
+name: Quality gate
+
+on:
+  pull_request:
+    # Match the existing CI scope: stacked PRs validate locally until retargeted.
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Go, .NET and coverage gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent-go/.go-version
+          cache-dependency-path: agent-go/go.sum
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Go formatting and vet
+        working-directory: agent-go
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            printf 'Files needing gofmt:\n%s\n' "$unformatted"
+            exit 1
+          fi
+          go vet ./...
+
+      - name: Build .NET control plane
+        run: dotnet build control-dotnet/VpnControl/VpnControl.csproj -v q --nologo
+
+      - name: Pinned Rust toolchain for coverage
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-rust
+
+      - name: Coverage collector self-test
+        run: bash tests/coverage.test.sh
+
+      - name: Tests and coverage (Rust, Go, .NET with PostgreSQL via Testcontainers)
+        env:
+          COVERAGE_GATE: "1"
+        run: bash tests/coverage.sh

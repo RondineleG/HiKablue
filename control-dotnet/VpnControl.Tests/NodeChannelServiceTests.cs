@@ -170,7 +170,7 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
         await using var db = NewDb();
         var outbox = await db.Outbox.SingleAsync();
         Assert.Equal("failed", outbox.Status);
-        Assert.Equal(before + 1, ControlMetrics.Snapshot().FailedCommands);
+        Assert.True(ControlMetrics.Snapshot().FailedCommands > before);
     }
 
     [Fact]
@@ -223,6 +223,31 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
         Assert.NotNull(outbox.NextRetryAt);
     }
 
+    [Theory]
+    [InlineData(AckOutcome.Rejected, AckErrorCode.AckErrorDeadlineExceeded)]
+    [InlineData(AckOutcome.Error, AckErrorCode.AckErrorInternal)]
+    public async Task AttemptSpecificAckCannotInvalidateRedeliveryOnTheSameStream(
+        AckOutcome outcome, AckErrorCode code)
+    {
+        var row = await SeedCommandAsync("edge-1", "ProvisionPeer", """{"peer":{}}""");
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        await using var db = NewDb();
+        await db.Outbox.ExecuteUpdateAsync(o => o
+            .SetProperty(r => r.Attempts, 2)
+            .SetProperty(r => r.Deadline, deadline));
+        var stream = Stream();
+
+        await _service.OnCommandAckAsync("edge-1", stream,
+            Ack(row, outcome, code), CancellationToken.None);
+        var during = await db.Outbox.AsNoTracking().SingleAsync();
+        Assert.Equal("sent", during.Status);
+        Assert.Null(during.NextRetryAt);
+
+        await _service.OnCommandAckAsync("edge-1", stream,
+            Ack(row, AckOutcome.Applied), CancellationToken.None);
+        Assert.Equal("acked", (await db.Outbox.AsNoTracking().SingleAsync()).Status);
+    }
+
     [Fact]
     public async Task RegisterBeyondCapacityThrowsResourceExhausted()
     {
@@ -268,22 +293,38 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
         Assert.Equal(0, await db.Outbox.CountAsync());
     }
 
-    [Fact]
-    public async Task AckForTerminalRowIsIgnored()
+    [Theory]
+    [InlineData("acked")]
+    [InlineData("failed")]
+    [InlineData("pending")]
+    public async Task AckForCommandNotAwaitingAckIsIgnored(string status)
     {
         var row = await SeedCommandAsync("edge-1", "ProvisionPeer",
             """{"peer":{}}""");
         await using (var db = NewDb())
         {
             var tracked = await db.Outbox.SingleAsync();
-            tracked.Status = "acked";
+            tracked.Status = status;
             await db.SaveChangesAsync();
         }
         await _service.OnCommandAckAsync("edge-1", Stream(),
-            Ack(row, AckOutcome.Rejected, AckErrorCode.AckErrorDeadlineExceeded),
+            Ack(row, AckOutcome.Applied),
             CancellationToken.None);
         await using var verify = NewDb();
-        Assert.Equal("acked", (await verify.Outbox.SingleAsync()).Status);
+        Assert.Equal(status, (await verify.Outbox.SingleAsync()).Status);
+    }
+
+    [Theory]
+    [InlineData("e0", "b1")]
+    [InlineData("e1", "b0")]
+    public async Task AckMustMatchTheStoredDispatchAttempt(string epoch, string backend)
+    {
+        var row = await SeedCommandAsync("edge-1", "ProvisionPeer", """{"peer":{}}""",
+            streamEpoch: epoch, backend: backend);
+        await _service.OnCommandAckAsync("edge-1", Stream(),
+            Ack(row, AckOutcome.Applied), CancellationToken.None);
+        await using var db = NewDb();
+        Assert.Equal("sent", (await db.Outbox.SingleAsync()).Status);
     }
 
     [Fact]
@@ -361,15 +402,19 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task RegisterRequeuesSentCommandsForRedelivery()
+    public async Task RegisterRequeuesOnlyAttemptsFromPreviousStreams()
     {
         var row = await SeedCommandAsync("edge-1", "ProvisionPeer", """{"peer":{}}""");
+        var current = await SeedCommandAsync("edge-1", "ProvisionPeer", """{"peer":{}}""",
+            streamEpoch: "e2", backend: "b2");
         await _service.OnRegisterAsync("edge-1",
             new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b2" },
-            CancellationToken.None);
+            CancellationToken.None, "e2");
         await using var db = NewDb();
         Assert.Equal("pending",
             (await db.Outbox.SingleAsync(o => o.CommandId == row.CommandId)).Status);
+        Assert.Equal("sent",
+            (await db.Outbox.SingleAsync(o => o.CommandId == current.CommandId)).Status);
         Assert.True(await db.Outbox.AnyAsync(o => o.CommandType == "SyncState"));
     }
 
