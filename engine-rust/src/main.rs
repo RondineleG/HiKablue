@@ -9,16 +9,20 @@ mod tun;
 mod wire;
 
 use clap::Parser;
+use zeroize::Zeroizing;
 
 use cli::{Cli, Mode};
 use forward::Config;
 
-fn parse_key_arg(hex: Option<String>) -> Option<[u8; 32]> {
-    hex.map(|k| match cli::parse_key_hex(&k) {
-        Ok(key) => key,
-        Err(err) => {
-            eprintln!("vpn-engine: invalid --key: {err}");
-            std::process::exit(2);
+fn parse_key_arg(hex: Option<String>) -> Option<Zeroizing<[u8; 32]>> {
+    hex.map(|k| {
+        let result = cli::parse_key_hex(&Zeroizing::new(k));
+        match result {
+            Ok(key) => key,
+            Err(err) => {
+                eprintln!("vpn-engine: invalid --key: {err}");
+                std::process::exit(2);
+            }
         }
     })
 }

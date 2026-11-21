@@ -67,7 +67,7 @@ pub fn parse(buf: &[u8]) -> io::Result<Header> {
 }
 
 /// The 12-byte AEAD IV: four zero bytes followed by the 8-byte
-/// little-endian counter (RFC 8439 nonce layout).
+/// little-endian counter. The wire counter is big-endian.
 pub fn aead_nonce(counter: u64) -> [u8; 12] {
     let mut iv = [0u8; 12];
     iv[4..].copy_from_slice(&counter.to_le_bytes());
@@ -102,6 +102,8 @@ mod tests {
     fn parse_rejects_bad_inputs() {
         assert!(parse(&[0u8; 5]).is_err()); // short
         let mut buf = [0u8; HEADER_LEN];
+        buf[0] = (VERSION << 4) | MSG_KEEPALIVE;
+        assert!(parse(&buf).is_ok());
         buf[1] = 1; // reserved byte set
         assert!(parse(&buf).is_err());
         buf[1] = 0;
@@ -116,8 +118,7 @@ mod tests {
     #[test]
     fn aead_nonce_maps_counter_to_last_eight_bytes() {
         let iv = aead_nonce(0x0102030405060708);
-        assert_eq!(&iv[..4], &[0, 0, 0, 0]);
-        assert_eq!(&iv[4..], &0x0102030405060708u64.to_le_bytes());
+        assert_eq!(iv, [0, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1]);
     }
 
     #[test]
@@ -125,5 +126,6 @@ mod tests {
         // 1400-byte inner packet -> exactly 1430 bytes of UDP payload.
         assert_eq!(HEADER_LEN + TAG_LEN, TOTAL_OVERHEAD);
         assert_eq!(1400 + TOTAL_OVERHEAD, 1430);
+        assert_eq!(1400 + TOTAL_OVERHEAD + 8 + 20, 1458);
     }
 }

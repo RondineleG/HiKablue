@@ -4,12 +4,13 @@ use std::net::Ipv4Addr;
 use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand};
+use zeroize::Zeroizing;
 
 pub const DEFAULT_MTU: u16 = 1400;
 pub const DEFAULT_TUN_NAME: &str = "tun0";
 pub const DEFAULT_METRICS_SOCK: &str = "/run/vpn/engine.sock";
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     name = "vpn-engine",
     version,
@@ -20,7 +21,7 @@ pub struct Cli {
     pub mode: Mode,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 pub enum Mode {
     /// Listen on a UDP bind address and learn the single lab peer from the
     /// first structurally valid packet whose inner source IP matches --peer.
@@ -29,7 +30,7 @@ pub enum Mode {
     Client(ClientArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct ServerArgs {
     /// Local UDP address to listen on, e.g. 192.168.56.11:51820.
     #[arg(long)]
@@ -44,7 +45,7 @@ pub struct ServerArgs {
     pub common: CommonArgs,
 }
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct ClientArgs {
     /// Local UDP address to bind, e.g. 0.0.0.0:0.
     #[arg(long, default_value = "0.0.0.0:0")]
@@ -64,7 +65,7 @@ pub struct ClientArgs {
     pub common: CommonArgs,
 }
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub struct CommonArgs {
     /// Inner MTU applied to the TUN interface. Capped at 1442 over IPv4
     /// or 1422 over IPv6 when --key is set (1500-byte path minus outer
@@ -113,13 +114,13 @@ fn hex_val(b: u8) -> Option<u8> {
 
 /// Parses a 64-hex-char string into a 32-byte key. Works on bytes so a
 /// multibyte UTF-8 char is a parse error, never a slice panic.
-pub fn parse_key_hex(s: &str) -> Result<[u8; 32], String> {
+pub fn parse_key_hex(s: &str) -> Result<Zeroizing<[u8; 32]>, String> {
     let s = s.trim();
     let bytes = s.as_bytes();
     if bytes.len() != 64 {
         return Err(format!("key must be 64 hex chars, got {}", s.len()));
     }
-    let mut key = [0u8; 32];
+    let mut key = Zeroizing::new([0u8; 32]);
     for (i, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let hi = hex_val(pair[0]);
         let lo = hex_val(pair[1]);

@@ -106,9 +106,9 @@ fora do bloco.
 de status — o provisionamento é assíncrono por design. Mesma chave com
 mesmo payload reproduz a resposta original; mesma chave com payload
 diferente é conflito **409**. `DELETE` move a sessão para `revoking` e
-enfileira `RevokePeer`; o lease de IP é *retido* até o nó confirmar —
-a liberação confirmada chega com o tratamento de `CommandAck` na fase 3.
-Toda resposta é `no-store`.
+enfileira `RevokePeer`. A liberação normal aguarda um `CommandAck` que
+confirme a remoção. A exceção do reaper no código atual está descrita abaixo.
+Respostas de sessão levam `no-store`.
 
 ## O loop se fecha: `NodeChannel`
 
@@ -158,11 +158,15 @@ prometia:
   com o Docker ativo. Localize os dois escritores de teste: o stream
   saudável deve conseguir confirmar o comando enquanto a outra escrita
   permanece bloqueada.
-- **`LeaseReaperWorker`.** A cada 60 s: sessões com `expires_at` vencido
-  cujo nó ficou mudo além da janela de quarentena (padrão 300 s) viram
-  `quarantined`, seu lease é apagado e o log de auditoria registra
-  `FORCED_REAPER_RELEASE` enquanto `ipam_reaped_leases_total` incrementa
-  — a invariante de hardening do ADR-0001, implementada.
+- **[`LeaseReaperWorker`](../../control-dotnet/VpnControl/Workers/LeaseReaperWorker.cs).** Por padrão, roda a cada 60 s e
+  move sessões vencidas para `quarantined` se o nó estiver sem reportar há
+  mais de 300 s ou nunca tiver sido visto. Apaga o lease sem ACK de remoção,
+  registra `FORCED_REAPER_RELEASE` e incrementa `ipam_reaped_leases_total`.
+  Isso **diverge da [especificação (§4)](../../vpn-debian-specification.md#4-session-lifecycle)**, que mantém o IP reservado
+  até confirmar a remoção, inclusive se o nó estiver indisponível. O
+  [ADR-0001](../../.agc/adr/0001-ipam-and-session-persistence.md) registra a exceção proposta, não uma mudança aprovada
+  na especificação. O silêncio do nó não prova que o peer foi removido.
+  Esse comportamento não atende ao critério de revogação.
 - **O lado Go.** O `pkg/orchestrator` disca com `credentials.NewTLS` (a
   CA de laboratório como única raiz, o cert do nó como identidade de
   cliente), keepalive 30 s/10 s e backoff de reconexão. O `Channel.Run`
@@ -418,6 +422,11 @@ segundo epoch é maior e `TryGet` ainda o retorna. Não altere o relógio do hos
   register/heartbeat/ack, fencing). Schema de outbox ampliado
   (`stream_epoch`, `backend_instance_id`, `status`, `attempts`,
   `next_retry_at`, `deadline` — migration `outbox-dispatch`).
-- `r2` — cancelamento do contexto filho e espera do heartbeat; epochs
+- `r2` — [PR #15](https://github.com/RondineleG/HiKablue/pull/15): cancelamento do contexto filho e espera do heartbeat; epochs
   monotônicos no processo; regressões e gate de qualidade/cobertura para
   PRs. Nenhum novo aceite de milestone ou resultado de rede é alegado.
+- `r3` — [PR #16](https://github.com/RondineleG/HiKablue/pull/16): recupera comandos sem ACK na outbox, isola
+  escritas entre nós, preserva o estado de replay em memória entre canais do
+  mesmo backend e rejeita prazos e epochs malformados. O prazo continua
+  exigindo relógios sincronizados. Os testes cobrem esses componentes, não
+  o provisionamento entre processos nem a revogação via backend Rust.
