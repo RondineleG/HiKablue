@@ -221,9 +221,9 @@ func TestHeartbeatLoopExitsOnSendError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// With no orchestrator registered the send fails fast.
-	if err := c.heartbeatLoop(ctx, cancel, stream); err == nil {
-		t.Fatal("expected heartbeat send error")
+	// With no orchestrator registered, gRPC ends the stream and Send returns EOF.
+	if err := c.heartbeatLoop(ctx, cancel, stream); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected EOF from heartbeat send, got %v", err)
 	}
 }
 
