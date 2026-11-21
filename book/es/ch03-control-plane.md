@@ -105,9 +105,9 @@ así un pool desalineado jamás puede alquilar direcciones fuera del bloque.
 de estado — el aprovisionamiento es asíncrono por diseño. La misma clave
 con el mismo payload reproduce la respuesta original; la misma clave con
 payload distinto es un conflicto **409**. `DELETE` mueve la sesión a
-`revoking` y encola `RevokePeer`; el lease de IP se *retiene* hasta que
-el nodo confirme — la liberación confirmada llega con el manejo de
-`CommandAck` en la fase 3. Toda respuesta es `no-store`.
+`revoking` y encola `RevokePeer`. La liberación normal espera un `CommandAck`
+que confirme la eliminación. La excepción del reaper en el código actual se
+describe abajo. Las respuestas de sesión llevan `no-store`.
 
 ## El bucle se cierra: `NodeChannel`
 
@@ -156,12 +156,15 @@ contrato prometía:
   **Ejercicio:** Ejecuta `dotnet test control-dotnet/VpnControl.Tests --filter FullyQualifiedName~DispatcherDoesNotHoldLocksDuringWritesOrRollBackOtherNodes`
   con Docker activo. Localiza los dos escritores de prueba: el stream
   sano debe poder enviar su ACK mientras la otra escritura sigue bloqueada.
-- **`LeaseReaperWorker`.** Cada 60 s: las sesiones con `expires_at`
-  vencido cuyo nodo lleva mudo más que la ventana de cuarentena (300 s
-  por defecto) pasan a `quarantined`, su lease se borra y el log de
-  auditoría registra `FORCED_REAPER_RELEASE` mientras
-  `ipam_reaped_leases_total` se incrementa — el invariante de
-  endurecimiento del ADR-0001, implementado.
+- **[`LeaseReaperWorker`](../../control-dotnet/VpnControl/Workers/LeaseReaperWorker.cs).** Por defecto, se ejecuta cada 60 s y
+  marca como `quarantined` las sesiones vencidas si el nodo lleva más de 300 s
+  sin reportar o no tiene fecha del último contacto. Borra el lease sin ACK de
+  eliminación, registra `FORCED_REAPER_RELEASE` e incrementa
+  `ipam_reaped_leases_total`. Esto **contradice la [especificación (§4)](../../vpn-debian-specification.md#4-session-lifecycle)**,
+  que reserva la IP hasta confirmar la eliminación, incluso si el nodo no
+  responde. El [ADR-0001](../../.agc/adr/0001-ipam-and-session-persistence.md) recoge la excepción propuesta, no un cambio
+  aprobado en la especificación. El silencio no demuestra que el par se haya
+  eliminado. Este comportamiento no satisface el criterio de revocación.
 - **El lado Go.** `pkg/orchestrator` marca con `credentials.NewTLS` (la
   CA de laboratorio como única raíz, el cert del nodo como identidad de
   cliente), keepalive 30 s/10 s y backoff de reconexión. `Channel.Run`
@@ -422,6 +425,11 @@ segundo epoch es mayor y `TryGet` aún lo devuelve. No cambiar el reloj del host
   register/heartbeat/ack, fencing). Esquema de outbox ampliado
   (`stream_epoch`, `backend_instance_id`, `status`, `attempts`,
   `next_retry_at`, `deadline` — migración `outbox-dispatch`).
-- `r2` — cancelación del contexto hijo y espera del heartbeat; epochs
+- `r2` — [PR #15](https://github.com/RondineleG/HiKablue/pull/15): cancelación del contexto hijo y espera del heartbeat; epochs
   monótonos dentro del proceso; regresiones y gate de calidad/cobertura
   para PRs. No se afirma un nuevo hito ni resultado de red en vivo.
+- `r3` — [PR #16](https://github.com/RondineleG/HiKablue/pull/16): recupera comandos sin ACK en el outbox,
+  aísla escrituras entre nodos, conserva el estado de replay en memoria entre
+  canales del mismo backend y rechaza plazos y epochs malformados. El plazo
+  sigue exigiendo relojes sincronizados. Las pruebas cubren estos componentes,
+  no el aprovisionamiento entre procesos ni la revocación vía el backend Rust.

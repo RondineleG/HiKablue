@@ -101,9 +101,9 @@ block.
 `POST /v1/sessions` with `Idempotency-Key` returns **202** plus a status
 URL — provisioning is async by design. Same key + same payload replays the
 original response; same key + different payload is a **409** conflict.
-`DELETE` moves a session to `revoking` and enqueues `RevokePeer`; the IP
-lease is *retained* until the node confirms — confirmed release lands with
-the `CommandAck` handling in phase 3. Every response is `no-store`.
+`DELETE` moves a session to `revoking` and enqueues `RevokePeer`. The normal
+release path waits for a matching `CommandAck` confirming removal. The reaper
+exception in the current code is described below. Session responses are `no-store`.
 
 ## The loop closes: `NodeChannel`
 
@@ -151,11 +151,15 @@ contract promised:
   **Exercise:** Run `dotnet test control-dotnet/VpnControl.Tests --filter FullyQualifiedName~DispatcherDoesNotHoldLocksDuringWritesOrRollBackOtherNodes`
   with Docker running. Find the two test writers: the healthy stream
   must be able to ACK while the other write is still blocked.
-- **`LeaseReaperWorker`.** Every 60 s: sessions past `expires_at` whose
-  node has been silent longer than the quarantine window (default 300 s)
-  move to `quarantined`, their lease is deleted, and the audit log shows
-  `FORCED_REAPER_RELEASE` while `ipam_reaped_leases_total` increments —
-  the ADR-0001 hardening invariant, implemented.
+- **[`LeaseReaperWorker`](../../control-dotnet/VpnControl/Workers/LeaseReaperWorker.cs).** By default, it runs every 60 s and
+  moves expired sessions to `quarantined` if the node has been silent for
+  more than 300 s or has no last-seen timestamp. It deletes the lease without
+  a removal ACK, logs `FORCED_REAPER_RELEASE` and increments
+  `ipam_reaped_leases_total`. This **diverges from the [specification (§4)](../../vpn-debian-specification.md#4-session-lifecycle)**,
+  which reserves the IP until removal is confirmed, including when a node is
+  unreachable. [ADR-0001](../../.agc/adr/0001-ipam-and-session-persistence.md) records the proposed exception, not an
+  approved change to the specification. Silence alone does not prove the peer
+  is gone. Do not treat this behavior as revocation acceptance.
 - **The Go side.** `pkg/orchestrator` dials with `credentials.NewTLS`
   (lab CA as the only root, node cert as client identity), keepalive
   30 s/10 s and reconnect backoff. `Channel.Run` sends `NodeRegister`
@@ -391,6 +395,11 @@ Do not test this by changing the host clock.
   `pkg/orchestrator` (mTLS dial, register/heartbeat/ack loop, fencing).
   Outbox schema extended (`stream_epoch`, `backend_instance_id`, `status`,
   `attempts`, `next_retry_at`, `deadline` — migration `outbox-dispatch`).
-- `r2` — child-context cancellation and heartbeat join; monotonic
+- `r2` — [PR #15](https://github.com/RondineleG/HiKablue/pull/15): child-context cancellation and heartbeat join; monotonic
   process-local stream epochs; regression tests and a PR quality/coverage
   gate. No new milestone acceptance or live-network result is claimed.
+- `r3` — [PR #16](https://github.com/RondineleG/HiKablue/pull/16): recover unacknowledged outbox commands,
+  isolate writes across nodes, keep replay state in memory across channels on
+  the same backend, and reject malformed deadlines and epochs. The deadline
+  still requires synchronized clocks. The tests cover these building blocks,
+  not cross-process provisioning or revocation through the Rust backend.

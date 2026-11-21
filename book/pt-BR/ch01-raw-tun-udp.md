@@ -13,6 +13,12 @@ dois endereços que ele carrega.
 > de um laboratório isolado e autorizado (`.agc/RULES.md` LAB-01). Nada deste
 > capítulo pertence a um caminho de produção.
 
+> **Capítulo histórico.** Os exemplos e resultados observados usam a
+> [revisão da Fase 1](https://github.com/RondineleG/HiKablue/blob/909c31e18bb75db34be1511de2bbf667c1338906/book/pt-BR/ch01-raw-tun-udp.md).
+> O lab de namespaces da `main` agora usa AEAD; veja o
+> [Capítulo 4](ch04-data-plane-crypto.md) para o transporte cifrado e sua
+> validação separada.
+
 ## As duas histórias que cada pacote conta
 
 Veja o laboratório que vamos usar:
@@ -390,8 +396,9 @@ só vale a checagem de destino (o `else if` acima).
 
 ## Execute você mesmo
 
-Compile e execute o laboratório de dois nós exatamente como em
-`engine-rust/README.md` (servidor em A, cliente em B) e depois:
+Compile o motor da revisão fixada da Fase 1 e siga o
+[README do laboratório](https://github.com/RondineleG/HiKablue/blob/909c31e18bb75db34be1511de2bbf667c1338906/engine-rust/README.md)
+(servidor em A, cliente em B). Em seguida:
 
 ```sh
 ping 10.80.1.1        # em B — espere respostas
@@ -421,7 +428,7 @@ underlay (`172.30.0.11/12` em vez de `192.168.56.11/12`).
 | Verificação | Ambiente | Observado |
 |---|---|---|
 | `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 avisos; 28/28 testes passam |
-| `tests/lab/netns-ping.sh` (dois nós `ip netns` sobre um par veth) | Ubuntu 22.04 | PASS: 3/3 pings em cada direção, TUN removido ao encerrar |
+| [`tests/lab/netns-ping.sh`](https://github.com/RondineleG/HiKablue/blob/909c31e18bb75db34be1511de2bbf667c1338906/tests/lab/netns-ping.sh) (dois nós `ip netns` sobre um par veth) | Ubuntu 22.04 | PASS: 3/3 pings em cada direção, TUN removido ao encerrar |
 | Mesmo script com um `hik-lab-a` estranho presente | Ubuntu 22.04 | recusado antes de tocá-lo (LAB-02); o namespace sobreviveu |
 | Ping `10.80.1.1` a partir de B e `10.80.1.2` a partir de A | Contêineres Debian 13 (trixie), rede `hikablue-lab` | 3/3 respostas em cada direção |
 | Mesmos pings | Contêineres Debian 12 (bookworm) | 3/3 respostas em cada direção |
@@ -443,8 +450,9 @@ No nó A, rode as duas capturas enquanto B faz um ping:
 ```sh
 sudo tcpdump -c1 -ni eth0 udp port 51820 &
 sudo tcpdump -c1 -ni tun0 icmp &
-ping -c1 10.80.1.2        # em B? Não — primeiro preveja.
 ```
+
+No terminal do nó B, rode `ping -c1 10.80.1.1` depois de fazer sua previsão.
 
 1. Que linha a `eth0` vai imprimir: endereços `10.80.1.x` ou `192.168.56.x`?
 2. Que linha a `tun0` vai imprimir?
@@ -476,3 +484,4 @@ resposta de volta.
   pendente, identificadores preservados), e o README raiz agora separa o ping
   ICMP verificado da verificação HTTP adiada. Nenhum conteúdo do capítulo
   mudou.
+- `r5` — Fixa o lab de UDP em claro e sua evidência à Fase 1; aponta para o Capítulo 4.

@@ -13,6 +13,11 @@ apart.
 > authorized lab only (`.agc/RULES.md` LAB-01). Nothing in this chapter
 > belongs on a production path.
 
+> **Historical chapter.** The examples and observed results use the
+> [Phase 1 revision](https://github.com/RondineleG/HiKablue/blob/909c31e18bb75db34be1511de2bbf667c1338906/book/en/ch01-raw-tun-udp.md).
+> The namespace lab on `main` now uses AEAD; see [Chapter 4](ch04-data-plane-crypto.md)
+> for the encrypted path and its separate evidence.
+
 ## The two stories every packet tells
 
 Look at the lab we will use:
@@ -389,7 +394,8 @@ connected to `--remote`, so only the destination check applies (the
 
 ## Run it yourself
 
-Build and run the two-node lab exactly as in `engine-rust/README.md`
+Build the engine from the pinned Phase 1 revision and follow its
+[lab README](https://github.com/RondineleG/HiKablue/blob/909c31e18bb75db34be1511de2bbf667c1338906/engine-rust/README.md)
 (server on A, client on B), then:
 
 ```sh
@@ -420,7 +426,7 @@ addresses (`172.30.0.11/12` instead of `192.168.56.11/12`).
 | Check | Environment | Observed |
 |---|---|---|
 | `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 warnings; 28/28 tests pass |
-| `tests/lab/netns-ping.sh` (two `ip netns` nodes on a veth pair) | Ubuntu 22.04 | PASS: 3/3 pings each way, TUN gone after shutdown |
+| [`tests/lab/netns-ping.sh`](https://github.com/RondineleG/HiKablue/blob/909c31e18bb75db34be1511de2bbf667c1338906/tests/lab/netns-ping.sh) (two `ip netns` nodes on a veth pair) | Ubuntu 22.04 | PASS: 3/3 pings each way, TUN gone after shutdown |
 | Same script with a foreign `hik-lab-a` present | Ubuntu 22.04 | refused before touching it (LAB-02); namespace survived |
 | Ping `10.80.1.1` from B and `10.80.1.2` from A | Debian 13 (trixie) containers, `hikablue-lab` net | 3/3 replies each direction |
 | Same pings | Debian 12 (bookworm) containers | 3/3 replies each direction |
@@ -442,8 +448,9 @@ On node A, run both captures while B pings once:
 ```sh
 sudo tcpdump -c1 -ni eth0 udp port 51820 &
 sudo tcpdump -c1 -ni tun0 icmp &
-ping -c1 10.80.1.2        # run this on B? No — predict first.
 ```
+
+In node B's terminal, run `ping -c1 10.80.1.1` after making your prediction.
 
 1. Which line will `eth0` print: addresses `10.80.1.x` or `192.168.56.x`?
 2. Which line will `tun0` print?
@@ -473,3 +480,4 @@ One `ping -c1` yields two datagrams — request out, reply back.
   1 still pending, identifiers preserved), and the root README now separates
   the verified ICMP ping from the deferred HTTP check. No chapter content
   changed.
+- `r5` — Pin the raw UDP lab and its evidence to Phase 1; link to Chapter 4.

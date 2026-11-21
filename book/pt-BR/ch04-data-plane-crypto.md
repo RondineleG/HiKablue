@@ -26,10 +26,10 @@ como AAD, seguido do texto cifrado e de uma tag Poly1305 de 16 bytes:
 ```text
 [0]     u8   versão (nibble alto, v1) | tipo (nibble baixo: 0x01 DATA, 0x02 KEEPALIVE)
 [1]     u8   reservado (0x00)
-[2..6]  u32  session_id (big-endian)
+[2..6]  u32  sender_index (identificador de sessão local ao nó, big-endian)
 [6..14] u64  contador (big-endian)
-[14..]       payload cifrado
-[..-16]      tag AEAD
+[14..len-16)  payload cifrado
+[len-16..len) tag AEAD
 ```
 
 Overhead total: **58 bytes** (20 IPv4 + 8 UDP + 14 + 16). Um pacote
@@ -41,8 +41,10 @@ Duas observações sobre o que o leitor não vê no wire:
 - **O IV do AEAD não viaja**: ele é reconstruído como 4 bytes zero mais
   o contador de 8 bytes em *little-endian* (`frame::aead_nonce`). O
   contador no cabeçalho é big-endian — são convenções independentes.
-- **O AAD protege o próprio cabeçalho**: mexer no tipo, no session_id
-  ou no contador quebra a tag antes de qualquer outra verificação.
+- **O AAD protege todo o cabeçalho.** Antes de verificar a tag, `open`
+  checa o tamanho do frame, a estrutura do cabeçalho, o índice esperado
+  do emissor e a janela de replay sem alterá-la. Um cabeçalho modificado
+  que passa nessas verificações falha na autenticação.
 
 ## Uma chave por direção
 
@@ -104,6 +106,11 @@ para o cabeçalho), a tag cai no tailroom de 16 bytes, e o decrypt
 reescreve o plaintext no mesmo lugar do ciphertext — `split_at_mut`
 entrega regiões disjuntas para AAD, texto e tag sem um único `Vec`.
 
+[`recv_datagram`](../../engine-rust/src/forward.rs) usa `recvmsg(MSG_TRUNC)` para obter
+o tamanho real do datagrama UDP. Se exceder o buffer de recepção de
+2048 bytes, o motor descarta o datagrama antes de analisar o cabeçalho
+ou decifrar, em vez de processar um prefixo truncado.
+
 ## Ingresso simétrico
 
 Servidor e cliente aplicam a mesma regra simétrica: o pacote interno
@@ -115,6 +122,10 @@ seu próprio `--peer <server-vip>` — a autenticação prova quem enviou o
 datagrama, mas só essa regra decide quais endereços internos ele pode
 carregar. Drops por causa vão para métricas separadas:
 `invalid_inner_src_total`, `invalid_inner_dst_total`, `dropped_pkts`.
+
+**Lacuna conhecida.** A [especificação (§6)](../../vpn-debian-specification.md#6-experimental-rust-transport) exige um
+`KEEPALIVE` vazio. O motor envia keepalives vazios, mas não confere esse
+tamanho na recepção. Um keepalive autenticado com conteúdo não é escrito no TUN.
 
 ## Lab
 
@@ -128,26 +139,32 @@ retrocompatibilidade.
 
 ## O que foi verificado
 
-A execução original da fase 2 (r0):
+**Base histórica (`r0`, [PR #14](https://github.com/RondineleG/HiKablue/pull/14)).**
+A execução registrada
+passou em 86 testes Rust e no gate completo do lab (15/15). Esses resultados
+descrevem a implementação original, não uma verificação de rede da `r1`.
 
-- `cargo test`: 86 testes — janela nas bordas ±2047/2048 e salto de
-  5000, vetor RFC 8439 contra a saída do próprio crate, bit-flip no AAD
-  sem tocar a janela, latch de exaustão, forged + replay dropados antes
-  do TUN, keepalive selado observado no wire nos dois papéis, replay
-  entre endpoints sem envenenar a janela.
-- `tests/checks.sh --lab`: ALL PASSED 15/15; cobertura Rust ≥ 95%.
-- **Não verificado**: derivação de chave cruzando processos reais
-  (o lab usa o mesmo PSK dos dois lados, não entrega via controle) —
-  esperado na fase de `key_epoch`.
+**Revisão de hardening (`r1`, [PR #17](https://github.com/RondineleG/HiKablue/pull/17)).**
+Na VM Ubuntu de
+desenvolvimento, passaram 91 testes Rust e o build de release. O gate
+local aprovou 12 verificações e pulou o lab privilegiado. O GitHub Actions
+não iniciou por bloqueio de cobrança. O ping bidirecional do lab não foi
+reexecutado nesta revisão. Encaminhamento pelo nó, conectividade de
+aplicações e provisionamento de chaves entre processos não foram verificados.
 
-`r1` troca a comparação da biblioteca com ela mesma pelo
-[vetor publicado no RFC 8439, apêndice A.5](https://www.rfc-editor.org/rfc/rfc8439.html#appendix-A.5).
-Rode `cargo test --locked --manifest-path engine-rust/Cargo.toml` da raiz
-para verificar o IV, o cabeçalho autenticado, o teto concorrente e a
-troca de sessão com época acima de `u32::MAX`. Não cobre provisionamento,
-encaminhamento privilegiado ou conectividade de aplicações. O ajuste do
-máximo tamanho de segmento TCP (MSS) fica para o túnel completo: 1360
-para IPv4 interno com MTU 1400.
+Na raiz do repositório, rode
+`cargo test --locked --manifest-path engine-rust/Cargo.toml`. A tabela
+mostra o que os testes verificam. O ajuste de MSS fica para a fase de
+túnel completo: 1360 para IPv4 interno com MTU 1400.
+
+| Requisito | Código | Teste |
+|---|---|---|
+| IV e overhead IPv4 de 58 bytes | [`wire/frame.rs`](../../engine-rust/src/wire/frame.rs) | `aead_nonce_maps_counter_to_last_eight_bytes`, `overhead_constants_match_spec` |
+| Contadores no limite da janela de replay de 2048 pacotes | [`crypto/replay.rs`](../../engine-rust/src/crypto/replay.rs) | `boundary_minus_2047_passes_minus_2048_fails` |
+| Vetor publicado do [RFC 8439 A.5](https://www.rfc-editor.org/rfc/rfc8439.html#appendix-A.5), em vez da comparação da biblioteca com ela mesma | [`crypto/session.rs`](../../engine-rust/src/crypto/session.rs) | `rfc8439_vector_matches_iv_mapping` |
+| Cabeçalho alterado não modifica o estado de replay; duplicata concorrente só passa uma vez | [`crypto/session.rs`](../../engine-rust/src/crypto/session.rs) | `bitflip_in_header_fails_auth_and_leaves_replay_untouched`, `concurrent_open_accepts_each_nonce_once` |
+| Teto atômico de TX; sessão substituta com epoch de 64 bits e novas chaves | [`crypto/session.rs`](../../engine-rust/src/crypto/session.rs) | `concurrent_nonce_allocation_stops_at_the_ceiling`, `replacement_keeps_full_epoch_and_uses_fresh_directional_keys` |
+| Detecção de truncamento UDP; validação simétrica no loop de teste | [`forward.rs`](../../engine-rust/src/forward.rs) | `recv_datagram_reports_real_length_and_source`, `run_loop_client_and_server_scenarios` |
 
 ## Lendo o código
 
@@ -273,3 +290,4 @@ E um desafio: `last_seq = 4100`. O pacote com `seq = 2051` passa em
 - `r0` — AEAD, janela de replay, latch de nonce, ingresso simétrico,
   `--key`/`--sender-index`/`--peer-index`/`--keepalive-secs`, métricas
   de ingresso separadas.
+- `r2` — Esclarece a validação de frames e separa a evidência histórica do lab da execução local da `r1`.

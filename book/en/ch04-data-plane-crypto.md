@@ -25,10 +25,10 @@ AAD, then ciphertext, then a 16-byte Poly1305 tag:
 ```text
 [0]     u8   version (high nibble, v1) | type (low nibble: 0x01 DATA, 0x02 KEEPALIVE)
 [1]     u8   reserved (0x00)
-[2..6]  u32  session_id (big-endian)
+[2..6]  u32  sender_index (node-local session identifier, big-endian)
 [6..14] u64  counter (big-endian)
-[14..]       ciphertext
-[..-16]      AEAD tag
+[14..len-16)  ciphertext
+[len-16..len) AEAD tag
 ```
 
 Total overhead: **58 bytes** (20 IPv4 + 8 UDP + 14 + 16). A 1400-byte
@@ -40,8 +40,10 @@ Two things the reader does not see on the wire:
 - **The AEAD IV does not travel**: it is rebuilt as 4 zero bytes plus
   the 8-byte counter in *little-endian* (`frame::aead_nonce`). The
   header counter is big-endian — independent conventions.
-- **AAD protects the header itself**: touching type, session_id or the
-  counter breaks the tag before any other check runs.
+- **AAD protects the entire header.** Before verifying the tag, `open`
+  checks frame length, header structure, the expected sender index, and
+  the replay window without modifying it. A modified header that passes
+  these preliminary checks fails authentication.
 
 ## One key per direction
 
@@ -102,6 +104,11 @@ and decryption rewrites plaintext where the ciphertext stood —
 `split_at_mut` hands disjoint regions for AAD, body and tag without a
 single `Vec`.
 
+[`recv_datagram`](../../engine-rust/src/forward.rs) uses `recvmsg(MSG_TRUNC)` to get the
+real UDP datagram length. If it exceeds the 2048-byte receive buffer,
+the engine drops the datagram before parsing or decrypting it rather
+than processing a truncated prefix.
+
 ## Symmetric ingress
 
 Server and client apply the same symmetric rule: the inner packet must
@@ -113,6 +120,10 @@ own `--peer <server-vip>` — authentication proves who sent the
 datagram, but only this rule decides which inner addresses it may
 carry. Drops count per cause: `invalid_inner_src_total`,
 `invalid_inner_dst_total`, `dropped_pkts`.
+
+**Known gap.** The [specification (§6)](../../vpn-debian-specification.md#6-experimental-rust-transport) requires an empty
+`KEEPALIVE`. The engine sends empty keepalives but does not enforce that
+length on receive. An authenticated nonempty keepalive is not written to TUN.
 
 ## Lab
 
@@ -126,25 +137,32 @@ compatibility.
 
 ## What was verified
 
-The original Phase 2 run (r0):
+**Historical baseline (`r0`, [PR #14](https://github.com/RondineleG/HiKablue/pull/14)).**
+The recorded run
+passed 86 Rust tests and the full lab gate (15/15). Those results describe
+the original implementation, not network verification of `r1`.
 
-- `cargo test`: 86 tests — window boundaries ±2047/2048 and a 5000-seq
-  leap, RFC 8439 vector against the crate's own output, AAD bit-flip
-  leaving the window untouched, exhaustion latch, forged + replay drops
-  before TUN, sealed keepalives observed on the wire in both roles,
-  cross-endpoint replay without window poisoning.
-- `tests/checks.sh --lab`: ALL PASSED 15/15; Rust coverage ≥ 95%.
-- **Not verified**: cross-process key derivation via control-plane
-  delivery (the lab shares one PSK) — expected in the `key_epoch` phase.
+**Hardening revision (`r1`, [PR #17](https://github.com/RondineleG/HiKablue/pull/17)).**
+On the Ubuntu
+development VM, 91 Rust tests and the release build passed. The local
+gate passed 12 checks, with the privileged lab skipped. GitHub Actions
+did not start because of a billing lock. Bidirectional lab ping was not
+rerun for this revision. Node forwarding, application connectivity and
+cross-process key provisioning were not verified.
 
-`r1` replaces the original library self-comparison with the published
-[RFC 8439 Appendix A.5 vector](https://www.rfc-editor.org/rfc/rfc8439.html#appendix-A.5).
-Run `cargo test --locked --manifest-path engine-rust/Cargo.toml` at the
-repo root to check the IV, authenticated header, concurrent nonce ceiling
-and session replacement above `u32::MAX`. Provisioning, privileged
-forwarding and application connectivity are not covered. TCP maximum
-segment size (MSS) clamping stays in the full-tunnel phase: 1360 at
-MTU 1400 for inner IPv4.
+From the repository root, run
+`cargo test --locked --manifest-path engine-rust/Cargo.toml`. The table
+shows the checks behind the claims. TCP MSS clamping remains deferred to
+the full-tunnel phase: 1360 at MTU 1400 for inner IPv4.
+
+| Requirement | Code | Test |
+|---|---|---|
+| IV and 58-byte IPv4 overhead | [`wire/frame.rs`](../../engine-rust/src/wire/frame.rs) | `aead_nonce_maps_counter_to_last_eight_bytes`, `overhead_constants_match_spec` |
+| Counters at the edge of the 2048-packet replay window | [`crypto/replay.rs`](../../engine-rust/src/crypto/replay.rs) | `boundary_minus_2047_passes_minus_2048_fails` |
+| Published [RFC 8439 A.5](https://www.rfc-editor.org/rfc/rfc8439.html#appendix-A.5) vector, replacing the earlier library self-comparison | [`crypto/session.rs`](../../engine-rust/src/crypto/session.rs) | `rfc8439_vector_matches_iv_mapping` |
+| Header modification leaves replay untouched; concurrent duplicate accepted once | [`crypto/session.rs`](../../engine-rust/src/crypto/session.rs) | `bitflip_in_header_fails_auth_and_leaves_replay_untouched`, `concurrent_open_accepts_each_nonce_once` |
+| Atomic TX ceiling; replacement with a 64-bit epoch and new keys | [`crypto/session.rs`](../../engine-rust/src/crypto/session.rs) | `concurrent_nonce_allocation_stops_at_the_ceiling`, `replacement_keeps_full_epoch_and_uses_fresh_directional_keys` |
+| UDP truncation detection; symmetric ingress in the test loop | [`forward.rs`](../../engine-rust/src/forward.rs) | `recv_datagram_reports_real_length_and_source`, `run_loop_client_and_server_scenarios` |
 
 ## Reading the code
 
@@ -274,3 +292,4 @@ pass `check()`? Hint: compute `diff` and compare with `WINDOW_SIZE`
 - `r0` — AEAD, replay window, nonce latch, symmetric ingress,
   `--key`/`--sender-index`/`--peer-index`/`--keepalive-secs`, split
   ingress metrics.
+- `r2` — Clarify frame validation and separate historical lab evidence from the local `r1` run.

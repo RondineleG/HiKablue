@@ -130,7 +130,9 @@ let read = async {
     stream.read_exact(&mut frame).await?;        // loop until it is complete
     Ok::<_, io::Error>(frame)
 };
-let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
+let frame = tokio::time::timeout(IO_DEADLINE, read)
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "metrics read deadline"))??;
 ```
 
 - `read_u32` é `AsyncReadExt::read_u32`: quatro bytes, big-endian — o mesmo
@@ -223,6 +225,7 @@ let frame = tokio::time::timeout(IO_DEADLINE, read).await??;
 
 ## Notas de revisão
 
+- `r14` — Atualiza o trecho do prazo de leitura das métricas conforme o código.
 - `r13` — Limitações documentadas fechadas: heartbeats exigem o segredo
   compartilhado `X-Heartbeat-Token` (o arranque recusa sem
   `VpnControl:HeartbeatToken`), o payload fica limitado (`node_id` ≤ 128,

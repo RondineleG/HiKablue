@@ -13,6 +13,12 @@ direcciones que lleva.
 > dentro de un laboratorio aislado y autorizado (`.agc/RULES.md` LAB-01). Nada
 > de este capítulo pertenece a una ruta de producción.
 
+> **Capítulo histórico.** Los ejemplos y resultados observados corresponden a la
+> [revisión de la Fase 1](https://github.com/RondineleG/HiKablue/blob/909c31e18bb75db34be1511de2bbf667c1338906/book/es/ch01-raw-tun-udp.md).
+> El lab de namespaces de `main` ahora usa AEAD; consulta el
+> [Capítulo 4](ch04-data-plane-crypto.md) para conocer el transporte cifrado
+> y su validación por separado.
+
 ## Las dos historias que cuenta cada paquete
 
 Observa el laboratorio que usaremos:
@@ -400,8 +406,9 @@ destino (el `else if` de arriba).
 
 ## Ejecútalo tú mismo
 
-Construye y ejecuta el laboratorio de dos nodos exactamente como en
-`engine-rust/README.md` (servidor en A, cliente en B) y luego:
+Compila el motor de la revisión fijada de la Fase 1 y sigue su
+[README del laboratorio](https://github.com/RondineleG/HiKablue/blob/909c31e18bb75db34be1511de2bbf667c1338906/engine-rust/README.md)
+(servidor en A, cliente en B) y luego:
 
 ```sh
 ping 10.80.1.1        # en B — espera respuestas
@@ -431,7 +438,7 @@ del underlay (`172.30.0.11/12` en lugar de `192.168.56.11/12`).
 | Verificación | Entorno | Observado |
 |---|---|---|
 | `cargo check`, `cargo test`, `cargo build --release` | Ubuntu 22.04, Rust 1.99.1 | 0 avisos; 28/28 pruebas pasan |
-| `tests/lab/netns-ping.sh` (dos nodos `ip netns` sobre un par veth) | Ubuntu 22.04 | PASS: 3/3 pings en cada dirección, TUN eliminado al cerrar |
+| [`tests/lab/netns-ping.sh`](https://github.com/RondineleG/HiKablue/blob/909c31e18bb75db34be1511de2bbf667c1338906/tests/lab/netns-ping.sh) (dos nodos `ip netns` sobre un par veth) | Ubuntu 22.04 | PASS: 3/3 pings en cada dirección, TUN eliminado al cerrar |
 | Mismo script con un `hik-lab-a` ajeno presente | Ubuntu 22.04 | rechazado antes de tocarlo (LAB-02); el namespace sobrevivió |
 | Ping `10.80.1.1` desde B y `10.80.1.2` desde A | Contenedores Debian 13 (trixie), red `hikablue-lab` | 3/3 respuestas en cada dirección |
 | Mismos pings | Contenedores Debian 12 (bookworm) | 3/3 respuestas en cada dirección |
@@ -453,8 +460,9 @@ En el nodo A, ejecuta ambas capturas mientras B hace un ping:
 ```sh
 sudo tcpdump -c1 -ni eth0 udp port 51820 &
 sudo tcpdump -c1 -ni tun0 icmp &
-ping -c1 10.80.1.2        # ¿en B? No — primero predice.
 ```
+
+En la terminal del nodo B, ejecuta `ping -c1 10.80.1.1` después de predecir.
 
 1. ¿Qué línea imprimirá `eth0`: direcciones `10.80.1.x` o `192.168.56.x`?
 2. ¿Qué línea imprimirá `tun0`?
@@ -486,3 +494,4 @@ de ida y la respuesta de vuelta.
   pendiente, identificadores preservados), y el README raíz ahora separa el
   ping ICMP verificado de la verificación HTTP aplazada. Ningún contenido del
   capítulo cambió.
+- `r5` — Fija el lab de UDP en claro y su evidencia a la Fase 1; enlaza al Capítulo 4.
