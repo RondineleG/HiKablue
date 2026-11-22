@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ ! "${BRANCH_NAME:-}" =~ ^(feat|fix)/[^/]+$ ]]; then
+# Branch naming applies to feature branches; the default branch itself is
+# exempt so the local gate (tests/checks.sh) can run on it — commit
+# subjects are still validated below.
+if [[ "${BRANCH_NAME:-}" != "main" && "${BRANCH_NAME:-}" != "master" ]] \
+    && [[ ! "${BRANCH_NAME:-}" =~ ^(feat|fix)/[^/]+$ ]]; then
   echo "Invalid branch name: ${BRANCH_NAME:-<empty>}"
   echo "Use feat/<slug> for additive work or fix/<slug> for bug fixes."
   exit 1

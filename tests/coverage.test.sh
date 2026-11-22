@@ -3,6 +3,10 @@
 # (TEST-01): threshold math, report parsers, and failure modes. Fixtures
 # and stubs only — the real measurement stays in coverage.sh.
 set -u
+# The gate and component overrides must not leak in from the caller (e.g.
+# COVERAGE_GATE=1 bash tests/checks.sh exports them to us): every scenario
+# below sets the variables it needs explicitly, so clear them first.
+unset COVERAGE_GATE COVERAGE_COMPONENTS COVERAGE_MIN
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT/tests/coverage-lib.sh"
 FIX="$ROOT/tests/fixtures/coverage"

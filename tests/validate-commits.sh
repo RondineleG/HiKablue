@@ -65,6 +65,8 @@ expect_fail() {
 expect_pass feat/commit-validation 11111111,22222222 \
   'docs(README): clarify setup' 'feat(api/v2)!: update response contract'
 expect_pass fix/packet-boundary 11111111 'fix(net): reject oversized packets'
+expect_pass main 11111111 'feat(api): gate runs on the default branch'
+expect_fail main 11111111 'invalid subject'
 expect_fail feat/commit-validation 11111111 'invalid subject'
 expect_fail feature/commit-validation 11111111 'feat: valid subject'
 expect_fail feat/commit-validation 11111111,22222222 \

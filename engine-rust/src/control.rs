@@ -32,7 +32,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tokio::net::{UnixListener, UnixStream};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::cli::parse_key_hex;
 use crate::metrics::{self, Metrics};
@@ -262,13 +262,31 @@ fn apply(
     }
 }
 
+/// Overwrites every string held in a parsed request tree so hex key
+/// material does not outlive the command that carried it. `0x00` is valid
+/// UTF-8, so zeroing each buffer in place keeps `String` sound.
+fn scrub_strings(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            // SAFETY: only the contents are zeroed; len and capacity stay
+            // unchanged and NUL bytes are valid UTF-8.
+            unsafe { s.as_mut_vec() }.zeroize();
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_strings),
+        serde_json::Value::Object(map) => map.values_mut().for_each(scrub_strings),
+        _ => {}
+    }
+}
+
 async fn handle(
     sessions: Arc<SessionTable>,
     metrics: Arc<Metrics>,
     mut stream: UnixStream,
 ) -> io::Result<()> {
-    let frame = metrics::read_frame(&mut stream).await?;
-    let request: serde_json::Value = serde_json::from_slice(&frame)
+    // Key hex arrives in this frame: keep it in a Zeroizing buffer so even
+    // a parse failure wipes the bytes on the way out.
+    let frame = Zeroizing::new(metrics::read_frame(&mut stream).await?);
+    let mut request: serde_json::Value = serde_json::from_slice(frame.as_slice())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
     let body = match metrics::validate_request(&request) {
@@ -281,7 +299,9 @@ async fn handle(
         },
         Err((code, message)) => metrics::error_envelope_body(code, &message),
     };
-    metrics::write_frame(&mut stream, &metrics::respond(&request, body)).await
+    let response = metrics::respond(&request, body);
+    scrub_strings(&mut request);
+    metrics::write_frame(&mut stream, &response).await
 }
 
 #[cfg(test)]
