@@ -263,13 +263,14 @@ fn apply(
 }
 
 /// Overwrites every string held in a parsed request tree so hex key
-/// material does not outlive the command that carried it. `0x00` is valid
-/// UTF-8, so zeroing each buffer in place keeps `String` sound.
+/// material does not outlive the command that carried it. Each string's
+/// buffer is wiped and truncated to len 0 — valid UTF-8.
 fn scrub_strings(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(s) => {
-            // SAFETY: only the contents are zeroed; len and capacity stay
-            // unchanged and NUL bytes are valid UTF-8.
+            // SAFETY: Vec::zeroize wipes the allocation and truncates to
+            // len 0 — an empty buffer is valid UTF-8, so the String stays
+            // sound.
             unsafe { s.as_mut_vec() }.zeroize();
         }
         serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_strings),
@@ -369,6 +370,19 @@ mod tests {
             "egress_key": egress_key,
             "ingress_key": ingress_key,
         })
+    }
+
+    #[test]
+    fn scrub_strings_wipes_hex_material_and_keeps_shape() {
+        let mut v = stage_payload(1, 11, 22, HEX_A, HEX_B);
+        scrub_strings(&mut v);
+        for field in ["egress_key", "ingress_key"] {
+            // Vec::zeroize wipes the allocation and truncates to len 0.
+            assert_eq!(v[field].as_str().unwrap(), "");
+        }
+        assert_eq!(v["key_epoch"], 1);
+        assert_eq!(v["sender_index"], 11);
+        assert_eq!(v["lab_session_id"], 42);
     }
 
     #[test]
