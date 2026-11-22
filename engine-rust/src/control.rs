@@ -292,6 +292,7 @@ mod tests {
 
     const HEX_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const HEX_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const HEX_C: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 
     fn sock_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -333,14 +334,20 @@ mod tests {
         serde_json::from_slice(&buf).unwrap()
     }
 
-    fn stage_payload(epoch: u64, sender: u32, peer: u32, key: &str) -> serde_json::Value {
+    fn stage_payload(
+        epoch: u64,
+        sender: u32,
+        peer: u32,
+        egress_key: &str,
+        ingress_key: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "lab_session_id": 42,
             "key_epoch": epoch,
             "sender_index": sender,
             "peer_index": peer,
-            "egress_key": key,
-            "ingress_key": key,
+            "egress_key": egress_key,
+            "ingress_key": ingress_key,
         })
     }
 
@@ -360,7 +367,7 @@ mod tests {
         let (path, sessions, metrics) = spawn_server("rot", Some(unsafe { libc::geteuid() })).await;
 
         // Stage a new epoch: rx already accepts peer_index 22.
-        let resp = request(&path, "StagePeer", stage_payload(1, 11, 22, HEX_A)).await;
+        let resp = request(&path, "StagePeer", stage_payload(1, 11, 22, HEX_A, HEX_B)).await;
         assert_eq!(resp["status"], "ok");
         assert_eq!(resp["result"]["role"], "staged");
         assert_eq!(resp["request_id"], "r1");
@@ -368,7 +375,7 @@ mod tests {
         assert!(sessions.tx().is_some()); // epoch 0 still seals
 
         // Replaying the identical stage is a no-op, not an error.
-        let resp = request(&path, "StagePeer", stage_payload(1, 11, 22, HEX_A)).await;
+        let resp = request(&path, "StagePeer", stage_payload(1, 11, 22, HEX_A, HEX_B)).await;
         assert_eq!(resp["status"], "ok");
 
         // Activate flips tx; the old epoch keeps decrypting.
@@ -397,16 +404,20 @@ mod tests {
         let resp = request(&path, "Retire", serde_json::json!({"key_epoch": 0})).await;
         assert_eq!(resp["error"]["code"], "active_epoch");
 
-        let resp = request(&path, "StagePeer", stage_payload(1, 7, 7, HEX_A)).await;
+        let resp = request(&path, "StagePeer", stage_payload(1, 7, 7, HEX_A, HEX_B)).await;
         assert_eq!(resp["error"]["code"], "invalid_field");
 
-        let mut bad = stage_payload(1, 11, 22, HEX_A);
+        // Identical direction keys are refused.
+        let resp = request(&path, "StagePeer", stage_payload(1, 11, 22, HEX_A, HEX_A)).await;
+        assert_eq!(resp["error"]["code"], "invalid_field");
+
+        let mut bad = stage_payload(1, 11, 22, HEX_A, HEX_B);
         bad["ingress_key"] = serde_json::json!("zz");
         let resp = request(&path, "StagePeer", bad).await;
         assert_eq!(resp["error"]["code"], "invalid_field");
 
         // A colliding peer_index is refused.
-        let resp = request(&path, "StagePeer", stage_payload(1, 11, 2, HEX_A)).await;
+        let resp = request(&path, "StagePeer", stage_payload(1, 11, 2, HEX_A, HEX_B)).await;
         assert_eq!(resp["error"]["code"], "index_in_use");
         assert!(sessions.tx().is_some());
 
@@ -419,7 +430,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_wipes_epochs_and_getsessions_reports_them() {
         let (path, sessions, _m) = spawn_server("rev", None).await;
-        request(&path, "StagePeer", stage_payload(1, 11, 22, HEX_B)).await;
+        request(&path, "StagePeer", stage_payload(1, 11, 22, HEX_B, HEX_C)).await;
         request(&path, "Activate", serde_json::json!({"key_epoch": 1})).await;
 
         let resp = request(&path, "GetSessions", serde_json::json!({})).await;

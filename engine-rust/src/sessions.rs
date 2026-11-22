@@ -13,12 +13,42 @@
 //! take a shared `RwLock` read and clone an `Arc`, so the hot path never
 //! blocks on a writer and never allocates per packet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::crypto::SessionState;
+
+/// BLAKE2s-256 fingerprint of a direction key. Retired epochs keep only
+/// fingerprints — never key material — so a later StagePeer can be
+/// refused when it reuses an old key without holding the key itself.
+fn key_fingerprint(key: &[u8; 32]) -> [u8; 32] {
+    use blake2::Digest;
+    let mut h = blake2::Blake2s256::new();
+    h.update(b"hikablue-retired-key");
+    h.update(key);
+    h.finalize().into()
+}
+
+/// What remains of a retired or revoked epoch: its identity plus the
+/// fingerprints of its keys, so neither can ever be provisioned again.
+#[derive(Clone)]
+struct Tombstone {
+    key_epoch: u64,
+    tx_fp: [u8; 32],
+    rx_fp: [u8; 32],
+}
+
+impl Tombstone {
+    fn of(session: &SessionState) -> Self {
+        Self {
+            key_epoch: session.key_epoch(),
+            tx_fp: key_fingerprint(session.tx_key()),
+            rx_fp: key_fingerprint(session.rx_key()),
+        }
+    }
+}
 
 /// Role an epoch plays in the rotation protocol, reported by GetMetrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +124,14 @@ struct TableState {
     /// Every epoch still allowed on rx — active, staged and each one not
     /// yet retired — keyed by the sender_index the peer stamps.
     rx: HashMap<u32, Arc<SessionState>>,
+    /// Retired/revoked epochs: epoch numbers, wire indexes and key
+    /// fingerprints that must never be provisioned again — reusing one
+    /// would reset counters and the replay window, letting captured
+    /// datagrams re-authenticate and nonces repeat.
+    retired: Vec<Tombstone>,
+    /// Wire indexes ever seen (live or tombstoned). One-shot: the spec
+    /// gives each new key epoch a fresh wire session ID.
+    used_indexes: HashSet<u32>,
     /// Numeric session id from the control contract; informational on the
     /// single-peer engine, checked by RevokePeer when present.
     lab_session_id: Option<u32>,
@@ -103,10 +141,13 @@ struct TableState {
 /// the control task mutates it through the ops below.
 pub struct SessionTable {
     state: RwLock<TableState>,
-    /// Sticky "keyed engine" flag: once the control plane stages an epoch,
-    /// plaintext mode is gone for good — a later RevokePeer blocks
-    /// traffic instead of silently speaking cleartext again.
+    /// Sticky "keyed engine" flag: once key material exists, plaintext
+    /// mode is gone for good — a later RevokePeer blocks traffic instead
+    /// of silently speaking cleartext again.
     provisioned: AtomicBool,
+    /// Bumped on every RevokePeer; the forwarding loop watches it to
+    /// drop the learned peer endpoint along with the revoked session.
+    revocations: AtomicU64,
 }
 
 impl SessionTable {
@@ -114,8 +155,12 @@ impl SessionTable {
     /// starts empty and the engine stays in the M2 plaintext mode until a
     /// StagePeer provisions the first managed epoch.
     pub fn new(initial: Option<SessionState>) -> Self {
+        let keyed = initial.is_some();
         let mut rx = HashMap::new();
+        let mut used_indexes = HashSet::new();
         let tx = initial.map(|session| {
+            used_indexes.insert(session.local_index());
+            used_indexes.insert(session.peer_index());
             let session = Arc::new(session);
             rx.insert(session.peer_index(), session.clone());
             session
@@ -125,9 +170,14 @@ impl SessionTable {
                 tx,
                 staged: None,
                 rx,
+                retired: Vec::new(),
+                used_indexes,
                 lab_session_id: None,
             }),
-            provisioned: AtomicBool::new(false),
+            // A lab --key engine is keyed from birth; a later RevokePeer
+            // must still block traffic rather than fall back to cleartext.
+            provisioned: AtomicBool::new(keyed),
+            revocations: AtomicU64::new(0),
         }
     }
 
@@ -145,10 +195,6 @@ impl SessionTable {
     /// The active epoch for sealing, or `None` while none is active.
     pub fn tx(&self) -> Option<Arc<SessionState>> {
         self.state.read().unwrap().tx.clone()
-    }
-
-    pub fn has_tx(&self) -> bool {
-        self.state.read().unwrap().tx.is_some()
     }
 
     /// The epoch that accepts `sender_index` on rx — active, staged or
@@ -180,6 +226,12 @@ impl SessionTable {
                 "sender_index and peer_index must differ".into(),
             ));
         }
+        if *tx_key == *rx_key {
+            // Identical direction keys reuse (key, nonce) pairs across
+            // both directions — ChaCha20-Poly1305 nonce reuse breaks
+            // confidentiality and integrity.
+            return Err(TableError::BadInput("tx_key and rx_key must differ".into()));
+        }
         let mut state = self.state.write().unwrap();
         if let Some(staged) = &state.staged {
             // A replayed StagePeer for the same epoch carries the same
@@ -205,10 +257,38 @@ impl SessionTable {
                 "epoch {key_epoch} already exists in the table"
             )));
         }
-        // The rx map key must be unique per epoch or a late packet could
-        // not pick its key deterministically.
+        // A retired epoch, index or key may never come back: re-creating
+        // it would reset the nonce counter and replay window, letting
+        // captured datagrams authenticate again.
+        if state.retired.iter().any(|t| t.key_epoch == key_epoch) {
+            return Err(TableError::BadInput(format!(
+                "epoch {key_epoch} was retired and cannot be reused"
+            )));
+        }
+        // A peer_index still live in rx maps to another epoch.
         if state.rx.contains_key(&peer_index) {
             return Err(TableError::IndexInUse(peer_index));
+        }
+        if state.used_indexes.contains(&sender_index) || state.used_indexes.contains(&peer_index) {
+            return Err(TableError::BadInput(
+                "sender_index/peer_index already used by an earlier epoch".into(),
+            ));
+        }
+        let tx_fp = key_fingerprint(&tx_key);
+        let rx_fp = key_fingerprint(&rx_key);
+        let key_is_fresh = |fp: &[u8; 32]| {
+            !state
+                .retired
+                .iter()
+                .any(|t| t.tx_fp == *fp || t.rx_fp == *fp)
+                && !state.rx.values().any(|s| {
+                    key_fingerprint(s.tx_key()) == *fp || key_fingerprint(s.rx_key()) == *fp
+                })
+        };
+        if !key_is_fresh(&tx_fp) || !key_is_fresh(&rx_fp) {
+            return Err(TableError::BadInput(
+                "key material already used by an earlier epoch".into(),
+            ));
         }
         let session = Arc::new(SessionState::new(
             key_epoch,
@@ -220,6 +300,8 @@ impl SessionTable {
         state.rx.insert(peer_index, session.clone());
         state.staged = Some(session);
         state.lab_session_id = lab_session_id;
+        state.used_indexes.insert(sender_index);
+        state.used_indexes.insert(peer_index);
         self.provisioned.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -229,6 +311,15 @@ impl SessionTable {
     /// becomes retiring automatically.
     pub fn activate(&self, key_epoch: u64) -> Result<u64, TableError> {
         let mut state = self.state.write().unwrap();
+        // Idempotent against at-least-once redelivery: replaying the
+        // Activate that already ran is a confirmed no-op, not an error.
+        if state
+            .tx
+            .as_ref()
+            .is_some_and(|active| active.key_epoch() == key_epoch)
+        {
+            return Ok(key_epoch);
+        }
         // A mismatched Activate must not consume the staged epoch — the
         // agent may have sent the ops out of order.
         if state.staged.as_ref().map(|s| s.key_epoch()) != Some(key_epoch) {
@@ -255,17 +346,26 @@ impl SessionTable {
             if staged.key_epoch() == key_epoch {
                 let staged = state.staged.take().unwrap();
                 state.rx.remove(&staged.peer_index());
+                state.retired.push(Tombstone::of(&staged));
                 return Ok(());
             }
         }
-        let peer_index = state
+        let session = state
             .rx
             .values()
             .find(|s| s.key_epoch() == key_epoch)
-            .map(|s| s.peer_index())
-            .ok_or(TableError::UnknownEpoch(key_epoch))?;
-        state.rx.remove(&peer_index);
-        Ok(())
+            .cloned();
+        match session {
+            Some(session) => {
+                state.rx.remove(&session.peer_index());
+                state.retired.push(Tombstone::of(&session));
+                Ok(())
+            }
+            // Replaying a Retire whose epoch is already tombstoned is a
+            // confirmed no-op; a truly unknown epoch is still an error.
+            None if state.retired.iter().any(|t| t.key_epoch == key_epoch) => Ok(()),
+            None => Err(TableError::UnknownEpoch(key_epoch)),
+        }
     }
 
     /// RevokePeer: wipe every epoch — active, staged and retiring. The
@@ -278,11 +378,39 @@ impl SessionTable {
                 return Err(TableError::UnknownLabSession(asked));
             }
         }
-        state.tx = None;
-        state.staged = None;
-        state.rx.clear();
+        // Tombstone every epoch before dropping it so a later StagePeer
+        // cannot resurrect old keys, indexes or counters.
+        if let Some(tx) = state.tx.take() {
+            state.retired.push(Tombstone::of(&tx));
+        }
+        if let Some(staged) = state.staged.take() {
+            if !state
+                .retired
+                .iter()
+                .any(|t| t.key_epoch == staged.key_epoch())
+            {
+                state.retired.push(Tombstone::of(&staged));
+            }
+        }
+        let dropped: Vec<Arc<SessionState>> = state.rx.drain().map(|(_, s)| s).collect();
+        for session in dropped {
+            if !state
+                .retired
+                .iter()
+                .any(|t| t.key_epoch == session.key_epoch())
+            {
+                state.retired.push(Tombstone::of(&session));
+            }
+        }
         state.lab_session_id = None;
+        self.revocations.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Number of RevokePeer ops applied; the forwarding loop clears its
+    /// learned peer endpoint when this changes.
+    pub fn revocations(&self) -> u64 {
+        self.revocations.load(Ordering::Relaxed)
     }
 
     /// Ordered snapshot for metrics: active first, then staged, then
@@ -337,19 +465,21 @@ mod tests {
     const KEY_A: [u8; 32] = [1u8; 32];
     const KEY_B: [u8; 32] = [2u8; 32];
     const KEY_C: [u8; 32] = [3u8; 32];
+    const KEY_D: [u8; 32] = [4u8; 32];
 
     fn stage_args(
         epoch: u64,
         sender: u32,
         peer: u32,
-        key: [u8; 32],
+        tx_key: [u8; 32],
+        rx_key: [u8; 32],
     ) -> (u64, u32, u32, Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
         (
             epoch,
             sender,
             peer,
-            Zeroizing::new(key),
-            Zeroizing::new(key),
+            Zeroizing::new(tx_key),
+            Zeroizing::new(rx_key),
         )
     }
 
@@ -365,7 +495,7 @@ mod tests {
                 11,
                 22,
                 Zeroizing::new(KEY_A),
-                Zeroizing::new(KEY_A),
+                Zeroizing::new(KEY_B),
             )
             .unwrap();
         assert!(table.keyed());
@@ -389,7 +519,7 @@ mod tests {
     #[test]
     fn stage_is_idempotent_on_replay() {
         let table = SessionTable::new(None);
-        let (e, s, p, k1, k2) = stage_args(7, 11, 22, KEY_A);
+        let (e, s, p, k1, k2) = stage_args(7, 11, 22, KEY_A, KEY_B);
         table.stage(Some(5), e, s, p, k1, k2).unwrap();
         table
             .stage(
@@ -398,7 +528,7 @@ mod tests {
                 s,
                 p,
                 Zeroizing::new(KEY_A),
-                Zeroizing::new(KEY_A),
+                Zeroizing::new(KEY_B),
             )
             .unwrap();
         assert_eq!(table.snapshot().len(), 1);
@@ -409,7 +539,7 @@ mod tests {
                 e,
                 s,
                 p,
-                Zeroizing::new(KEY_B),
+                Zeroizing::new(KEY_C),
                 Zeroizing::new(KEY_B),
             ),
             Err(TableError::StagedPending(7))
@@ -423,7 +553,7 @@ mod tests {
             1,
             2,
         )));
-        let (e, s, p, k1, k2) = stage_args(1, 33, 44, KEY_B);
+        let (e, s, p, k1, k2) = stage_args(1, 33, 44, KEY_B, KEY_C);
         table.stage(Some(9), e, s, p, k1, k2).unwrap();
         table.activate(1).unwrap();
         // New epoch seals; old epoch still decrypts during drain.
@@ -463,12 +593,14 @@ mod tests {
                 11,
                 22,
                 Zeroizing::new(KEY_A),
-                Zeroizing::new(KEY_A),
+                Zeroizing::new(KEY_B),
             )
             .unwrap();
         table.retire(1).unwrap();
         assert!(table.rx_lookup(22).is_none());
         assert!(table.tx().is_none());
+        // A replayed Retire of the tombstoned epoch is a no-op.
+        table.retire(1).unwrap();
         // And a different epoch can be staged right away.
         table
             .stage(
@@ -476,10 +608,59 @@ mod tests {
                 2,
                 33,
                 44,
-                Zeroizing::new(KEY_B),
-                Zeroizing::new(KEY_B),
+                Zeroizing::new(KEY_C),
+                Zeroizing::new(KEY_D),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn retired_material_cannot_come_back() {
+        let table = SessionTable::new(None);
+        let (e, s, p, k1, k2) = stage_args(1, 11, 22, KEY_A, KEY_B);
+        table.stage(Some(5), e, s, p, k1, k2).unwrap();
+        table.retire(1).unwrap();
+        // The retired epoch number, its wire indexes and its keys are all
+        // dead: any of them alone must refuse a new StagePeer.
+        for (e2, s2, p2, k1, k2) in [
+            (1, 55, 66, KEY_C, KEY_D),
+            (2, 11, 66, KEY_C, KEY_D),
+            (2, 55, 22, KEY_C, KEY_D),
+            (2, 55, 66, KEY_A, KEY_D),
+            (2, 55, 66, KEY_C, KEY_B),
+        ] {
+            assert!(matches!(
+                table.stage(Some(5), e2, s2, p2, Zeroizing::new(k1), Zeroizing::new(k2)),
+                Err(TableError::BadInput(_)) | Err(TableError::IndexInUse(_))
+            ));
+        }
+        // Fresh epoch, indexes and keys are accepted.
+        table
+            .stage(
+                Some(5),
+                2,
+                33,
+                44,
+                Zeroizing::new(KEY_C),
+                Zeroizing::new(KEY_D),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn stage_rejects_identical_direction_keys() {
+        let table = SessionTable::new(None);
+        assert!(matches!(
+            table.stage(
+                Some(5),
+                1,
+                11,
+                22,
+                Zeroizing::new(KEY_A),
+                Zeroizing::new(KEY_A),
+            ),
+            Err(TableError::BadInput(_))
+        ));
     }
 
     #[test]
@@ -497,7 +678,7 @@ mod tests {
                 11,
                 2,
                 Zeroizing::new(KEY_B),
-                Zeroizing::new(KEY_B),
+                Zeroizing::new(KEY_C),
             ),
             Err(TableError::IndexInUse(2))
         ));
@@ -509,7 +690,7 @@ mod tests {
                 7,
                 7,
                 Zeroizing::new(KEY_B),
-                Zeroizing::new(KEY_B),
+                Zeroizing::new(KEY_C),
             ),
             Err(TableError::BadInput(_))
         ));
@@ -521,7 +702,7 @@ mod tests {
                 0,
                 8,
                 Zeroizing::new(KEY_B),
-                Zeroizing::new(KEY_B),
+                Zeroizing::new(KEY_C),
             ),
             Err(TableError::BadInput(_))
         ));
@@ -541,7 +722,7 @@ mod tests {
                 11,
                 22,
                 Zeroizing::new(KEY_A),
-                Zeroizing::new(KEY_A),
+                Zeroizing::new(KEY_B),
             )
             .unwrap();
         assert!(matches!(
@@ -551,6 +732,8 @@ mod tests {
         // The staged epoch survives a mismatched Activate.
         table.activate(1).unwrap();
         assert_eq!(table.tx().unwrap().key_epoch(), 1);
+        // A replayed Activate of the live epoch is a no-op.
+        assert_eq!(table.activate(1).unwrap(), 1);
     }
 
     #[test]
@@ -567,7 +750,7 @@ mod tests {
                 11,
                 22,
                 Zeroizing::new(KEY_B),
-                Zeroizing::new(KEY_B),
+                Zeroizing::new(KEY_C),
             )
             .unwrap();
         table.revoke(Some(5)).unwrap();
@@ -583,8 +766,8 @@ mod tests {
                 2,
                 33,
                 44,
-                Zeroizing::new(KEY_C),
-                Zeroizing::new(KEY_C),
+                Zeroizing::new(KEY_A),
+                Zeroizing::new(KEY_D),
             )
             .unwrap();
         assert!(matches!(
