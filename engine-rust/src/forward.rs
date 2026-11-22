@@ -23,11 +23,13 @@ use tokio::signal::unix::{signal, SignalKind};
 use zeroize::Zeroizing;
 
 use crate::cli::Ipv4Cidr;
+use crate::control;
 use crate::crypto::{CryptoError, SessionState};
 use crate::metrics::{self, Metrics};
 use crate::packet::{destination_ip, source_ip, validate_ipv4};
+use crate::sessions::SessionTable;
 use crate::tun::{configure_interface, Tun};
-use crate::wire::{HEADER_LEN, MSG_DATA, MSG_KEEPALIVE, TOTAL_OVERHEAD};
+use crate::wire::{frame, HEADER_LEN, MSG_DATA, MSG_KEEPALIVE, TOTAL_OVERHEAD};
 
 /// Fixed reusable buffer size.
 pub const BUFFER_SIZE: usize = 2048;
@@ -54,6 +56,14 @@ pub struct Config {
     /// Unix socket that answers GetMetrics.
     pub metrics_sock: PathBuf,
     pub metrics_group: Option<String>,
+    /// Unix socket that accepts key-lifecycle ops (StagePeer/Activate/
+    /// Retire/RevokePeer). Carries key material: mode 0600 plus a
+    /// SO_PEERCRED check, separate from the read-only metrics socket.
+    pub control_sock: Option<PathBuf>,
+    /// UID the control socket is chowned to and authorized for — the
+    /// unprivileged agent's uid. Root always passes the peer-credential
+    /// check.
+    pub control_uid: Option<u32>,
     /// Optional 32-byte session key enabling the AEAD wire format.
     pub key: Option<Zeroizing<[u8; 32]>>,
     /// Session index stamped on outbound packets; selects this side's
@@ -115,9 +125,12 @@ impl Config {
             if self.sender_index == self.peer_index {
                 return Err(invalid("sender_index and peer_index must differ".into()));
             }
-            // A zero interval re-arms instantly and wins every biased
-            // select! round — the loop would emit keepalives forever and
-            // starve TUN and UDP reads.
+        }
+        // Keepalive and MTU rules apply whenever the engine can become
+        // keyed — a fixed --key now, or a StagePeer over the control
+        // socket later. A zero interval would re-arm instantly and win
+        // every biased select! round once an epoch activates.
+        if self.key.is_some() || self.control_sock.is_some() {
             if self.keepalive_interval.is_zero() {
                 return Err(invalid(
                     "keepalive interval must be greater than zero".into(),
@@ -304,7 +317,30 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
                 ),
             }
         })?;
-    let metrics_task = tokio::spawn(metrics::serve(metrics.clone(), metrics_listener));
+    // Key material lives in the shared session table: the loop clones
+    // Arcs out of it while the control task mutates it through the
+    // StagePeer/Activate/Retire/RevokePeer ops. A lab --key session is
+    // epoch 0 and already active.
+    let sessions =
+        std::sync::Arc::new(SessionTable::new(cfg.key.map(|key| {
+            SessionState::from_lab_psk(key, cfg.sender_index, cfg.peer_index)
+        })));
+    let control_task = if let Some(path) = &cfg.control_sock {
+        let listener = control::bind(path, cfg.control_uid)?;
+        Some(tokio::spawn(control::serve(
+            sessions.clone(),
+            metrics.clone(),
+            listener,
+            cfg.control_uid,
+        )))
+    } else {
+        None
+    };
+    let metrics_task = tokio::spawn(metrics::serve(
+        metrics.clone(),
+        metrics_listener,
+        Some(sessions.clone()),
+    ));
     if !is_server {
         // The client connects to its configured remote: it has one peer
         // from the start, no learning needed.
@@ -312,20 +348,25 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
     }
 
     let mut learned_peer: Option<SocketAddr> = None;
+    // A RevokePeer wipes the session that pinned the endpoint; the
+    // reprovisioned peer may come from a different port, so the learned
+    // endpoint is dropped along with the old keys.
+    let mut seen_revocations = sessions.revocations();
     // TUN reads land past HEADER_LEN of headroom so sealing needs no copy;
     // decrypted UDP payloads are consumed in place at the same offset.
     let mut tun_buf = [0u8; BUFFER_SIZE];
     let mut udp_buf = [0u8; BUFFER_SIZE];
     let mut sigterm = signal(SignalKind::terminate())?;
 
-    let session = cfg
-        .key
-        .map(|key| SessionState::from_lab_psk(key, cfg.sender_index, cfg.peer_index));
     // A datagram send of any kind resets the keepalive deadline — it only
     // fires while the stream is otherwise idle.
     let mut next_keepalive = tokio::time::Instant::now() + cfg.keepalive_interval;
 
     loop {
+        if sessions.revocations() != seen_revocations {
+            learned_peer = None;
+            seen_revocations = sessions.revocations();
+        }
         tokio::select! {
             biased;
             result = tokio::signal::ctrl_c() => {
@@ -335,9 +376,16 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
             _ = sigterm.recv() => {
                 break;
             }
-            _ = tokio::time::sleep_until(next_keepalive), if session.is_some() => {
+            // The keepalive timer always arms — when the engine has no
+            // active epoch yet it just re-arms, so a later Activate over
+            // the control socket starts keepalives without needing
+            // traffic first. Guarding inside (not in select!) also keeps
+            // a concurrent RevokePeer from racing the tx() clone.
+            _ = tokio::time::sleep_until(next_keepalive) => {
                 next_keepalive = tokio::time::Instant::now() + cfg.keepalive_interval;
-                let session = session.as_ref().unwrap();
+                let Some(session) = sessions.tx() else {
+                    continue;
+                };
                 let wire_len = match session.seal(&mut tun_buf, 0, MSG_KEEPALIVE) {
                     Ok(n) => n,
                     Err(err) => {
@@ -366,17 +414,27 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
                     metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                let payload_len = if let Some(session) = &session {
-                    match session.seal(&mut tun_buf, n, MSG_DATA) {
-                        Ok(wire_len) => wire_len,
-                        Err(CryptoError::NonceExhaustionNeedsRekey) => {
+                let keyed = sessions.keyed();
+                let payload_len = if keyed {
+                    match sessions.tx() {
+                        Some(session) => match session.seal(&mut tun_buf, n, MSG_DATA) {
+                            Ok(wire_len) => wire_len,
+                            Err(CryptoError::NonceExhaustionNeedsRekey) => {
+                                metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                                eprintln!("vpn-engine: key epoch {} exhausted, needs rekey", session.key_epoch());
+                                continue;
+                            }
+                            Err(err) => {
+                                metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                                eprintln!("vpn-engine: cannot seal datagram: {err}");
+                                continue;
+                            }
+                        },
+                        // Keyed engine without an active epoch — revoked or
+                        // not yet activated: the spec blocks traffic until
+                        // reprovisioning completes.
+                        None => {
                             metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
-                            eprintln!("vpn-engine: key epoch {} exhausted, needs rekey", session.key_epoch());
-                            continue;
-                        }
-                        Err(err) => {
-                            metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
-                            eprintln!("vpn-engine: cannot seal datagram: {err}");
                             continue;
                         }
                     }
@@ -388,7 +446,7 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
                 let sent = if is_server {
                     match learned_peer {
                         Some(peer) => {
-                            if session.is_some() {
+                            if keyed {
                                 Some(socket.send_to(&tun_buf[..payload_len], peer).await)
                             } else {
                                 Some(socket.send_to(&tun_buf[HEADER_LEN..payload_len], peer).await)
@@ -396,7 +454,7 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
                         }
                         None => None,
                     }
-                } else if session.is_some() {
+                } else if keyed {
                     Some(socket.send(&tun_buf[..payload_len]).await)
                 } else {
                     Some(socket.send(&tun_buf[HEADER_LEN..payload_len]).await)
@@ -447,19 +505,40 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
                     continue;
                 }
 
-                // Decrypt in place when a session key is configured: the
-                // plaintext replaces the ciphertext at offset HEADER_LEN in
-                // the same buffer — no allocation.
-                let (msg_type, packet) = if let Some(session) = &session {
-                    match session.open(&mut udp_buf, real_len) {
-                        Ok((header, pt_len)) => (
-                            header.message_type,
-                            &udp_buf[HEADER_LEN..HEADER_LEN + pt_len],
-                        ),
-                        Err(_err) => {
+                // Decrypt in place when the engine is keyed: the header's
+                // sender_index picks the epoch in the session table, so
+                // staged and retiring epochs decrypt alongside the active
+                // one during a rotation. The plaintext replaces the
+                // ciphertext at offset HEADER_LEN in the same buffer —
+                // no allocation.
+                let (msg_type, packet) = if sessions.keyed() {
+                    if real_len < HEADER_LEN + crate::wire::TAG_LEN {
+                        metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    let sender_index = match frame::parse(&udp_buf[..HEADER_LEN]) {
+                        Ok(header) => header.sender_index,
+                        Err(_) => {
                             metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
+                    };
+                    match sessions.rx_lookup(sender_index) {
+                        None => {
+                            metrics.rx_unknown_sender_index.fetch_add(1, Ordering::Relaxed);
+                            metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        Some(session) => match session.open(&mut udp_buf, real_len) {
+                            Ok((header, pt_len)) => (
+                                header.message_type,
+                                &udp_buf[HEADER_LEN..HEADER_LEN + pt_len],
+                            ),
+                            Err(_err) => {
+                                metrics.dropped_pkts.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                        },
                     }
                 } else {
                     (MSG_DATA, &udp_buf[..real_len])
@@ -538,6 +617,12 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
 
     metrics_task.abort();
     metrics::cleanup(&cfg.metrics_sock);
+    if let Some(task) = control_task {
+        task.abort();
+        if let Some(path) = &cfg.control_sock {
+            control::cleanup(path);
+        }
+    }
     eprintln!("vpn-engine: shutting down");
     Ok(())
 }
@@ -564,6 +649,8 @@ mod tests {
             mtu: 1400,
             metrics_sock: PathBuf::from("/tmp/test.sock"),
             metrics_group: None,
+            control_sock: None,
+            control_uid: None,
             key: None,
             sender_index: 1,
             peer_index: 0,
@@ -840,6 +927,8 @@ mod tests {
             mtu: 1400,
             metrics_sock: sock_path(tag),
             metrics_group: None,
+            control_sock: None,
+            control_uid: None,
             key: None,
             sender_index: 1,
             peer_index: 0,
@@ -916,6 +1005,7 @@ mod tests {
         server_scenario().await;
         crypto_client_scenario().await;
         crypto_server_scenario().await;
+        rotation_scenario().await;
         drop(_sig);
     }
 
@@ -1220,6 +1310,173 @@ mod tests {
         assert_eq!(from, bind_addr);
         assert_eq!(kn, HEADER_LEN + TAG_LEN);
         assert_eq!(kb[0], (crate::wire::frame::VERSION << 4) | MSG_KEEPALIVE);
+
+        test_sigterm();
+        engine.await.unwrap().unwrap();
+    }
+
+    /// One control-socket round trip: write the request frame, read the
+    /// response frame.
+    async fn control_request(
+        path: &std::path::Path,
+        op: &str,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut c = tokio::net::UnixStream::connect(path).await.unwrap();
+        let req = serde_json::json!({
+            "request_id": "t", "version": 1, "op": op, "payload": payload,
+        })
+        .to_string();
+        c.write_u32(req.len() as u32).await.unwrap();
+        c.write_all(req.as_bytes()).await.unwrap();
+        let n = c.read_u32().await.unwrap() as usize;
+        let mut buf = vec![0u8; n];
+        c.read_exact(&mut buf).await.unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    fn hex32(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
+    }
+
+    /// Zero-drop rotation: a keyed client engine is rotated Stage ->
+    /// Activate -> Retire through the control socket while the peer keeps
+    /// sending under both epochs. Staged and retiring epochs decrypt
+    /// alongside the active one; only after Retire does the old index
+    /// become unknown.
+    async fn rotation_scenario() {
+        let (tun, peer) = fake_tun();
+        let remote = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = remote.local_addr().unwrap();
+        let bind = free_port();
+        let control_path = sock_path("ctrl");
+        let mut cfg = cfg_for(bind, Some(remote_addr), Some(OTHER_VIP), "rot");
+        cfg.key = Some(Zeroizing::new(LAB_KEY));
+        cfg.peer_index = 2;
+        cfg.control_sock = Some(control_path.clone());
+        let bind_addr = cfg.bind;
+        let engine = tokio::spawn(run_loop(cfg, tun));
+
+        // Epoch 0 peer: stamps 2, expects 1, derived lab keys.
+        let peer0 = SessionState::from_lab_psk(Zeroizing::new(LAB_KEY), 2, 1);
+        // Epoch 1 material comes over the socket: the peer's session holds
+        // the mirrored keys — its tx is our ingress, its rx our egress.
+        let egress = Zeroizing::new([0xA5; 32]);
+        let ingress = Zeroizing::new([0x5A; 32]);
+        let peer1 = SessionState::new(
+            1,
+            Zeroizing::new(*ingress), // peer seals with our ingress key
+            Zeroizing::new(*egress),  // and opens our egress traffic
+            22,                       // peer stamps its own index
+            11,                       // and expects our new one
+        );
+
+        let send_sealed = |session: &SessionState, inner: &[u8]| {
+            let mut buf = vec![0u8; HEADER_LEN + inner.len() + TAG_LEN + 32];
+            buf[HEADER_LEN..HEADER_LEN + inner.len()].copy_from_slice(inner);
+            let n = session.seal(&mut buf, inner.len(), MSG_DATA).unwrap();
+            buf[..n].to_vec()
+        };
+        let mut tb = [0u8; 256];
+
+        // Baseline: epoch-0 datagram lands.
+        let pkt0 = ipv4_packet(OTHER_VIP, LOCAL_VIP, b"epoch0");
+        let wire0 = send_sealed(&peer0, &pkt0);
+        let mut landed = false;
+        for _ in 0..40 {
+            remote.send_to(&wire0, bind_addr).await.unwrap();
+            if let Ok(n) = peer.recv(&mut tb) {
+                assert_eq!(&tb[..n], pkt0.as_slice());
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(landed, "epoch-0 packet never reached TUN");
+
+        // StagePeer: the new epoch already decrypts before Activate —
+        // early datagrams under peer_index 22 land on TUN.
+        let resp = control_request(
+            &control_path,
+            "StagePeer",
+            serde_json::json!({
+                "lab_session_id": 7,
+                "key_epoch": 1,
+                "sender_index": 11,
+                "peer_index": 22,
+                "egress_key": hex32(0xA5),
+                "ingress_key": hex32(0x5A),
+            }),
+        )
+        .await;
+        assert_eq!(resp["status"], "ok");
+        let pkt1 = ipv4_packet(OTHER_VIP, LOCAL_VIP, b"staged-epoch1");
+        let wire1 = send_sealed(&peer1, &pkt1);
+        let mut landed = false;
+        for _ in 0..40 {
+            remote.send_to(&wire1, bind_addr).await.unwrap();
+            if let Ok(n) = peer.recv(&mut tb) {
+                assert_eq!(&tb[..n], pkt1.as_slice());
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(landed, "staged-epoch packet never reached TUN");
+
+        // Activate: outbound traffic flips to sender_index 11.
+        let resp = control_request(
+            &control_path,
+            "Activate",
+            serde_json::json!({"key_epoch": 1}),
+        )
+        .await;
+        assert_eq!(resp["status"], "ok");
+        peer.send(&ipv4_packet(LOCAL_VIP, OTHER_VIP, b"out1"))
+            .unwrap();
+        let mut rb = [0u8; 256];
+        let (_, _) = tokio::time::timeout(Duration::from_secs(2), remote.recv_from(&mut rb))
+            .await
+            .expect("post-activate datagram timed out")
+            .unwrap();
+        assert_eq!(&rb[2..6], &11u32.to_be_bytes());
+
+        // Retiring epoch 0 still decrypts during the drain window.
+        let pkt0b = ipv4_packet(OTHER_VIP, LOCAL_VIP, b"epoch0-late");
+        let wire0b = send_sealed(&peer0, &pkt0b);
+        let mut landed = false;
+        for _ in 0..40 {
+            remote.send_to(&wire0b, bind_addr).await.unwrap();
+            if let Ok(n) = peer.recv(&mut tb) {
+                assert_eq!(&tb[..n], pkt0b.as_slice());
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(landed, "retiring-epoch packet dropped during drain");
+
+        // Retire ends the window: the same peer can no longer reach epoch 0.
+        let resp =
+            control_request(&control_path, "Retire", serde_json::json!({"key_epoch": 0})).await;
+        assert_eq!(resp["status"], "ok");
+        let pkt0c = ipv4_packet(OTHER_VIP, LOCAL_VIP, b"epoch0-dead");
+        let wire0c = send_sealed(&peer0, &pkt0c);
+        remote.send_to(&wire0c, bind_addr).await.unwrap();
+        assert!(
+            peer.recv(&mut tb).is_err(),
+            "retired-epoch packet reached TUN"
+        );
+
+        // GetSessions reports one active epoch with the observed counters.
+        let resp = control_request(&control_path, "GetSessions", serde_json::json!({})).await;
+        let epochs = resp["result"]["epochs"].as_array().unwrap();
+        assert_eq!(epochs.len(), 1);
+        assert_eq!(epochs[0]["key_epoch"], 1);
+        assert_eq!(epochs[0]["role"], "active");
+        assert_eq!(epochs[0]["rx_pkts"], 1);
+        assert_eq!(epochs[0]["tx_pkts"], 1);
 
         test_sigterm();
         engine.await.unwrap().unwrap();

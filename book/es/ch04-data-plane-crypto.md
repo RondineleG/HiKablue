@@ -130,6 +130,38 @@ direcciones internas puede llevar. Los drops cuentan por causa:
 `KEEPALIVE` vacío. El motor envía keepalives vacíos, pero no comprueba esa
 longitud al recibirlos. Un keepalive autenticado no vacío no se escribe en TUN.
 
+## Rotación sin pérdida: la frontera de control
+
+Un `--key` fijo no puede rotar. El motor ahora expone un segundo socket
+Unix — `--control-sock`, modo 0600 — que acepta operaciones del ciclo de
+vida de claves del agente del nodo en el mismo sobre JSON con prefijo de
+longitud u32-BE del socket de métricas, controlado por `SO_PEERCRED`
+(root, el uid del propio motor o el agente `--control-uid`). El material
+de claves nunca cruza el socket de telemetría.
+
+Las operaciones implementan un commit en dos fases con ventana de drenaje:
+
+- `StagePeer` aloja una nueva época en un slot de staging; rx acepta de
+  inmediato datagramas sellados con el nuevo `peer_index`.
+- `Activate` cambia el egreso a la época en staging en un límite de
+  paquete y cuenta `rotations_total`; la época vieja sigue descifrando —
+  ahora está retirándose.
+- `Retire` cierra el drenaje: la época sale de la tabla y sus claves se
+  zeroizan.
+- `RevokePeer` borra todas las épocas; el motor sigue con clave y
+  descarta tráfico hasta el reprovisionamiento.
+
+[`SessionTable`](../../engine-rust/src/sessions.rs) guarda una época
+`tx`, un slot `staged` y un mapa `rx` indexado por el `sender_index`
+del wire — los lectores toman el `RwLock` compartido y clonan un `Arc`,
+así el camino de paquetes nunca se detiene en una rotación.
+`GetSessions` y la respuesta de métricas reportan `tx_pkts`/`rx_pkts`
+por época y `rx_unknown_sender_index_total`.
+
+`PeerKeyMaterial` en el proto ganó campos explícitos `sender_index` y
+`peer_index`: `lab_session_id` identifica la sesión de laboratorio entre
+rekeys, mientras cada nueva época recibe índices de wire nuevos.
+
 ## Lab
 
 ```bash
@@ -239,6 +271,39 @@ fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
 - Nótese: `check` solo lee. La marca ocurre en `update()`, llamado
   únicamente después de que la etiqueta AEAD verifique.
 
+### `activate` — `engine-rust/src/sessions.rs`
+
+```rust
+    pub fn activate(&self, key_epoch: u64) -> Result<u64, TableError> {
+        let mut state = self.state.write().unwrap();
+        if state
+            .tx
+            .as_ref()
+            .is_some_and(|active| active.key_epoch() == key_epoch)
+        {
+            return Ok(key_epoch);
+        }
+        if state.staged.as_ref().map(|s| s.key_epoch()) != Some(key_epoch) {
+            return Err(TableError::UnknownEpoch(key_epoch));
+        }
+        let staged = state.staged.take().unwrap();
+        let previous = state.tx.replace(staged);
+        Ok(previous.map(|s| s.key_epoch()).unwrap_or(0))
+    }
+```
+
+- El `write()` del `RwLock` retiene escritores y lectores juntos por unas
+  pocas instrucciones — las mutaciones son raras (una por rotación), así
+  que el costo desaparece frente al beneficio de no cargar `ArcSwap`.
+- La primera comprobación hace `Activate` idempotente: una entrega
+  repetida es un no-op confirmado, no un error.
+- La segunda impide que un `Activate` fuera de orden consuma el slot de
+  staging — la época pedida debe ser exactamente la que espera.
+- `state.tx.replace(staged)` es el cambio atómico: la época nueva asume
+  el egreso y la antigua vuelve al `Option` — sigue en el mapa `rx` como
+  *retiring* hasta que el `Retire` del agente cierre la ventana de
+  drenaje.
+
 ## Glosario
 
 - **AAD (Associated Authenticated Data)** — datos autenticados pero no
@@ -246,6 +311,9 @@ fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
   etiqueta.
 - **AEAD** — "Authenticated Encryption with Associated Data": cifrado +
   integridad en una sola operación; aquí, ChaCha20-Poly1305 (RFC 8439).
+- **`Arc`** — puntero compartido con conteo atómico de referencias: cada
+  lector del mapa `rx` clona un `Arc` y retiene la época sin bloquear a
+  los escritores.
 - **AtomicU64 / `try_update`** — Actualización atómica condicional; no se comparte un nonce.
 - **BLAKE2s-256** — función hash de 32 bytes usada para derivar la
   clave de cada dirección del PSK + índice.
@@ -255,6 +323,12 @@ fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
 - **Headroom / tailroom** — espacio reservado antes/después del payload
   en el buffer: 14B delante para el encabezado, 16B detrás para la
   etiqueta — sin realocar.
+- **`--control-sock`** — socket Unix de control (modo 0600) por el que el
+  agente envía StagePeer/Activate/Retire/RevokePeer; separado del socket
+  de métricas para que las claves nunca crucen la telemetría.
+- **Época (`key_epoch`)** — número de una generación de claves; cada
+  rotación crea una época nueva con índices y claves nuevos, sin reutilizar
+  nada.
 - **`--key <64-hex>`** — PSK de laboratorio: 64 dígitos hexadecimales =
   32 bytes, pasado en ambos extremos. Solo lab.
 - **Keepalive (0x02)** — datagrama sellado sin payload, emitido cuando
@@ -267,11 +341,23 @@ fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
   lados antes de la conversación — en el lab, viene de `--key`.
 - **Replay window** — el bitmap de 2048 bits que recuerda qué
   contadores recientes ya fueron autenticados.
+- **`RwLock`** — lock de lectura-escritura: muchos lectores (el camino de
+  paquetes) o un escritor (una rotación) a la vez — los lectores nunca se
+  esperan entre sí.
+- **`SO_PEERCRED`** — opción de socket Unix que revela el uid de quien
+  conectó; el socket de control solo acepta root, el uid del motor o
+  `--control-uid`.
+- **Ventana de drenaje** — intervalo entre `Activate` y `Retire` en que
+  la época antigua sigue descifrando paquetes en vuelo; la duración la
+  decide el agente.
 - **`--sender-index` / `--peer-index`** — el identificador de sesión
   estampado por quien envía / esperado por quien recibe; también elige
   qué clave derivada usar.
 - **`split_at_mut`** — el fatiador de Rust que divide un buffer en dos
   regiones mutables disjuntas en tiempo constante.
+- **Tombstone** — el registro de lo que murió: época, índices y
+  *fingerprints* de las claves retiradas, para que ninguno vuelva a
+  provisionarse.
 - **TUN** — la interfaz virtual que entrega/recibe paquetes IP
   internos.
 - **`u64::MAX − 65536`** — el techo del contador: margen antes del
@@ -293,10 +379,33 @@ Y un desafío: `last_seq = 4100`. ¿Pasa `check()` un paquete con
 `seq = 2051`? Pista: calcula `diff` y compara con `WINDOW_SIZE` (2048).
 `diff = 2049 ≥ 2048` → `Expired`, rechazado.
 
+## Ejercicio — conduce una rotación por el socket de control
+
+Arranca el engine con `--control-sock /tmp/ctl.sock` y, con el laboratorio
+pasando tráfico continuo, envía en orden:
+
+1. `StagePeer` con `key_epoch=1`, `sender_index=33`, `peer_index=44` y
+   dos claves de 64-hex distintas para egreso/ingreso;
+2. `Activate` `key_epoch=1`;
+3. tras unos segundos, `Retire` `key_epoch=0`.
+
+Pregunta en cada paso qué `sender_index` acepta el rx. Respuestas: tras
+(1) acepta el `peer_index` antiguo **y** el nuevo 44; tras (2) el egreso
+ya sella con 33 mientras el ingreso sigue aceptando ambos; tras (3) solo
+queda 44 — `rx_unknown_sender_index` empieza a contar rezagados de la
+época muerta y `rotations_total` marca 1. Un `Retire` repetido es un
+no-op exitoso, y reutilizar la época 1, el índice 33 o las mismas claves
+es rechazado por el tombstone.
+
 ## Revisiones
 
 - `r1` — Época de 64 bits, borrado de claves, límite de nonces y vector RFC.
+- `r3` — Verificado en la VM de desarrollo: 108 tests de Rust, gate local
+  12/12 (lab privilegiado omitido); GitHub Actions bloqueado por cobro.
 - `r0` — AEAD, ventana de replay, latch de nonce, ingreso simétrico,
   `--key`/`--sender-index`/`--peer-index`/`--keepalive-secs`, métricas
   de ingreso separadas.
 - `r2` — Aclara la validación de frames y separa la evidencia histórica del lab de la ejecución local de `r1`.
+- `r3` — Socket de control (`--control-sock`, `SO_PEERCRED`), `SessionTable`
+  multi-época en rx, StagePeer/Activate/Retire/RevokePeer, contadores por
+  época, `sender_index`/`peer_index` en el proto.

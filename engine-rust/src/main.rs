@@ -1,10 +1,12 @@
 // coverage: lab-only begin — process bootstrap glue; exercised end-to-end
 // by the lab demos, not unit tests.
 mod cli;
+mod control;
 mod crypto;
 mod forward;
 mod metrics;
 mod packet;
+mod sessions;
 mod tun;
 mod wire;
 
@@ -40,6 +42,8 @@ async fn main() {
             mtu: args.common.mtu,
             metrics_sock: args.common.metrics_sock,
             metrics_group: args.common.metrics_group,
+            control_sock: args.common.control_sock,
+            control_uid: args.common.control_uid,
             key: parse_key_arg(args.common.key),
             sender_index: args.common.sender_index,
             peer_index: args.common.peer_index,
@@ -54,6 +58,8 @@ async fn main() {
             mtu: args.common.mtu,
             metrics_sock: args.common.metrics_sock,
             metrics_group: args.common.metrics_group,
+            control_sock: args.common.control_sock,
+            control_uid: args.common.control_uid,
             key: parse_key_arg(args.common.key),
             sender_index: args.common.sender_index,
             peer_index: args.common.peer_index,
