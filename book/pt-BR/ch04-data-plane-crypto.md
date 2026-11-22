@@ -266,12 +266,47 @@ fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
 - Repare: `check` só lê. A marcação acontece em `update()`, chamado
   somente depois da tag AEAD verificar.
 
+### `activate` — `engine-rust/src/sessions.rs`
+
+```rust
+    pub fn activate(&self, key_epoch: u64) -> Result<u64, TableError> {
+        let mut state = self.state.write().unwrap();
+        if state
+            .tx
+            .as_ref()
+            .is_some_and(|active| active.key_epoch() == key_epoch)
+        {
+            return Ok(key_epoch);
+        }
+        if state.staged.as_ref().map(|s| s.key_epoch()) != Some(key_epoch) {
+            return Err(TableError::UnknownEpoch(key_epoch));
+        }
+        let staged = state.staged.take().unwrap();
+        let previous = state.tx.replace(staged);
+        Ok(previous.map(|s| s.key_epoch()).unwrap_or(0))
+    }
+```
+
+- O `write()` no `RwLock` segura escritores e leitores juntos por algumas
+  instruções — mutações são raras (uma por rotação), então o custo some
+  diante do benefício de não haver `ArcSwap`.
+- A primeira verificação torna `Activate` idempotente: entrega repetida
+  da mesma operação é um no-op confirmado, não erro.
+- A segunda impede que um `Activate` fora de ordem consuma o slot de
+  staging — a época pedida precisa ser exatamente a que está esperando.
+- `state.tx.replace(staged)` é a virada atômica: a época nova assume o
+  egresso e a antiga volta no `Option` — que segue no mapa `rx` como
+  *retiring* até o `Retire` do agente fechar a janela de drenagem.
+
 ## Glossário
 
 - **AAD (Associated Authenticated Data)** — dados autenticados mas não
   cifrados; aqui, os 14 bytes do cabeçalho. Mexer neles quebra a tag.
 - **AEAD** — "Authenticated Encryption with Associated Data": cifra +
   integridade numa operação só; aqui, ChaCha20-Poly1305 (RFC 8439).
+- **`Arc`** — ponteiro compartilhado com contagem de referências: cada
+  leitor do mapa `rx` clona um `Arc` e segura a época sem bloquear
+  escritores.
 - **AtomicU64 / `try_update`** — Atualização atômica condicional; duas chamadas não compartilham nonce.
 - **BLAKE2s-256** — função hash de 32 bytes usada para derivar a chave
   de cada direção do PSK + índice.
@@ -281,6 +316,11 @@ fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
 - **Headroom / tailroom** — espaço reservado antes/depois do payload no
   buffer: 14B na frente pro cabeçalho, 16B atrás pra tag — sem
   realocar.
+- **`--control-sock`** — socket Unix de controle (modo 0600) por onde o
+  agente envia StagePeer/Activate/Retire/RevokePeer; separado do socket
+  de métricas para manter chaves fora da telemetria.
+- **Época (`key_epoch`)** — número de uma geração de chaves; cada rotação
+  cria uma época nova com índices e chaves novos, nunca reutiliza nada.
 - **`--key <64-hex>`** — PSK de laboratório: 64 dígitos hexadecimais =
   32 bytes, passado nas duas pontas. Somente lab.
 - **Keepalive (0x02)** — datagrama selado sem payload, emitido quando o
@@ -293,11 +333,23 @@ fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
   lados antes da conversa — no lab, vem do `--key`.
 - **Replay window** — o bitmap de 2048 bits que lembra quais contadores
   recentes já foram autenticados.
+- **`RwLock`** — trava de leitura-escrita: muitos leitores (o caminho de
+  pacotes) ou um escritor (a rotação) por vez — leitores nunca esperam
+  entre si.
+- **`SO_PEERCRED`** — opção de socket Unix que revela o uid de quem
+  conectou; o socket de controle só aceita root, o uid do motor ou
+  `--control-uid`.
+- **Janela de drenagem** — intervalo entre `Activate` e `Retire` em que
+  a época antiga continua decifrando pacotes em voo; quem decide a
+  duração é o agente.
 - **`--sender-index` / `--peer-index`** — o identificador de sessão
   carimbado por quem envia / esperado por quem recebe; também escolhe
   qual chave derivada usar.
 - **`split_at_mut`** — fatiador do Rust que divide um buffer em duas
   regiões mutáveis disjuntas em tempo constante.
+- **Tombstone** — registro do que já morreu: época, índices e
+  *fingerprints* das chaves aposentadas, para que nenhum dos três volte
+  a ser provisionado.
 - **TUN** — a interface virtual que entrega/recebe pacotes IP internos.
 - **`u64::MAX − 65536`** — o teto do contador: margem antes do overflow
   para disparar `NonceExhaustionNeedsRekey`.
@@ -317,9 +369,29 @@ E um desafio: `last_seq = 4100`. O pacote com `seq = 2051` passa em
 `check()`? Dica: calcule `diff` e compare com `WINDOW_SIZE` (2048).
 `diff = 2049 ≥ 2048` → `Expired`, rejeitado.
 
+## Exercício — conduza uma rotação no socket de controle
+
+Suba o engine com `--control-sock /tmp/ctl.sock` e, com o laboratório
+rodando tráfego contínuo, envie na ordem:
+
+1. `StagePeer` com `key_epoch=1`, `sender_index=33`, `peer_index=44` e
+   chaves de 64-hex distintas para egresso/ingresso;
+2. `Activate` `key_epoch=1`;
+3. depois de alguns segundos, `Retire` `key_epoch=0`.
+
+Pergunte a cada passo qual `sender_index` o rx aceita. Respostas: após
+(1) aceita o `peer_index` antigo **e** o novo 44; após (2) o egresso já
+sela com 33 enquanto o ingresso continua aceitando os dois; após (3) só
+44 resta — `rx_unknown_sender_index` começa a contar datagramas atrasados
+da época morta, e `rotations_total` marca 1. Um `Retire` repetido retorna
+sucesso (no-op), e reaproveitar a época 1, o índice 33 ou as mesmas
+chaves é recusado pelo tombstone.
+
 ## Revisões
 
 - `r1` — Época de 64 bits, descarte de chaves, teto de nonces e vetor RFC.
+- `r3` — Verificado na VM de desenvolvimento: 108 testes Rust, gate local
+  12/12 (lab privilegiado pulado); GitHub Actions bloqueado por cobrança.
 - `r0` — AEAD, janela de replay, latch de nonce, ingresso simétrico,
   `--key`/`--sender-index`/`--peer-index`/`--keepalive-secs`, métricas
   de ingresso separadas.

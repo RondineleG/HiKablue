@@ -265,6 +265,39 @@ fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
 - Note: `check` only reads. Marking happens in `update()`, called only
   after the AEAD tag verifies.
 
+### `activate` — `engine-rust/src/sessions.rs`
+
+```rust
+    pub fn activate(&self, key_epoch: u64) -> Result<u64, TableError> {
+        let mut state = self.state.write().unwrap();
+        if state
+            .tx
+            .as_ref()
+            .is_some_and(|active| active.key_epoch() == key_epoch)
+        {
+            return Ok(key_epoch);
+        }
+        if state.staged.as_ref().map(|s| s.key_epoch()) != Some(key_epoch) {
+            return Err(TableError::UnknownEpoch(key_epoch));
+        }
+        let staged = state.staged.take().unwrap();
+        let previous = state.tx.replace(staged);
+        Ok(previous.map(|s| s.key_epoch()).unwrap_or(0))
+    }
+```
+
+- The `RwLock` `write()` holds writers and readers together for a few
+  instructions — mutations are rare (one per rotation), so the cost
+  disappears next to the benefit of carrying no `ArcSwap` dependency.
+- The first check makes `Activate` idempotent: a redelivered op is a
+  confirmed no-op, not an error.
+- The second stops an out-of-order `Activate` from consuming the
+  staging slot — the requested epoch must be exactly the staged one.
+- `state.tx.replace(staged)` is the atomic cut-over: the new epoch
+  takes over egress and the old one lands back in the `Option` — it
+  stays in the `rx` map as *retiring* until the agent's `Retire` ends
+  the drain window.
+
 ## Glossary
 
 - **AAD (Associated Authenticated Data)** — data authenticated but not
@@ -272,6 +305,9 @@ fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
 - **AEAD** — "Authenticated Encryption with Associated Data":
   encryption + integrity in one operation; here, ChaCha20-Poly1305
   (RFC 8439).
+- **`Arc`** — an atomically reference-counted shared pointer: each `rx`
+  map reader clones an `Arc` and holds the epoch without blocking
+  writers.
 - **AtomicU64 / `try_update`** — Atomic conditional update; concurrent callers cannot share a nonce.
 - **BLAKE2s-256** — the 32-byte hash function used to derive each
   direction's key from PSK + index.
@@ -281,6 +317,12 @@ fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
 - **Headroom / tailroom** — space reserved before/after the payload in
   the buffer: 14B up front for the header, 16B at the back for the tag
   — no reallocating.
+- **`--control-sock`** — the Unix control socket (mode 0600) through
+  which the agent sends StagePeer/Activate/Retire/RevokePeer; kept
+  separate from the metrics socket so keys never cross telemetry.
+- **Epoch (`key_epoch`)** — the number of one key generation; each
+  rotation creates a new epoch with fresh indexes and keys, never
+  reusing any of them.
 - **`--key <64-hex>`** — the lab PSK: 64 hex digits = 32 bytes, passed
   on both ends. Lab only.
 - **Keepalive (0x02)** — a sealed datagram with no payload, sent when
@@ -293,11 +335,22 @@ fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
   before the conversation — in the lab, it comes from `--key`.
 - **Replay window** — the 2048-bit bitmap remembering which recent
   counters were already authenticated.
+- **`RwLock`** — a read-write lock: many readers (the packet path) or
+  one writer (a rotation) at a time — readers never wait on each other.
+- **`SO_PEERCRED`** — a Unix socket option that reveals the connecting
+  peer's uid; the control socket only accepts root, the engine's uid or
+  `--control-uid`.
+- **Drain window** — the span between `Activate` and `Retire` during
+  which the old epoch keeps decrypting in-flight packets; its duration
+  is the agent's call.
 - **`--sender-index` / `--peer-index`** — the session identifier
   stamped by the sender / expected by the receiver; it also selects
   which derived key to use.
 - **`split_at_mut`** — Rust's slicer that splits a buffer into two
   disjoint mutable regions in constant time.
+- **Tombstone** — the record of what is dead: epoch number, wire
+  indexes and key *fingerprints* of a retired epoch, so none of them
+  can ever be provisioned again.
 - **TUN** — the virtual interface that hands inner IP packets in and
   out.
 - **`u64::MAX − 65536`** — the counter ceiling: headroom before
@@ -318,9 +371,29 @@ And a challenge: `last_seq = 4100`. Does a packet with `seq = 2051`
 pass `check()`? Hint: compute `diff` and compare with `WINDOW_SIZE`
 (2048). `diff = 2049 ≥ 2048` → `Expired`, rejected.
 
+## Exercise — drive a rotation on the control socket
+
+Start the engine with `--control-sock /tmp/ctl.sock` and, with the lab
+passing continuous traffic, send in order:
+
+1. `StagePeer` with `key_epoch=1`, `sender_index=33`, `peer_index=44`
+   and two different 64-hex keys for egress/ingress;
+2. `Activate` `key_epoch=1`;
+3. after a few seconds, `Retire` `key_epoch=0`.
+
+At each step, ask which `sender_index` the rx path accepts. Answers:
+after (1) it accepts the old `peer_index` **and** the new 44; after (2)
+egress already seals with 33 while ingress still accepts both; after (3)
+only 44 remains — `rx_unknown_sender_index` starts counting stragglers
+from the dead epoch and `rotations_total` reads 1. A repeated `Retire`
+succeeds as a no-op, and reusing epoch 1, index 33 or the same keys is
+refused by the tombstone.
+
 ## Revisions
 
 - `r1` — 64-bit epoch, zeroizing keys, concurrent nonce ceiling and RFC vector.
+- `r3` — Verified on the dev VM: 108 Rust tests, local gate 12/12
+  (privileged lab skipped); GitHub Actions blocked by billing.
 - `r0` — AEAD, replay window, nonce latch, symmetric ingress,
   `--key`/`--sender-index`/`--peer-index`/`--keepalive-secs`, split
   ingress metrics.
