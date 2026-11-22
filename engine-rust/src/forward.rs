@@ -125,9 +125,12 @@ impl Config {
             if self.sender_index == self.peer_index {
                 return Err(invalid("sender_index and peer_index must differ".into()));
             }
-            // A zero interval re-arms instantly and wins every biased
-            // select! round — the loop would emit keepalives forever and
-            // starve TUN and UDP reads.
+        }
+        // Keepalive and MTU rules apply whenever the engine can become
+        // keyed — a fixed --key now, or a StagePeer over the control
+        // socket later. A zero interval would re-arm instantly and win
+        // every biased select! round once an epoch activates.
+        if self.key.is_some() || self.control_sock.is_some() {
             if self.keepalive_interval.is_zero() {
                 return Err(invalid(
                     "keepalive interval must be greater than zero".into(),
@@ -345,6 +348,10 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
     }
 
     let mut learned_peer: Option<SocketAddr> = None;
+    // A RevokePeer wipes the session that pinned the endpoint; the
+    // reprovisioned peer may come from a different port, so the learned
+    // endpoint is dropped along with the old keys.
+    let mut seen_revocations = sessions.revocations();
     // TUN reads land past HEADER_LEN of headroom so sealing needs no copy;
     // decrypted UDP payloads are consumed in place at the same offset.
     let mut tun_buf = [0u8; BUFFER_SIZE];
@@ -356,6 +363,10 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
     let mut next_keepalive = tokio::time::Instant::now() + cfg.keepalive_interval;
 
     loop {
+        if sessions.revocations() != seen_revocations {
+            learned_peer = None;
+            seen_revocations = sessions.revocations();
+        }
         tokio::select! {
             biased;
             result = tokio::signal::ctrl_c() => {
@@ -365,9 +376,16 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
             _ = sigterm.recv() => {
                 break;
             }
-            _ = tokio::time::sleep_until(next_keepalive), if sessions.has_tx() => {
+            // The keepalive timer always arms — when the engine has no
+            // active epoch yet it just re-arms, so a later Activate over
+            // the control socket starts keepalives without needing
+            // traffic first. Guarding inside (not in select!) also keeps
+            // a concurrent RevokePeer from racing the tx() clone.
+            _ = tokio::time::sleep_until(next_keepalive) => {
                 next_keepalive = tokio::time::Instant::now() + cfg.keepalive_interval;
-                let session = sessions.tx().unwrap();
+                let Some(session) = sessions.tx() else {
+                    continue;
+                };
                 let wire_len = match session.seal(&mut tun_buf, 0, MSG_KEEPALIVE) {
                     Ok(n) => n,
                     Err(err) => {
