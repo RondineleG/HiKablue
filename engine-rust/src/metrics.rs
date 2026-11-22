@@ -25,15 +25,17 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::sessions::{EpochRole, SessionTable};
+
 /// Largest accepted request frame, per the socket contract (1 MiB). The
 /// GetMetrics request is a handful of bytes, so anything bigger is rejected
 /// before allocation.
-const MAX_FRAME: u32 = 1 << 20;
+pub(crate) const MAX_FRAME: u32 = 1 << 20;
 
 /// Time a connection may take to deliver or receive a frame. An accepted
 /// connection holds a task and a file descriptor; without a deadline a
 /// silent peer could exhaust descriptors and take the listener down.
-const IO_DEADLINE: Duration = Duration::from_secs(10);
+pub(crate) const IO_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Upper bound on simultaneous metrics connections.
 const MAX_CONNECTIONS: usize = 64;
@@ -57,6 +59,11 @@ pub struct Metrics {
     pub invalid_inner_dst: AtomicU64,
     /// 0 or 1 for the current single fixed peer.
     pub peers: AtomicU64,
+    /// Datagrams dropped because their `sender_index` maps to no known
+    /// epoch — retired, never provisioned or garbage.
+    pub rx_unknown_sender_index: AtomicU64,
+    /// Key rotations completed by an Activate on the control socket.
+    pub rotations_total: AtomicU64,
     started: Instant,
 }
 
@@ -71,12 +78,35 @@ impl Metrics {
             invalid_inner_src: AtomicU64::new(0),
             invalid_inner_dst: AtomicU64::new(0),
             peers: AtomicU64::new(0),
+            rx_unknown_sender_index: AtomicU64::new(0),
+            rotations_total: AtomicU64::new(0),
             started: Instant::now(),
         })
     }
 }
 
-fn metrics_json(m: &Metrics) -> serde_json::Value {
+fn metrics_json(m: &Metrics, sessions: Option<&SessionTable>) -> serde_json::Value {
+    let epochs: Vec<serde_json::Value> = sessions
+        .map(|t| {
+            t.snapshot()
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "key_epoch": e.key_epoch,
+                        "sender_index": e.sender_index,
+                        "peer_index": e.peer_index,
+                        "role": match e.role {
+                            EpochRole::Active => "active",
+                            EpochRole::Staged => "staged",
+                            EpochRole::Retiring => "retiring",
+                        },
+                        "tx_pkts": e.tx_pkts,
+                        "rx_pkts": e.rx_pkts,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     serde_json::json!({
         "rx_bytes": m.rx_bytes.load(Ordering::Relaxed),
         "rx_pkts": m.rx_pkts.load(Ordering::Relaxed),
@@ -85,21 +115,68 @@ fn metrics_json(m: &Metrics) -> serde_json::Value {
         "dropped_pkts": m.dropped_pkts.load(Ordering::Relaxed),
         "invalid_inner_src_total": m.invalid_inner_src.load(Ordering::Relaxed),
         "invalid_inner_dst_total": m.invalid_inner_dst.load(Ordering::Relaxed),
+        "rx_unknown_sender_index_total": m.rx_unknown_sender_index.load(Ordering::Relaxed),
+        "rotations_total": m.rotations_total.load(Ordering::Relaxed),
         "peers": m.peers.load(Ordering::Relaxed),
+        "epochs": epochs,
         "uptime_secs": m.started.elapsed().as_secs(),
     })
 }
 
-fn error_envelope_body(code: &str, message: &str) -> serde_json::Value {
+pub(crate) fn error_envelope_body(code: &str, message: &str) -> serde_json::Value {
     serde_json::json!({
         "status": "error",
         "error": {"code": code, "message": message},
     })
 }
 
+/// Reads one length-prefixed frame under the I/O deadline: the length is
+/// validated before allocating and `read_exact` assembles the whole frame
+/// because a single `read` may return any prefix of it.
+pub(crate) async fn read_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
+    let read = async {
+        let len = stream.read_u32().await?;
+        if len > MAX_FRAME {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame of {len} bytes exceeds {MAX_FRAME}"),
+            ));
+        }
+        let mut frame = vec![0u8; len as usize];
+        stream.read_exact(&mut frame).await?;
+        Ok::<_, io::Error>(frame)
+    };
+    tokio::time::timeout(IO_DEADLINE, read)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "read deadline"))?
+}
+
+/// Writes one length-prefixed JSON frame under the I/O deadline.
+pub(crate) async fn write_frame(stream: &mut UnixStream, body: &str) -> io::Result<()> {
+    let write = async {
+        stream.write_u32(body.len() as u32).await?;
+        stream.write_all(body.as_bytes()).await
+    };
+    tokio::time::timeout(IO_DEADLINE, write)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "write deadline"))?
+}
+
+/// Builds the response envelope: `request_id` echoes verbatim (any JSON
+/// type) and `version` is always 1.
+pub(crate) fn respond(request: &serde_json::Value, body: serde_json::Value) -> String {
+    let mut response = body;
+    response["request_id"] = request
+        .get("request_id")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    response["version"] = serde_json::json!(1);
+    response.to_string()
+}
+
 /// Envelope rules from the socket contract: `request_id`, `version`,
 /// `op` and `payload` are all required; only protocol version 1 exists.
-fn validate_request(req: &serde_json::Value) -> Result<(), (&'static str, String)> {
+pub(crate) fn validate_request(req: &serde_json::Value) -> Result<(), (&'static str, String)> {
     let missing = |f: &str| Err(("missing_field", format!("missing {f}")));
     if req.get("request_id").is_none() {
         return missing("request_id");
@@ -180,15 +257,21 @@ pub fn bind(path: &Path, group: Option<&str>) -> io::Result<UnixListener> {
 }
 
 /// Serves `GetMetrics` on the listener until the task is aborted.
-pub async fn serve(metrics: Arc<Metrics>, listener: UnixListener) -> io::Result<()> {
+/// `sessions` feeds the per-epoch snapshot when the engine runs keyed.
+pub async fn serve(
+    metrics: Arc<Metrics>,
+    listener: UnixListener,
+    sessions: Option<Arc<SessionTable>>,
+) -> io::Result<()> {
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (stream, _) = listener.accept().await?;
         let m = metrics.clone();
+        let s = sessions.clone();
         let permit = permits.clone().acquire_owned().await.unwrap();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(err) = handle(m, stream).await {
+            if let Err(err) = handle(m, s, stream).await {
                 eprintln!("vpn-engine metrics: {err}");
             }
         });
@@ -200,25 +283,12 @@ pub fn cleanup(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
-async fn handle(metrics: Arc<Metrics>, mut stream: UnixStream) -> io::Result<()> {
-    let read = async {
-        let len = stream.read_u32().await?;
-        if len > MAX_FRAME {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("metrics frame of {len} bytes exceeds {MAX_FRAME}"),
-            ));
-        }
-        // The length prefix says how many bytes the frame holds; the socket
-        // is free to deliver them one at a time. read_exact keeps reading
-        // until the whole frame is assembled or the peer disconnects.
-        let mut frame = vec![0u8; len as usize];
-        stream.read_exact(&mut frame).await?;
-        Ok::<_, io::Error>(frame)
-    };
-    let frame = tokio::time::timeout(IO_DEADLINE, read)
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "metrics read deadline"))??;
+async fn handle(
+    metrics: Arc<Metrics>,
+    sessions: Option<Arc<SessionTable>>,
+    mut stream: UnixStream,
+) -> io::Result<()> {
+    let frame = read_frame(&mut stream).await?;
 
     let request: serde_json::Value = serde_json::from_slice(&frame)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
@@ -228,28 +298,16 @@ async fn handle(metrics: Arc<Metrics>, mut stream: UnixStream) -> io::Result<()>
     // answered with a valid error envelope, not a dropped connection.
     let body = match validate_request(&request) {
         Ok(()) => match request["op"].as_str() {
-            Some("GetMetrics") => {
-                serde_json::json!({"status": "ok", "result": metrics_json(&metrics)})
-            }
+            Some("GetMetrics") => serde_json::json!({
+                "status": "ok",
+                "result": metrics_json(&metrics, sessions.as_deref())
+            }),
             Some(other) => error_envelope_body("unknown_op", &format!("unknown op {other:?}")),
             None => error_envelope_body("invalid_op", "op must be a string"),
         },
         Err((code, message)) => error_envelope_body(code, &message),
     };
-    let mut response = body;
-    response["request_id"] = request
-        .get("request_id")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    response["version"] = serde_json::json!(1);
-    let response = response.to_string();
-    let write = async {
-        stream.write_u32(response.len() as u32).await?;
-        stream.write_all(response.as_bytes()).await
-    };
-    tokio::time::timeout(IO_DEADLINE, write)
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "metrics write deadline"))?
+    write_frame(&mut stream, &respond(&request, body)).await
 }
 
 #[cfg(test)]
@@ -271,7 +329,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let listener = bind(&path, None).unwrap();
         let m = Metrics::new();
-        tokio::spawn(serve(m, listener));
+        tokio::spawn(serve(m, listener, None));
         path
     }
 
@@ -347,7 +405,7 @@ mod tests {
         let m = Metrics::new();
         m.rx_bytes.store(5, Ordering::Relaxed);
         m.dropped_pkts.store(1, Ordering::Relaxed);
-        tokio::spawn(serve(m, listener));
+        tokio::spawn(serve(m, listener, None));
         let resp = request(
             &path,
             &serde_json::json!({"request_id": "r", "version": 1, "op": "GetMetrics", "payload": {}}),
@@ -363,7 +421,7 @@ mod tests {
         let path = sock_path("live");
         let _ = std::fs::remove_file(&path);
         let listener = bind(&path, None).unwrap();
-        tokio::spawn(serve(Metrics::new(), listener));
+        tokio::spawn(serve(Metrics::new(), listener, None));
         tokio::time::sleep(Duration::from_millis(50)).await;
         let err = bind(&path, None).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);

@@ -139,6 +139,14 @@ message PeerKeyMaterial {
   // 32-byte ChaCha20 keys, one per direction (engine→peer, peer→engine).
   bytes egress_key = 2;
   bytes ingress_key = 3;
+  // Wire session index this engine stamps on outbound packets for the
+  // epoch. Distinct from Peer.lab_session_id, which identifies the lab
+  // session across rekeys (spec §6: a new key epoch gets a new wire
+  // session ID).
+  uint32 sender_index = 4;
+  // Wire session index the peer stamps on its packets for the epoch;
+  // selects the engine's ingress direction key.
+  uint32 peer_index = 5;
 }
 
 message ProvisionPeer {

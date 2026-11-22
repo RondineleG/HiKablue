@@ -130,6 +130,38 @@ direcciones internas puede llevar. Los drops cuentan por causa:
 `KEEPALIVE` vacío. El motor envía keepalives vacíos, pero no comprueba esa
 longitud al recibirlos. Un keepalive autenticado no vacío no se escribe en TUN.
 
+## Rotación sin pérdida: la frontera de control
+
+Un `--key` fijo no puede rotar. El motor ahora expone un segundo socket
+Unix — `--control-sock`, modo 0600 — que acepta operaciones del ciclo de
+vida de claves del agente del nodo en el mismo sobre JSON con prefijo de
+longitud u32-BE del socket de métricas, controlado por `SO_PEERCRED`
+(root, el uid del propio motor o el agente `--control-uid`). El material
+de claves nunca cruza el socket de telemetría.
+
+Las operaciones implementan un commit en dos fases con ventana de drenaje:
+
+- `StagePeer` aloja una nueva época en un slot de staging; rx acepta de
+  inmediato datagramas sellados con el nuevo `peer_index`.
+- `Activate` cambia el egreso a la época en staging en un límite de
+  paquete y cuenta `rotations_total`; la época vieja sigue descifrando —
+  ahora está retirándose.
+- `Retire` cierra el drenaje: la época sale de la tabla y sus claves se
+  zeroizan.
+- `RevokePeer` borra todas las épocas; el motor sigue con clave y
+  descarta tráfico hasta el reprovisionamiento.
+
+[`SessionTable`](../../engine-rust/src/sessions.rs) guarda una época
+`tx`, un slot `staged` y un mapa `rx` indexado por el `sender_index`
+del wire — los lectores toman el `RwLock` compartido y clonan un `Arc`,
+así el camino de paquetes nunca se detiene en una rotación.
+`GetSessions` y la respuesta de métricas reportan `tx_pkts`/`rx_pkts`
+por época y `rx_unknown_sender_index_total`.
+
+`PeerKeyMaterial` en el proto ganó campos explícitos `sender_index` y
+`peer_index`: `lab_session_id` identifica la sesión de laboratorio entre
+rekeys, mientras cada nueva época recibe índices de wire nuevos.
+
 ## Lab
 
 ```bash
@@ -300,3 +332,6 @@ Y un desafío: `last_seq = 4100`. ¿Pasa `check()` un paquete con
   `--key`/`--sender-index`/`--peer-index`/`--keepalive-secs`, métricas
   de ingreso separadas.
 - `r2` — Aclara la validación de frames y separa la evidencia histórica del lab de la ejecución local de `r1`.
+- `r3` — Socket de control (`--control-sock`, `SO_PEERCRED`), `SessionTable`
+  multi-época en rx, StagePeer/Activate/Retire/RevokePeer, contadores por
+  época, `sender_index`/`peer_index` en el proto.

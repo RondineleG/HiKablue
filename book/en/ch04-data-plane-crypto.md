@@ -125,6 +125,38 @@ carry. Drops count per cause: `invalid_inner_src_total`,
 `KEEPALIVE`. The engine sends empty keepalives but does not enforce that
 length on receive. An authenticated nonempty keepalive is not written to TUN.
 
+## Rotating without a drop: the control boundary
+
+A fixed `--key` cannot rotate. The engine now exposes a second Unix
+socket — `--control-sock`, mode 0600 — that accepts key-lifecycle ops
+from the node agent in the same u32-BE length-prefixed JSON envelope
+the metrics socket speaks, gated by `SO_PEERCRED` (root, the engine's
+own uid, or the `--control-uid` agent). Key material never crosses the
+telemetry socket.
+
+The ops implement a two-phase commit with a drain window:
+
+- `StagePeer` allocates a new epoch in a staging slot; rx immediately
+  accepts datagrams stamped with the new `peer_index`.
+- `Activate` flips egress to the staged epoch at a packet boundary and
+  counts `rotations_total`; the old epoch keeps decrypting — it is now
+  retiring.
+- `Retire` ends the drain: the epoch leaves the table and its keys are
+  zeroized.
+- `RevokePeer` wipes every epoch; the engine stays keyed and drops
+  traffic until reprovisioning.
+
+[`SessionTable`](../../engine-rust/src/sessions.rs) holds one `tx`
+epoch, one `staged` slot, and an `rx` map keyed by the wire
+`sender_index` — readers take a shared `RwLock` and clone an `Arc`, so
+the packet path never stalls on a rotation. `GetSessions` and the
+metrics reply report per-epoch `tx_pkts`/`rx_pkts` and
+`rx_unknown_sender_index_total`.
+
+`PeerKeyMaterial` in the proto gained explicit `sender_index` and
+`peer_index` fields: `lab_session_id` identifies the lab session across
+rekeys, while each new epoch gets fresh wire indexes.
+
 ## Lab
 
 ```bash
@@ -293,3 +325,6 @@ pass `check()`? Hint: compute `diff` and compare with `WINDOW_SIZE`
   `--key`/`--sender-index`/`--peer-index`/`--keepalive-secs`, split
   ingress metrics.
 - `r2` — Clarify frame validation and separate historical lab evidence from the local `r1` run.
+- `r3` — Control socket (`--control-sock`, `SO_PEERCRED`), `SessionTable`
+  multi-epoch rx, StagePeer/Activate/Retire/RevokePeer, per-epoch counters,
+  proto `sender_index`/`peer_index`.

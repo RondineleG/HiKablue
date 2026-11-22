@@ -84,6 +84,11 @@ pub struct SessionState {
     peer_index: u32,
     tx_counter: AtomicU64,
     rx_replay: Mutex<AntiReplayWindow>,
+    /// Datagrams sealed under this epoch (DATA and KEEPALIVE), reported
+    /// per epoch by GetMetrics.
+    tx_pkts: AtomicU64,
+    /// Datagrams authenticated and accepted under this epoch.
+    rx_pkts: AtomicU64,
 }
 
 impl SessionState {
@@ -105,6 +110,8 @@ impl SessionState {
             peer_index,
             tx_counter: AtomicU64::new(0),
             rx_replay: Mutex::new(AntiReplayWindow::new()),
+            tx_pkts: AtomicU64::new(0),
+            rx_pkts: AtomicU64::new(0),
         }
     }
 
@@ -121,6 +128,33 @@ impl SessionState {
 
     pub fn key_epoch(&self) -> u64 {
         self.key_epoch
+    }
+
+    /// Index stamped on outbound packets; selects the tx direction key.
+    pub fn local_index(&self) -> u32 {
+        self.local_index
+    }
+
+    /// Index the peer stamps; selects the rx direction key and keys the
+    /// session table's rx map.
+    pub fn peer_index(&self) -> u32 {
+        self.peer_index
+    }
+
+    pub fn tx_key(&self) -> &Zeroizing<[u8; 32]> {
+        &self.tx_key
+    }
+
+    pub fn rx_key(&self) -> &Zeroizing<[u8; 32]> {
+        &self.rx_key
+    }
+
+    pub fn tx_pkts(&self) -> u64 {
+        self.tx_pkts.load(Ordering::Relaxed)
+    }
+
+    pub fn rx_pkts(&self) -> u64 {
+        self.rx_pkts.load(Ordering::Relaxed)
     }
 
     /// Allocates the next outbound nonce or latches the session dead when
@@ -163,6 +197,7 @@ impl SessionState {
             )
             .map_err(|_| CryptoError::Authentication)?;
         rest[len..len + TAG_LEN].copy_from_slice(&tag);
+        self.tx_pkts.fetch_add(1, Ordering::Relaxed);
         Ok(HEADER_LEN + len + TAG_LEN)
     }
 
@@ -209,6 +244,7 @@ impl SessionState {
             replay.check(header.nonce).map_err(CryptoError::Replay)?;
             replay.update(header.nonce);
         }
+        self.rx_pkts.fetch_add(1, Ordering::Relaxed);
         Ok((header, ct_len))
     }
 }

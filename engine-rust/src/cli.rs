@@ -83,6 +83,18 @@ pub struct CommonArgs {
     /// the socket is limited to the engine's own user/group.
     #[arg(long)]
     pub metrics_group: Option<String>,
+    /// Unix socket that accepts key-lifecycle ops (StagePeer, Activate,
+    /// Retire, RevokePeer) from the node agent, same u32-BE length + JSON
+    /// envelope as the metrics socket. Carries key material, so it runs
+    /// mode 0600 with a SO_PEERCRED check — separate from telemetry.
+    /// Without this flag the control socket is not opened.
+    #[arg(long)]
+    pub control_sock: Option<std::path::PathBuf>,
+    /// UID of the node agent allowed to connect to the control socket;
+    /// the socket file is chowned to it. Root always passes the
+    /// peer-credential check. Requires --control-sock.
+    #[arg(long)]
+    pub control_uid: Option<u32>,
     /// 32-byte ChaCha20-Poly1305 session key as 64 hex chars. Lab-only
     /// pre-shared key: real key delivery arrives via the control plane in a
     /// later phase. Without it the engine speaks the M2 plaintext format.
