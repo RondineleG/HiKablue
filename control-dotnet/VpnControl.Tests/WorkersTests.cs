@@ -167,7 +167,8 @@ public sealed class WorkersTests : IAsyncLifetime
             await service.OnCommandAckAsync(first.NodeId, active, new CommandAck
             {
                 CommandId = retry.CommandId.ToString(), StreamEpoch = active.StreamEpoch,
-                BackendInstanceId = active.BackendInstanceId, Outcome = AckOutcome.Applied
+                BackendInstanceId = active.BackendInstanceId, Outcome = AckOutcome.Applied,
+                AppliedRevision = (ulong)retry.Revision
             }, CancellationToken.None);
         }
         Assert.Equal(1, await dispatcher.DispatchOnceAsync(CancellationToken.None));
@@ -219,7 +220,8 @@ public sealed class WorkersTests : IAsyncLifetime
             await service.OnCommandAckAsync(healthy.NodeId, active, new CommandAck
             {
                 CommandId = command.CommandId, StreamEpoch = command.StreamEpoch,
-                BackendInstanceId = command.BackendInstanceId, Outcome = AckOutcome.Applied
+                BackendInstanceId = command.BackendInstanceId, Outcome = AckOutcome.Applied,
+                AppliedRevision = command.Revision
             }, ct);
             Assert.Equal("acked", (await ackDb.Outbox.AsNoTracking()
                 .SingleAsync(o => o.CommandId == healthy.CommandId, ct)).Status);
