@@ -173,9 +173,12 @@ sudo ip netns exec "$NS_SVC" ip route add default via 192.168.100.1
 
 mkdir "$RUN_DIR/www"
 printf 'hikablue-m4-ok\n' >"$RUN_DIR/www/index.html"
-sudo ip netns exec "$NS_SVC" python3 -m http.server 8080 --bind 10.80.1.100 \
-    --directory "$RUN_DIR/www" >"$RUN_DIR/http.log" 2>&1 &
-HTTP_PID=$!
+# Record the namespace shell's real pid before it execs Python; killing the
+# sudo wrapper alone would orphan the HTTP server.
+sudo ip netns exec "$NS_SVC" sh -c "echo \$\$ >'$RUN_DIR/http.pid'; exec python3 -m http.server 8080 --bind 10.80.1.100 --directory '$RUN_DIR/www'" \
+    >"$RUN_DIR/http.log" 2>&1 &
+wait_for 5 test -s "$RUN_DIR/http.pid" || fail "HTTP service did not write its pid"
+HTTP_PID=$(cat "$RUN_DIR/http.pid")
 PIDS+=("$HTTP_PID")
 
 log "control plane"
