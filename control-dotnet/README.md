@@ -30,7 +30,7 @@ not user authentication. Session-level access control comes from the
 bootstrap `sessionToken`: owner GET/DELETE require `X-Session-Token`
 unless `X-Admin-Token` matches `VpnControl:AdminToken`. Only the SHA-256
 digest of the token is stored; idempotent replay derives the same token
-from secret session material without persisting it. Session responses carry
+from an independent session secret without persisting the token. Session responses carry
 `Cache-Control: no-store`. Persistence lives in `Data/` (EF Core +
 Npgsql, schema in `initial-control-plane` migration per ADR-0001); the
 pool comes from `VpnControl:IpPoolCidr` (default `10.42.0.0/22`). With no

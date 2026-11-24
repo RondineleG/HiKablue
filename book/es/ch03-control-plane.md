@@ -107,7 +107,7 @@ de estado — el aprovisionamiento es asíncrono por diseño. La misma clave
 con el mismo payload reproduce la respuesta original; la misma clave con
 payload distinto es un conflicto **409**. La respuesta de bootstrap también
 devuelve `sessionToken`, una capability de 256 bits derivada con HMAC del
-material secreto de sesión. Solo se guarda su resumen SHA-256, pero repetir
+secreto independiente de sesión. Solo se guarda su resumen SHA-256, pero repetir
 el create idempotente deriva el mismo token. El `GET`/`DELETE` del dueño
 debe enviarlo como `X-Session-Token`; `X-Subject` sigue siendo solo la
 etiqueta de propiedad del laboratorio hasta la autenticación real de

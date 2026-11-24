@@ -37,6 +37,7 @@ public sealed class ControlDbContext(DbContextOptions<ControlDbContext> options)
             e.Property(s => s.RequestHash).HasColumnName("request_hash");
             e.Property(s => s.OwnerSubject).HasColumnName("owner_subject");
             e.Property(s => s.SessionTokenHash).HasColumnName("session_token_hash").HasMaxLength(64);
+            e.Property(s => s.SessionTokenKey).HasColumnName("session_token_key");
             e.Property(s => s.PeerPublicKey).HasColumnName("peer_public_key");
             e.Property(s => s.Status).HasColumnName("status").HasConversion<string>();
             e.Property(s => s.VirtualIp).HasColumnName("virtual_ip");

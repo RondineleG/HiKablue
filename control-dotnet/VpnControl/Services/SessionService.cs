@@ -54,16 +54,16 @@ public sealed class SessionService(
     private static string HashSessionToken(string token) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
 
-    // The bootstrap token is derived from secret session key material rather
-    // than stored plaintext. Replaying the idempotent create therefore returns
-    // the same capability without weakening the database-at-rest posture.
+    // The bootstrap token is derived from an independent session secret rather
+    // than stored plaintext or mixed with traffic keys. Replaying the
+    // idempotent create therefore returns the same capability.
     private static string DeriveSessionToken(SessionRow row)
     {
-        if (row.EgressKey is null)
+        if (row.SessionTokenKey is null)
         {
             return "";
         }
-        using var hmac = new HMACSHA256(row.EgressKey);
+        using var hmac = new HMACSHA256(row.SessionTokenKey);
         return Convert.ToHexString(hmac.ComputeHash(
             Encoding.UTF8.GetBytes($"hikablue-session-token:{row.SessionId}")));
     }
@@ -185,6 +185,7 @@ public sealed class SessionService(
                     KeyEpoch = keyEpoch,
                     EgressKey = RandomNumberGenerator.GetBytes(32),
                     IngressKey = RandomNumberGenerator.GetBytes(32),
+                    SessionTokenKey = RandomNumberGenerator.GetBytes(32),
                     SenderIndex = senderIndex,
                     PeerIndex = peerIndex,
                     ExpiresAt = now.AddSeconds(ttl),

@@ -103,7 +103,7 @@ block.
 URL — provisioning is async by design. Same key + same payload replays the
 original response; same key + different payload is a **409** conflict.
 The bootstrap response also returns `sessionToken`, a 256-bit capability
-derived from secret session material with HMAC. Only its SHA-256 digest is
+derived from an independent session secret with HMAC. Only its SHA-256 digest is
 stored, yet replaying the idempotent create derives the same token again.
 Owner `GET`/`DELETE` must send it as `X-Session-Token`; `X-Subject` remains
 only the lab ownership label until real user authentication arrives.
