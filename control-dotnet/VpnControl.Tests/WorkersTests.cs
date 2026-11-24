@@ -176,6 +176,39 @@ public sealed class WorkersTests : IAsyncLifetime
         Assert.Equal(second.CommandId.ToString(), writer.Sent[2].CommandId);
     }
 
+    [Fact]
+    public async Task DispatcherOrdersSameTimestampCommandsByRevision()
+    {
+        var createdAt = DateTimeOffset.UtcNow;
+        await using (var db = NewDb())
+        {
+            db.Outbox.AddRange(
+                new OutboxRow
+                {
+                    CommandId = Guid.Parse("ffffffff-ffff-ffff-ffff-ffffffffffff"),
+                    NodeId = "edge-1", CommandType = "RevokePeer",
+                    Payload = """{"session_id":"00000000-0000-0000-0000-0000000000aa","lab_session_id":3,"reason":"expired"}""",
+                    Revision = 2, CreatedAt = createdAt, Status = "pending"
+                },
+                new OutboxRow
+                {
+                    CommandId = Guid.Parse("00000000-0000-0000-0000-000000000001"),
+                    NodeId = "edge-1", CommandType = "RevokePeer",
+                    Payload = """{"session_id":"00000000-0000-0000-0000-0000000000bb","lab_session_id":4,"reason":"expired"}""",
+                    Revision = 3, CreatedAt = createdAt, Status = "pending"
+                });
+            await db.SaveChangesAsync();
+        }
+        var writer = new CollectWriter();
+        _streams.Attach("edge-1", "backend-1", writer, new CancellationTokenSource());
+
+        Assert.Equal(1, await NewDispatcher().DispatchOnceAsync(CancellationToken.None));
+
+        var sent = Assert.Single(writer.Sent);
+        Assert.Equal("ffffffff-ffff-ffff-ffff-ffffffffffff", sent.CommandId);
+        Assert.Equal(2UL, sent.Revision);
+    }
+
     [Theory]
     [InlineData(1)]
     [InlineData(3)]

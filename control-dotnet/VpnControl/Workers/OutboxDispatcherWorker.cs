@@ -111,10 +111,10 @@ public sealed class OutboxDispatcherWorker(
                     SELECT 1 FROM outbox earlier
                     WHERE earlier.node_id = candidate.node_id
                       AND earlier.status IN ('pending', 'sent')
-                      AND (earlier.created_at, earlier.command_id) <
-                          (candidate.created_at, candidate.command_id)
+                      AND (earlier.revision, earlier.created_at, earlier.command_id) <
+                          (candidate.revision, candidate.created_at, candidate.command_id)
                   )
-                ORDER BY candidate.created_at, candidate.command_id
+                ORDER BY candidate.revision, candidate.created_at, candidate.command_id
                 LIMIT {BatchSize}
                 FOR UPDATE OF candidate SKIP LOCKED
                 """)
