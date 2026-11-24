@@ -27,10 +27,9 @@ Name branches `feat/<slug>` for additive work and `fix/<slug>` for bug fixes. Us
   next_retry_at, deadline on outbox), and `outbox-delivery-indexes`
   (deadline and per-node ordering indexes). Apply with `dotnet ef database
   update` or `db.Database.MigrateAsync()`. The Go orchestration client is
-  delivered as `agent-go/pkg/orchestrator` (mTLS channel, fencing, ACKs);
-  wiring it into `cmd/vpn-agent` — which still fetches M1 metrics once
-  (the lab harness posts the HTTP heartbeat) — is deferred to milestone-4 integration along
-  with the end-to-end gRPC lab.
+  delivered as `agent-go/pkg/orchestrator` (mTLS channel, fencing, ACKs).
+  Wiring it into `cmd/vpn-agent` and the end-to-end gRPC laboratory were
+  milestone-4 integration work and are now covered below.
 - **Milestone 4 (end-to-end sessions) validated locally.** Rust has the
   versioned AEAD wire format, directional keys, multi-peer `SessionTable`,
   per-peer endpoint pinning, tombstoned key material and the
