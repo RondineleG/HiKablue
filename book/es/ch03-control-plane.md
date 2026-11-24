@@ -458,7 +458,20 @@ La expiración ahora sigue la especificación:
 ```csharp
 session.Status = SessionStatus.Revoking;
 session.FailureReason = "expired";
-db.Outbox.Add(new OutboxRow { CommandType = "RevokePeer", ... });
+db.Outbox.Add(new OutboxRow
+{
+    CommandId = Guid.NewGuid(),
+    NodeId = session.NodeId,
+    CommandType = "RevokePeer",
+    Revision = node.DesiredRevision,
+    CreatedAt = now,
+    Payload = System.Text.Json.JsonSerializer.Serialize(new
+    {
+        session_id = session.SessionId,
+        lab_session_id = session.LabSessionId,
+        reason = "expired"
+    })
+});
 ```
 
 La primera línea inicia la revocación sin fingir que el par ya desapareció.
