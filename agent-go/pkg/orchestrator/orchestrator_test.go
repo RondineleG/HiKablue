@@ -393,7 +393,7 @@ func TestReplayedAppliedCommandIsConfirmedWithoutRedispatch(t *testing.T) {
 	}
 	// Run records the applied command only after a successful dispatch.
 	c.replay.appliedCommands[cmd.CommandId] = struct{}{}
-	c.replay.appliedRevision = cmd.Revision
+	c.replay.appliedRevision = 9
 
 	ack, dispatch := c.evaluate(cmd, time.Now())
 	if dispatch {
@@ -401,6 +401,10 @@ func TestReplayedAppliedCommandIsConfirmedWithoutRedispatch(t *testing.T) {
 	}
 	if ack.Outcome != edgev1.AckOutcome_ACK_OUTCOME_APPLIED {
 		t.Fatalf("replayed command must be confirmed APPLIED, got %v", ack.Outcome)
+	}
+	if ack.AppliedRevision != cmd.Revision {
+		t.Fatalf("replayed APPLIED ack must echo command revision %d, got %d",
+			cmd.Revision, ack.AppliedRevision)
 	}
 	if h.provisioned != 1 {
 		t.Fatalf("handler ran %d times, want 1", h.provisioned)

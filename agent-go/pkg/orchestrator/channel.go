@@ -143,8 +143,11 @@ func (c *Channel) run(ctx context.Context, client edgev1.EdgeOrchestratorClient)
 			} else {
 				if cmd.Revision > ack.AppliedRevision {
 					atomic.StoreUint64(&c.replay.appliedRevision, cmd.Revision)
-					ack.AppliedRevision = cmd.Revision
 				}
+				// APPLIED is a confirmation of this command's desired
+				// revision, even for a legacy zero revision; the backend
+				// high-water mark belongs in registrations and heartbeats.
+				ack.AppliedRevision = cmd.Revision
 				c.replay.appliedCommands[cmd.CommandId] = struct{}{}
 			}
 		}
@@ -202,7 +205,10 @@ func (c *Channel) evaluate(cmd *edgev1.ControlCommand, now time.Time) (
 		return ack, false
 	}
 	// An already-applied command can be confirmed without applying anything.
+	// APPLIED acknowledgements are command-specific: report the revision at
+	// which this command was applied, not the backend's newer high-water mark.
 	if _, applied := c.replay.appliedCommands[cmd.CommandId]; applied {
+		ack.AppliedRevision = cmd.Revision
 		c.streamEpoch = epoch
 		return ack, false
 	}
