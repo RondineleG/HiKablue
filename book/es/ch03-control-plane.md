@@ -483,7 +483,10 @@ epoch, backend instance y revisión.
 
 El agente también aplica expiración localmente. Si el control plane está
 fuera cuando vence `expires_at`, el nodo revoca en el motor; la convergencia
-llega después por reenvío y `SyncState`. El snapshot valida cuenta
+llega después por reenvío y `SyncState`. Los vencimientos se persisten en
+un sidecar `<control socket>.expiry.json` solo del propietario y se recargan
+antes de abrir el canal; un vencimiento cumplido mientras solo el agente
+estaba caído se aplica inmediatamente al reiniciar. El snapshot valida cuenta
 declarada, longitud y SHA-256 antes de mutar, y la guardia de borrado impide
 que un snapshot vacío o masivo no forzado limpie el backend.
 

@@ -478,7 +478,10 @@ revisão.
 
 O agente também aplica expiração localmente. Se o plano de controle estiver
 fora quando `expires_at` passar, o nó revoga no engine; a convergência
-chega depois por reenvio e `SyncState`. O snapshot valida contagem
+chega depois por reenvio e `SyncState`. Os prazos são persistidos em um
+sidecar `<control socket>.expiry.json` somente do dono e recarregados antes
+da abertura do canal; um prazo vencido enquanto apenas o agente estava fora
+é aplicado imediatamente na reinicialização. O snapshot valida contagem
 declarada, comprimento e SHA-256 antes de mutar, e a guarda de remoção impede
 que um snapshot vazio ou massivo sem force limpe o backend.
 

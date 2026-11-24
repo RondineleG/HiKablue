@@ -73,6 +73,10 @@ func runWithContext(parent context.Context, args []string, stdout, stderr io.Wri
 		return 1
 	}
 	handler := agent.NewEngineHandler(*controlSock, *sock)
+	if err := handler.LoadExpiryState(); err != nil {
+		fmt.Fprintln(stderr, "vpn-agent: load expiry state:", err)
+		return 1
+	}
 	go handler.RunExpiryLoop(ctx, 500*time.Millisecond)
 
 	cfg := orchestrator.Config{

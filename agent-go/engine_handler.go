@@ -5,8 +5,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -18,19 +21,97 @@ import (
 // socket. Command application is deliberately synchronous: the channel ACK
 // is meaningful only after StagePeer+Activate or RevokePeer has completed.
 type EngineHandler struct {
-	Control     ControlClient
-	MetricsSock string
+	Control         ControlClient
+	MetricsSock     string
+	ExpiryStatePath string
 
 	mu      sync.Mutex
 	expires map[uint32]time.Time
 }
 
+type expiryStateFile struct {
+	Peers map[uint32]time.Time `json:"peers"`
+}
+
 func NewEngineHandler(controlSock, metricsSock string) *EngineHandler {
 	return &EngineHandler{
-		Control:     ControlClient{SocketPath: controlSock, Timeout: 2 * time.Second},
-		MetricsSock: metricsSock,
-		expires:     make(map[uint32]time.Time),
+		Control:         ControlClient{SocketPath: controlSock, Timeout: 2 * time.Second},
+		MetricsSock:     metricsSock,
+		ExpiryStatePath: controlSock + ".expiry.json",
+		expires:         make(map[uint32]time.Time),
 	}
+}
+
+// LoadExpiryState restores expiration deadlines owned by this control
+// socket. Expired entries are deliberately kept: the expiry loop must remove
+// their peers immediately even if the agent was offline at the deadline.
+func (h *EngineHandler) LoadExpiryState() error {
+	if h.ExpiryStatePath == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(h.ExpiryStatePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read expiry state: %w", err)
+	}
+	var state expiryStateFile
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return fmt.Errorf("decode expiry state: %w", err)
+	}
+	for lab, expires := range state.Peers {
+		if lab == 0 || expires.IsZero() {
+			return fmt.Errorf("expiry state contains invalid peer %d", lab)
+		}
+	}
+	h.mu.Lock()
+	h.expires = make(map[uint32]time.Time, len(state.Peers))
+	for lab, expires := range state.Peers {
+		h.expires[lab] = expires
+	}
+	h.mu.Unlock()
+	return nil
+}
+
+func (h *EngineHandler) persistExpiryLocked() error {
+	if h.ExpiryStatePath == "" {
+		return nil
+	}
+	raw, err := json.Marshal(expiryStateFile{Peers: h.expires})
+	if err != nil {
+		return err
+	}
+	tmp := h.ExpiryStatePath + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return fmt.Errorf("write expiry state: %w", err)
+	}
+	if err := os.Rename(tmp, h.ExpiryStatePath); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replace expiry state: %w", err)
+	}
+	_ = os.Chmod(h.ExpiryStatePath, 0o600)
+	return nil
+}
+
+func (h *EngineHandler) rememberExpiry(lab uint32, expires time.Time) error {
+	h.mu.Lock()
+	h.expires[lab] = expires
+	err := h.persistExpiryLocked()
+	h.mu.Unlock()
+	return err
+}
+
+func (h *EngineHandler) forgetExpiry(lab uint32) error {
+	h.mu.Lock()
+	old, existed := h.expires[lab]
+	delete(h.expires, lab)
+	err := h.persistExpiryLocked()
+	if err != nil && existed {
+		h.expires[lab] = old
+	}
+	h.mu.Unlock()
+	return err
 }
 
 func validKeyMaterial(k *edgev1.PeerKeyMaterial) error {
@@ -99,9 +180,9 @@ func (h *EngineHandler) ProvisionPeer(ctx context.Context, p *edgev1.ProvisionPe
 	if err := h.Control.Call(ctx, "Activate", activate, nil); err != nil {
 		return fmt.Errorf("activate peer %d epoch %d: %w", lab, km.KeyEpoch, err)
 	}
-	h.mu.Lock()
-	h.expires[lab] = p.Peer.ExpiresAt.AsTime()
-	h.mu.Unlock()
+	if err := h.rememberExpiry(lab, p.Peer.ExpiresAt.AsTime()); err != nil {
+		return fmt.Errorf("persist peer %d expiration: %w", lab, err)
+	}
 	return nil
 }
 
@@ -113,9 +194,9 @@ func (h *EngineHandler) RevokePeer(ctx context.Context, p *edgev1.RevokePeer) er
 	if err := h.Control.Call(ctx, "RevokePeer", payload, nil); err != nil {
 		return fmt.Errorf("revoke peer %d: %w", p.LabSessionId, err)
 	}
-	h.mu.Lock()
-	delete(h.expires, p.LabSessionId)
-	h.mu.Unlock()
+	if err := h.forgetExpiry(p.LabSessionId); err != nil {
+		return fmt.Errorf("persist peer %d expiration removal: %w", p.LabSessionId, err)
+	}
 	return nil
 }
 
@@ -188,18 +269,18 @@ func (h *EngineHandler) SyncState(ctx context.Context, p *edgev1.SyncState) erro
 		}
 		// Rehydrate the local expiration deadline after an agent restart.
 		// The engine owns enforcement; this map only drives the agent's timer.
-		h.mu.Lock()
-		h.expires[lab] = peer.ExpiresAt.AsTime()
-		h.mu.Unlock()
+		if err := h.rememberExpiry(lab, peer.ExpiresAt.AsTime()); err != nil {
+			return fmt.Errorf("persist snapshot peer %d expiration: %w", lab, err)
+		}
 	}
 	for lab := range local {
 		if !desired[lab] {
 			if err := h.Control.Call(ctx, "RevokePeer", map[string]any{"lab_session_id": lab}, nil); err != nil {
 				return fmt.Errorf("remove extra peer %d: %w", lab, err)
 			}
-			h.mu.Lock()
-			delete(h.expires, lab)
-			h.mu.Unlock()
+			if err := h.forgetExpiry(lab); err != nil {
+				return fmt.Errorf("persist extra peer %d expiration removal: %w", lab, err)
+			}
 		}
 	}
 	return nil
@@ -228,9 +309,7 @@ func (h *EngineHandler) ExpireDuePeers(ctx context.Context) {
 	h.mu.Unlock()
 	for _, lab := range due {
 		if err := h.Control.Call(ctx, "RevokePeer", map[string]any{"lab_session_id": lab}, nil); err == nil {
-			h.mu.Lock()
-			delete(h.expires, lab)
-			h.mu.Unlock()
+			_ = h.forgetExpiry(lab)
 		}
 	}
 }

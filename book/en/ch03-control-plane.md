@@ -470,7 +470,10 @@ backend instance and revision fencing have matched the command.
 The agent also enforces expiration locally. If the control plane is offline
 when `expires_at` passes, the node still calls the engine's `RevokePeer`;
 control-plane convergence happens later through redelivery and
-`SyncState`. `SyncState` validates declared count, byte length and SHA-256
+`SyncState`. Deadlines are persisted in an owner-only `<control socket>.expiry.json`
+sidecar and reloaded before the channel starts, so a deadline that passed
+while only the agent was down is enforced immediately after restart.
+`SyncState` validates declared count, byte length and SHA-256
 before mutation, and the deletion guard prevents a non-forced empty or
 mass-deletion snapshot from wiping the backend.
 

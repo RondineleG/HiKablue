@@ -255,6 +255,37 @@ func TestSyncStateDeletionGuardAndForcedRemoval(t *testing.T) {
 	}
 }
 
+func TestExpiryStateSurvivesAgentRestart(t *testing.T) {
+	provision := testProvision(8, 1)
+	provision.Peer.ExpiresAt = timestamppb.New(time.Now().Add(20 * time.Millisecond))
+	path, ops := controlServer(t, ControlSessions{})
+	h := NewEngineHandler(path, "missing")
+	if err := h.ProvisionPeer(context.Background(), provision); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+
+	restarted := NewEngineHandler(path, "missing")
+	if err := restarted.LoadExpiryState(); err != nil {
+		t.Fatal(err)
+	}
+	restarted.ExpireDuePeers(context.Background())
+
+	got := ops()
+	if len(got) != 3 || got[2].Op != "RevokePeer" {
+		t.Fatalf("restarted agent did not expire persisted peer: %+v", got)
+	}
+	if err := restarted.LoadExpiryState(); err != nil {
+		t.Fatal(err)
+	}
+	restarted.mu.Lock()
+	remaining := len(restarted.expires)
+	restarted.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("expired peer remained in persisted state: %d entries", remaining)
+	}
+}
+
 func TestEngineHealthyAndExpiryLoop(t *testing.T) {
 	h := NewEngineHandler("missing-control", filepath.Join(t.TempDir(), "missing-metrics"))
 	if h.EngineHealthy() {
