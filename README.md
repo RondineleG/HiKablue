@@ -16,13 +16,13 @@ HiKablue follows one packet end to end: from a Linux client's TUN interface, thr
 │  client    │───────────▶│   vpn-control    │  sessions, IPs,
 │  vpn-cli   │            │    (C#/.NET)     │  revocation, state
 └─────┬──────┘            └────────▲─────────┘
-      │                          │ gRPC + mTLS (library; vpn-agent wiring pending)
+      │                          │ gRPC + mTLS NodeChannel
       │ UDP (test traffic)  ┌────┴──────┐
       │                     │ vpn-agent │
       ▼                     │   (Go)    │
 ┌────────────┐   Unix sock  └───────────┘
 │ vpn-engine │◀──────────────────┘
-│   (Rust)   │  GetMetrics (peer control pending)
+│   (Rust)   │  GetMetrics + peer control
 └─────┬──────┘
       │ TUN
       ▼
@@ -35,7 +35,7 @@ Tunneled traffic flows client → engine (UDP in the lab) — the agent stays on
 |---|---|---|
 | `engine-rust/` | IPv4 TUN ↔ UDP, hardened `GetMetrics` Unix socket, multi-peer ChaCha20-Poly1305 sessions with per-direction keys, endpoint pinning and control socket lifecycle | M4 validated locally |
 | `agent-go/` | Metrics-fetcher binary, `vpn-agent -serve` orchestration loop and `pkg/orchestrator` (mTLS channel, register/heartbeat/ACK, fencing) | M4 validated locally |
-| `control-dotnet/` | PostgreSQL/EF Core, IPAM, session API, SPIFFE mTLS `NodeChannel`, outbox and lease reaper; loopback-only lab REST/legacy heartbeat remains | M3 components delivered; gRPC lab integration pending |
+| `control-dotnet/` | PostgreSQL/EF Core, IPAM, session API, SPIFFE mTLS `NodeChannel`, outbox and lease reaper; loopback-only lab REST/legacy heartbeat remains | M4 session validation delivered locally |
 | `proto/` | gRPC `NodeChannel` definitions and generated Go/C# bindings | Delivered in M3 |
 
 The custom UDP transport exists **only for isolated lab exercises** with test traffic. The roadmap specifies a WireGuard backend before real traffic is carried.
@@ -62,7 +62,7 @@ One command runs the whole gate — commit conventions, diff safety, shellcheck,
 
 ```bash
 bash tests/checks.sh          # everything except privileged lab steps
-bash tests/checks.sh --lab    # full gate: TUN/UDP ping + telemetry E2E + resource safety
+bash tests/checks.sh --lab    # full gate: TUN/UDP ping + telemetry E2E + resource safety + session E2E
 ```
 
 The lab steps use `sudo` only where TUN creation and namespaces require it, run in `mktemp`-isolated directories, refuse to touch resources they did not create, and clean up after themselves.
