@@ -14,17 +14,23 @@ auditing backed by PostgreSQL. Today it delivers:
   outbox command **in one transaction** (ADR-0001). Answers 202 with the
   session view and its `statusUrl`. Honors `Idempotency-Key`: same key +
   same payload replays the original session, same key + a different
-  payload answers 409.
-- `GET /v1/sessions/{id}` — session view for the owner or an admin.
-- `DELETE /v1/sessions/{id}` — moves the session to `revoking` and writes
+  payload answers 409. The create/replay response carries a one-time
+  `sessionToken` bootstrap capability.
+- `GET /v1/sessions/{id}` — session view for the owner presenting that
+  token as `X-Session-Token`, or for an admin.
+- `DELETE /v1/sessions/{id}` — with the same owner token or admin token,
+  moves the session to `revoking` and writes
   the `RevokePeer` outbox command; the IP lease is released only after the
   backend confirms removal.
 - `GET /health/live`, `GET /health/ready` — liveness, and readiness that
   additionally proves PostgreSQL answers (`SELECT 1`).
 
-Caller identity is lab-grade: `X-Subject` names the owner (required on
-POST; GET/DELETE need it unless `X-Admin-Token` matches
-`VpnControl:AdminToken`). Session responses carry
+Caller identity is still lab-grade: `X-Subject` names the owner but is
+not user authentication. Session-level access control comes from the
+bootstrap `sessionToken`: owner GET/DELETE require `X-Session-Token`
+unless `X-Admin-Token` matches `VpnControl:AdminToken`. Only the SHA-256
+digest of the token is stored; idempotent replay derives the same token
+from secret session material without persisting it. Session responses carry
 `Cache-Control: no-store`. Persistence lives in `Data/` (EF Core +
 Npgsql, schema in `initial-control-plane` migration per ADR-0001); the
 pool comes from `VpnControl:IpPoolCidr` (default `10.42.0.0/22`). With no
@@ -92,10 +98,12 @@ Proteções ativas no Marco 1 (laboratório isolado):
 - Nós que param de enviar heartbeat expiram do registro após 10 minutos
   sem `LastSeen` novo.
 - O documento OpenAPI é servido em `/openapi/v1.json` (loopback apenas).
-- A identidade de chamada em `/v1/sessions` é por cabeçalho `X-Subject` —
-  mero rótulo de laboratório, sem verificação; autenticação real chega com
-  o marco de usuários. `X-Admin-Token` (`VpnControl:AdminToken`) permite
-  leitura/revogação administrativa.
+- A identidade de chamada em `/v1/sessions` ainda usa `X-Subject` como
+  rótulo de laboratório, sem autenticação real de usuário. O acesso do
+  dono exige a capability `sessionToken` devolvida no bootstrap e enviada
+  como `X-Session-Token`; apenas o resumo SHA-256 dela é persistido.
+  `X-Admin-Token` (`VpnControl:AdminToken`) permite leitura/revogação
+  administrativa.
 
 Limitação que permanece, deferida ao marco de control plane:
 
