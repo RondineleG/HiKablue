@@ -1,8 +1,8 @@
 <!-- chapter-id: ch04-data-plane-crypto -->
 # Capítulo 4 — O fio cifrado: AEAD, replay e a janela que não perdoa
 
-*The Journey of my VPN* · Capítulo `ch04-data-plane-crypto` · Marco 4,
-fase 2: criptografia do plano de dados no motor Rust
+*The Journey of my VPN* · Capítulo `ch04-data-plane-crypto` · Marco 4:
+criptografia do plano de dados no motor Rust e validação de sessões
 
 Até aqui o túnel falava em texto claro: qualquer um entre os dois
 namespace conseguia ler — e reescrever — cada datagrama. Este capítulo
@@ -11,12 +11,14 @@ diferença entre "criptografado" e *seguro*: uma chave por direção, um
 nonce que nunca se repete e uma janela de replay que só avança depois da
 autenticação.
 
-> **Limite do laboratório.** A chave vem de `--key <64-hex>`, um
-> pre-shared key de laboratório passado nos dois lados. A entrega real
-> de chaves — com `ProvisionPeer` e `key_epoch` do marco 3 — chega numa
-> fase posterior. Reiniciar um motor com o mesmo `--key` reusa material
-> de chave e zera contador e janela: fora do laboratório isso é uma
-> vulnerabilidade, não um detalhe.
+> **Limite do laboratório.** Os exercícios de criptografia da fase 2 usam
+> `--key <64-hex>`, uma pre-shared key de laboratório passada nos dois
+> lados. O laboratório de sessões de ponta a ponta, em vez disso, recebe
+> chaves direcionais por sessão via `ProvisionPeer` e inicia os clientes
+> com `--tx-key`/`--rx-key`. As duas formas são bootstrap de laboratório,
+> não a entrega final de chaves ao cliente. Reiniciar um motor com a mesma
+> chave reusa material de chave e zera contador e janela: fora do
+> laboratório isso é uma vulnerabilidade, não um detalhe.
 
 ## O formato do fio
 

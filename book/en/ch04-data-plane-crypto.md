@@ -1,8 +1,8 @@
 <!-- chapter-id: ch04-data-plane-crypto -->
 # Chapter 4 — The Sealed Wire: AEAD, Replay, and the Unforgiving Window
 
-*The Journey of my VPN* · Chapter `ch04-data-plane-crypto` · Milestone 4,
-phase 2: Rust data-plane crypto
+*The Journey of my VPN* · Chapter `ch04-data-plane-crypto` · Milestone 4:
+Rust data-plane crypto and session validation
 
 Until now the tunnel spoke in cleartext: anyone between the two
 namespaces could read — and rewrite — every datagram. This chapter puts
@@ -11,11 +11,13 @@ separate "encrypted" from *secure*: one key per direction, a nonce that
 never repeats, and a replay window that only advances after
 authentication.
 
-> **Lab boundary.** Keys come from `--key <64-hex>`, a lab pre-shared
-> key passed on both ends. Real key delivery — `ProvisionPeer` and
-> `key_epoch` from milestone 3 — arrives in a later phase. Restarting an
-> engine with the same `--key` reuses key material and resets counter
-> and window: outside the lab that is a vulnerability, not a detail.
+> **Lab boundary.** The phase-2 crypto exercises use `--key <64-hex>`, a
+> lab pre-shared key passed on both ends. The end-to-end session laboratory
+> instead receives per-session directional keys through `ProvisionPeer` and
+> starts clients with `--tx-key`/`--rx-key`. Both forms are lab bootstrap,
+> not final client key delivery. Restarting an engine with the same key
+> reuses key material and resets counter and window: outside the lab that
+> is a vulnerability, not a detail.
 
 ## The wire format
 

@@ -1,8 +1,8 @@
 <!-- chapter-id: ch04-data-plane-crypto -->
 # Capítulo 4 — El hilo cifrado: AEAD, replay y la ventana que no perdona
 
-*The Journey of my VPN* · Capítulo `ch04-data-plane-crypto` · Hito 4,
-fase 2: criptografía del plano de datos en el motor Rust
+*The Journey of my VPN* · Capítulo `ch04-data-plane-crypto` · Hito 4:
+criptografía del plano de datos en el motor Rust y validación de sesiones
 
 Hasta aquí el túnel hablaba en claro: cualquiera entre los dos
 namespaces podía leer — y reescribir — cada datagrama. Este capítulo
@@ -11,12 +11,14 @@ separan "cifrado" de *seguro*: una clave por dirección, un nonce que
 nunca se repite y una ventana de replay que solo avanza tras la
 autenticación.
 
-> **Límite del laboratorio.** La clave viene de `--key <64-hex>`, un
-> pre-shared key de laboratorio pasado en ambos lados. La entrega real
-> de claves — `ProvisionPeer` y `key_epoch` del hito 3 — llega en una
-> fase posterior. Reiniciar un motor con el mismo `--key` reutiliza
-> material de clave y reinicia contador y ventana: fuera del laboratorio
-> eso es una vulnerabilidad, no un detalle.
+> **Límite del laboratorio.** Los ejercicios de criptografía de la fase 2
+> usan `--key <64-hex>`, una pre-shared key de laboratorio pasada en ambos
+> lados. El laboratorio de sesiones extremo a extremo, en cambio, recibe
+> claves direccionales por sesión mediante `ProvisionPeer` y arranca los
+> clientes con `--tx-key`/`--rx-key`. Ambas formas son bootstrap de
+> laboratorio, no la entrega final de claves al cliente. Reiniciar un motor
+> con la misma clave reutiliza material de clave y reinicia contador y
+> ventana: fuera del laboratorio eso es una vulnerabilidad, no un detalle.
 
 ## El formato del hilo
 
