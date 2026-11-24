@@ -65,9 +65,10 @@ PROXY_PID=""
 log() { echo "== $*"; }
 fail() {
     echo "session-e2e: FAIL: $*" >&2
-    local keep=/tmp/hk-m4-session-failed
-    rm -rf "$keep"
-    cp -a "$RUN_DIR" "$keep" 2>/dev/null || true
+    local keep="/tmp/hk-m4-session-failed-${RUN_DIR##*/}"
+    if [ ! -e "$keep" ]; then
+        cp -a "$RUN_DIR" "$keep" 2>/dev/null || true
+    fi
     echo "  debug artifacts preserved at $keep" >&2
     exit 1
 }

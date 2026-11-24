@@ -116,7 +116,9 @@ the acceptance output lines are the stable result.
 
 The script removes only namespaces, processes, PostgreSQL data, sockets,
 keys, and temporary files that it created in its run directory. On failure
-it copies the run directory to `/tmp/hk-m4-session-failed` before cleanup
-so `control.log`, `agent.log`, engine logs, PostgreSQL logs, and session
-JSON can be inspected. Delete that directory manually after investigation.
+it copies the run directory to a unique `/tmp/hk-m4-session-failed-*`
+path before cleanup so `control.log`, `agent.log`, engine logs, PostgreSQL
+logs, and session JSON can be inspected. Delete that directory manually
+after investigation. The copy preserves the owner-only permissions of the
+run directory because it contains lab session keys.
 It can contain lab key material; never commit it.
