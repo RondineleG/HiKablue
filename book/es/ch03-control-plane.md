@@ -132,6 +132,8 @@ contrato prometía:
   ack con otro `stream_epoch` o `backend_instance_id` se ignora.
   El ACK también debe coincidir con un intento `sent` guardado;
   PostgreSQL bloquea esa fila mientras aplica el resultado.
+  Para `APPLIED`, `applied_revision` también debe igualar la revisión
+  deseada de esa fila — si no, el ACK es viejo y se ignora.
   `APPLIED` marca la fila `acked` (y un ack de `RevokePeer` borra el lease
   y revoca la sesión); `FENCED_STREAM`/`FENCED_BACKEND` fallan la fila,
   cierran el stream y encolan un `SyncState` de resincronización;
@@ -149,9 +151,11 @@ contrato prometía:
   Una escritura fallida no prueba que no hubo entrega: un intento sin
   ACK se reintenta tras vencer su plazo, con el mismo ID, incluso sin
   reconexión. Sin stream activo, espera en `pending` hasta `next_retry_at`.
-  Tras tres intentos sin confirmación, el worker marca el comando
-  `failed` sin liberar ningún lease. La migración `outbox-delivery-indexes`
-  añade índices parciales para intentos vencidos y el orden por nodo.
+  Los timeouts de respuesta no tienen funeral por número de intentos: el
+  comando sigue elegible para reconciliación hasta un fallo explícito de
+  validación/ACK o un ACK confirmado. La migración
+  `outbox-delivery-indexes` añade índices parciales para intentos vencidos
+  y el orden por nodo.
 
   **Ejercicio:** Ejecuta `dotnet test control-dotnet/VpnControl.Tests --filter FullyQualifiedName~DispatcherDoesNotHoldLocksDuringWritesOrRollBackOtherNodes`
   con Docker activo. Localiza los dos escritores de prueba: el stream

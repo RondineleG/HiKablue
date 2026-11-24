@@ -74,7 +74,8 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
         string epoch = "e1", string backend = "b1") => new()
     {
         CommandId = row.CommandId.ToString(), StreamEpoch = epoch,
-        BackendInstanceId = backend, Outcome = outcome, ErrorCode = code
+        BackendInstanceId = backend, Outcome = outcome, ErrorCode = code,
+        AppliedRevision = (ulong)row.Revision
     };
 
     [Fact]
@@ -207,6 +208,44 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
         Assert.Equal(SessionStatus.Revoked,
             (await verify.Sessions.SingleAsync()).Status);
         Assert.Equal(0,
+            await verify.IpLeases.CountAsync(l => l.SessionId == sessionId));
+    }
+
+    [Fact]
+    public async Task AppliedAckWithWrongRevisionDoesNotReleaseTheLease()
+    {
+        var sessionId = Guid.NewGuid();
+        await using (var db = NewDb())
+        {
+            db.Nodes.Add(new NodeRow
+            {
+                NodeId = "edge-1", BackendInstanceId = "b1",
+                RegisteredAt = DateTimeOffset.UtcNow, EngineHealthy = true
+            });
+            db.Sessions.Add(new SessionRow
+            {
+                SessionId = sessionId, OwnerSubject = "alice",
+                Status = SessionStatus.Revoking, NodeId = "edge-1",
+                LabSessionId = 7, ExpiresAt = DateTimeOffset.UtcNow.AddHours(1),
+                VirtualIp = System.Net.IPAddress.Parse("10.99.0.7"),
+                CreatedAt = DateTimeOffset.UtcNow, UpdatedAt = DateTimeOffset.UtcNow
+            });
+            await db.SaveChangesAsync();
+            await db.Database.ExecuteSqlAsync(
+                $"INSERT INTO ip_leases (address, session_id, node_id, reserved_at) VALUES (CAST({"10.99.0.7"} AS inet), {sessionId}, {"edge-1"}, {DateTimeOffset.UtcNow})");
+        }
+
+        var row = await SeedCommandAsync("edge-1", "RevokePeer",
+            $$"""{"session_id":"{{sessionId}}","lab_session_id":7,"reason":"user_revoked"}""");
+        var ack = Ack(row, AckOutcome.Applied);
+        ack.AppliedRevision = (ulong)row.Revision + 1;
+        await _service.OnCommandAckAsync("edge-1", Stream(), ack, CancellationToken.None);
+
+        await using var verify = NewDb();
+        Assert.Equal("sent", (await verify.Outbox.SingleAsync()).Status);
+        Assert.Equal(SessionStatus.Revoking,
+            (await verify.Sessions.SingleAsync()).Status);
+        Assert.Equal(1,
             await verify.IpLeases.CountAsync(l => l.SessionId == sessionId));
     }
 

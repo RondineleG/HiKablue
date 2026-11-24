@@ -229,6 +229,7 @@ create_session() {
         || { cat "$out" >&2; fail "create $subject failed"; }
     local id
     id=$(jq -r '.data.sessionId' "$out")
+    [ "$(jq -r '.data.status' "$out")" = pending ] || fail "session $subject did not start pending"
     for _ in $(seq 30); do
         api "$CTRL_URL/v1/sessions/$id" -H "X-Subject: $subject" >"$out" || true
         [ "$(jq -r '.data.status' "$out" 2>/dev/null)" = active ] && return 0

@@ -127,6 +127,8 @@ contract promised:
   `command_id` *and* fenced: an ack stamped for another `stream_epoch` or
   `backend_instance_id` is ignored. The ACK must also match a stored
   `sent` attempt; PostgreSQL locks that row while applying the outcome.
+  For `APPLIED`, `applied_revision` must also equal that row's desired
+  revision — otherwise the acknowledgement is stale and ignored.
   `APPLIED` marks the outbox row `acked`
   (and a `RevokePeer` ack deletes the lease and revokes the session);
   `FENCED_STREAM`/`FENCED_BACKEND` fail the row, close the stream and
@@ -143,10 +145,11 @@ contract promised:
   Writes to different nodes are independent. A write failure does not
   prove non-delivery: an unacknowledged attempt is retried after its
   deadline, with the same command ID, even without a reconnect. Without a
-  live stream it waits in `pending` at `next_retry_at`. After three
-  attempts without confirmation, the worker marks the command `failed`
-  without releasing any lease. The `outbox-delivery-indexes` migration
-  adds partial indexes for expired attempts and per-node ordering.
+  live stream it waits in `pending` at `next_retry_at`. Response timeouts
+  have no attempt-count funeral: the command remains eligible for
+  reconciliation until an explicit validation/ACK failure or a confirming
+  ACK. The `outbox-delivery-indexes` migration adds partial indexes for
+  expired attempts and per-node ordering.
 
   **Exercise:** Run `dotnet test control-dotnet/VpnControl.Tests --filter FullyQualifiedName~DispatcherDoesNotHoldLocksDuringWritesOrRollBackOtherNodes`
   with Docker running. Find the two test writers: the healthy stream

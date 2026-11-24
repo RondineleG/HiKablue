@@ -133,6 +133,8 @@ prometia:
   com outro `stream_epoch` ou `backend_instance_id` é ignorado.
   O ACK também precisa corresponder a uma tentativa `sent` registrada;
   o PostgreSQL bloqueia a linha enquanto aplica o resultado.
+  Para `APPLIED`, `applied_revision` também precisa igualar a revisão
+  desejada dessa linha — caso contrário o ACK é antigo e ignorado.
   `APPLIED` marca a linha `acked` (e um ack de `RevokePeer` apaga o lease
   e revoga a sessão); `FENCED_STREAM`/`FENCED_BACKEND` falham a linha,
   fecham o stream e enfileiram um `SyncState` de ressincronização;
@@ -149,8 +151,9 @@ prometia:
   gRPC. Escritas para nós diferentes são independentes. Falha na escrita
   não prova que não houve entrega: uma tentativa sem ACK é refeita após
   o prazo, com o mesmo ID, mesmo sem reconexão. Sem stream ativo, fica
-  em `pending` até `next_retry_at`. Após três tentativas sem confirmação,
-  o worker marca o comando `failed` sem liberar leases. A migration
+  em `pending` até `next_retry_at`. Timeouts de resposta não têm funeral
+  por número de tentativas: o comando continua elegível para reconciliação
+  até uma falha explícita de validação/ACK ou um ACK confirmado. A migration
   `outbox-delivery-indexes` adiciona índices parciais para tentativas
   vencidas e ordenação por nó.
 
