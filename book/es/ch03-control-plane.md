@@ -509,9 +509,9 @@ reactivó.
 - `r2` — [PR #15](https://github.com/RondineleG/HiKablue/pull/15): cancelación del contexto hijo y espera del heartbeat; epochs
   monótonos dentro del proceso; regresiones y gate de calidad/cobertura
   para PRs. No se afirma un nuevo hito ni resultado de red en vivo.
-- `r4` — integración extremo a extremo: claves direccionales, expiración conforme a la especificación y ciclo observado en el laboratorio.
 - `r3` — [PR #16](https://github.com/RondineleG/HiKablue/pull/16): recupera comandos sin ACK en el outbox,
   aísla escrituras entre nodos, conserva el estado de replay en memoria entre
   canales del mismo backend y rechaza plazos y epochs malformados. El plazo
   sigue exigiendo relojes sincronizados. Las pruebas cubren estos componentes,
   no el aprovisionamiento entre procesos ni la revocación vía el backend Rust.
+- `r4` — integración extremo a extremo: claves direccionales, expiración conforme a la especificación y ciclo observado en el laboratorio.

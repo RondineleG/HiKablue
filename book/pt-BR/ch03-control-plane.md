@@ -502,9 +502,9 @@ a sessão ficou `revoked` e o lease chegou a zero. A não foi reativada.
 - `r2` — [PR #15](https://github.com/RondineleG/HiKablue/pull/15): cancelamento do contexto filho e espera do heartbeat; epochs
   monotônicos no processo; regressões e gate de qualidade/cobertura para
   PRs. Nenhum novo aceite de milestone ou resultado de rede é alegado.
-- `r4` — integração de ponta a ponta: chaves direcionais, expiração conforme a especificação e ciclo observado no laboratório.
 - `r3` — [PR #16](https://github.com/RondineleG/HiKablue/pull/16): recupera comandos sem ACK na outbox, isola
   escritas entre nós, preserva o estado de replay em memória entre canais do
   mesmo backend e rejeita prazos e epochs malformados. O prazo continua
   exigindo relógios sincronizados. Os testes cobrem esses componentes, não
   o provisionamento entre processos nem a revogação via backend Rust.
+- `r4` — integração de ponta a ponta: chaves direcionais, expiração conforme a especificação e ciclo observado no laboratório.

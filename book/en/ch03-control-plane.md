@@ -494,9 +494,9 @@ become 0. A was not reactivated.
 - `r2` — [PR #15](https://github.com/RondineleG/HiKablue/pull/15): child-context cancellation and heartbeat join; monotonic
   process-local stream epochs; regression tests and a PR quality/coverage
   gate. No new milestone acceptance or live-network result is claimed.
-- `r4` — end-to-end integration: control-plane-issued directional key material and wire indexes, spec-compliant expiration without forced lease release, exact agent validation, local expiration, and observed pending/active/revoking/revoked behavior in the two-client laboratory.
 - `r3` — [PR #16](https://github.com/RondineleG/HiKablue/pull/16): recover unacknowledged outbox commands,
   isolate writes across nodes, keep replay state in memory across channels on
   the same backend, and reject malformed deadlines and epochs. The deadline
   still requires synchronized clocks. The tests cover these building blocks,
   not cross-process provisioning or revocation through the Rust backend.
+- `r4` — end-to-end integration: control-plane-issued directional key material and wire indexes, spec-compliant expiration without forced lease release, exact agent validation, local expiration, and observed pending/active/revoking/revoked behavior in the two-client laboratory.
