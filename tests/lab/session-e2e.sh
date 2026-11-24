@@ -26,8 +26,10 @@ CTRL_PORT=7443
 PROXY_PORT=7444
 PGPORT=55432
 CTRL_URL="https://127.0.0.1:$CTRL_PORT"
-HB_TOKEN=hikablue-lab-heartbeat-token
-ADMIN_TOKEN=hikablue-lab-admin-token
+# Lab-only bearer values are random per run; they authenticate only the
+# loopback control plane started below and disappear with the run directory.
+HB_TOKEN=$(openssl rand -hex 16)
+ADMIN_TOKEN=$(openssl rand -hex 16)
 NS_EXIT=hkm4exit
 NS_A=hkm4ca
 NS_B=hkm4cb
