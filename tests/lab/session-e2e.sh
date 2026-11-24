@@ -384,6 +384,12 @@ if curl_client "$NS_A" >/dev/null; then
 fi
 echo "  OBSERVED: node ACK completed revocation; only then was A's IP released"
 
+FINAL_AFTER=$(grep -c '^ok$' "$RUN_DIR/b-continuous.log" || true)
+FINAL_FAILS=$(grep -c '^fail$' "$RUN_DIR/b-continuous.log" || true)
+[ "$FINAL_AFTER" -gt "$AFTER" ] || fail "client B did not continue receiving responses through reconciliation"
+[ "$FINAL_FAILS" -eq 0 ] || fail "client B observed $FINAL_FAILS failed responses through reconciliation"
+echo "  OBSERVED: B survived through revocation and reconciliation without a failed response"
+
 log "forwarding metrics"
 "$AGENT" --metrics-sock "$RUN_DIR/server-metrics.sock" | tee "$RUN_DIR/server-metrics.json"
 echo "session-e2e ($MODE): PASS"
