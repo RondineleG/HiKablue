@@ -31,7 +31,9 @@ direction is the inverse of the exit engine direction. This is lab-only
 bootstrap, not the later user-facing client provisioning flow.
 
 The service namespace runs `python3 -m http.server` bound to
-`10.80.1.100:8080` behind the exit node. Client-to-client hairpinning is
+`10.80.1.100:8080` behind the exit node. The control plane leases only
+`10.80.1.128/25`, so this test address can never collide with a client VIP.
+Client-to-client hairpinning is
 intentionally denied in the milestone-4 policy; forwarded service answers
 may keep the service source address.
 

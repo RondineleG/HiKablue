@@ -184,6 +184,8 @@ HTTP_PID=$(cat "$RUN_DIR/http.pid")
 PIDS+=("$HTTP_PID")
 
 log "control plane"
+# The lease pool is carved from the client half of the tunnel subnet so the
+# service test address 10.80.1.100 can never be assigned to a client.
 ASPNETCORE_URLS="$CTRL_URL" \
 Kestrel__Certificates__Default__Path="$RUN_DIR/pki/server/server.crt" \
 Kestrel__Certificates__Default__KeyPath="$RUN_DIR/pki/server/server.key" \
@@ -191,7 +193,7 @@ VpnControl__LabCaPath="$RUN_DIR/pki/ca/ca.crt" \
 VpnControl__ConnectionString="Host=127.0.0.1;Port=$PGPORT;Database=postgres;Username=$(id -un)" \
 VpnControl__HeartbeatToken="$HB_TOKEN" \
 VpnControl__AdminToken="$ADMIN_TOKEN" \
-VpnControl__IpPoolCidr="10.80.1.0/24" \
+VpnControl__IpPoolCidr="10.80.1.128/25" \
 VpnControl__OutboxDispatchMs=100 \
 VpnControl__SessionTtlSeconds=180 \
 dotnet run --project control-dotnet/VpnControl --no-build >"$CTRL_LOG" 2>&1 &
