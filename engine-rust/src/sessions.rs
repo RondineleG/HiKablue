@@ -319,16 +319,12 @@ impl SessionTable {
         // clients and rotation tests keep their epoch-0 behavior.
         if lab != 0 && !state.peers.contains_key(&lab) && state.peers.len() == 1 {
             if let Some(peer0) = state.peers.remove(&0) {
-                if peer0.endpoint.is_none() {
-                    for owner in state.rx.values_mut() {
-                        if owner.0 == 0 {
-                            owner.0 = lab;
-                        }
+                for owner in state.rx.values_mut() {
+                    if owner.0 == 0 {
+                        owner.0 = lab;
                     }
-                    state.peers.insert(lab, peer0);
-                } else {
-                    state.peers.insert(0, peer0);
                 }
+                state.peers.insert(lab, peer0);
             }
         }
 
@@ -741,6 +737,21 @@ mod tests {
             t.stage(req(2, 4, 15, peer, A, C)),
             Err(TableError::IndexInUse(_)) | Err(TableError::StagedPending(_))
         ));
+    }
+
+    #[test]
+    fn explicit_provisioning_adopts_static_peer_after_endpoint_learning() {
+        let initial = SessionState::from_lab_psk(Zeroizing::new([9u8; 32]), 11, 12);
+        let t = SessionTable::new(Some(initial), Some(Ipv4Addr::new(10, 80, 1, 8)), false);
+        let ep: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        assert_eq!(t.learn_endpoint(0, ep), Some(ep));
+
+        t.stage(req(7, 1, 21, 22, C, D)).unwrap();
+
+        assert_eq!(t.activate(None, 1).unwrap(), 0);
+        assert_eq!(t.endpoint_count(), 1);
+        assert_eq!(t.rx_lookup(22).unwrap().lab_session_id, 7);
+        assert_eq!(t.single_tx().unwrap().endpoint, Some(ep));
     }
 
     #[test]
