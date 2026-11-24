@@ -13,8 +13,9 @@ using Xunit;
 
 namespace VpnControl.Tests;
 
-/// The two M3 workers against real PostgreSQL: SKIP LOCKED dispatch into
-/// live streams and quarantine + forced lease release for dead nodes.
+/// The control-plane workers against real PostgreSQL: SKIP LOCKED dispatch
+/// into live streams, retry of unacknowledged attempts, and reaper-driven
+/// expiration without forced lease release.
 public sealed class WorkersTests : IAsyncLifetime
 {
     private readonly PostgreSqlContainer _pg =
