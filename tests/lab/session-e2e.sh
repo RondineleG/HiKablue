@@ -119,7 +119,12 @@ dotnet build control-dotnet/VpnControl/VpnControl.csproj -v q --nologo >/dev/nul
 log "temporary PostgreSQL"
 PGBIN=$(dirname "$(find /usr/lib/postgresql -path '*/bin/initdb' -print 2>/dev/null | sort -V | tail -1)")
 [ -x "$PGBIN/initdb" ] || fail "postgresql binaries not installed"
-"$PGBIN/initdb" -D "$PGDATA" --auth=trust --no-sync >/dev/null
+PGPASSWORD=$(openssl rand -hex 24)
+export PGPASSWORD
+printf '%s\n' "$PGPASSWORD" >"$RUN_DIR/postgres-password"
+"$PGBIN/initdb" -D "$PGDATA" --auth=scram-sha-256 \
+    --pwfile="$RUN_DIR/postgres-password" --no-sync >/dev/null
+rm -f "$RUN_DIR/postgres-password"
 "$PGBIN/pg_ctl" -D "$PGDATA" -l "$RUN_DIR/postgres.log" \
     -o "-p $PGPORT -k $RUN_DIR" start >/dev/null
 wait_for 10 "$PGBIN/psql" -h 127.0.0.1 -p "$PGPORT" -U "$(id -un)" -d postgres -Atc "select 1" \
@@ -190,7 +195,7 @@ ASPNETCORE_URLS="$CTRL_URL" \
 Kestrel__Certificates__Default__Path="$RUN_DIR/pki/server/server.crt" \
 Kestrel__Certificates__Default__KeyPath="$RUN_DIR/pki/server/server.key" \
 VpnControl__LabCaPath="$RUN_DIR/pki/ca/ca.crt" \
-VpnControl__ConnectionString="Host=127.0.0.1;Port=$PGPORT;Database=postgres;Username=$(id -un)" \
+VpnControl__ConnectionString="Host=127.0.0.1;Port=$PGPORT;Database=postgres;Username=$(id -un);Password=$PGPASSWORD" \
 VpnControl__HeartbeatToken="$HB_TOKEN" \
 VpnControl__AdminToken="$ADMIN_TOKEN" \
 VpnControl__IpPoolCidr="10.80.1.128/25" \

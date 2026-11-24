@@ -49,7 +49,8 @@ Run on a Linux host with:
 - no pre-existing `hkm4exit`, `hkm4ca`, `hkm4cb`, or `hkm4svc` namespace.
 
 The script starts a temporary PostgreSQL cluster inside its own `mktemp`
-directory. It does not require Docker. It creates a lab-only CA, a node
+directory with a random SCRAM password that never leaves the environment of
+the run. It does not require Docker. It creates a lab-only CA, a node
 client certificate, and a loopback server certificate. All keys are test
 material and are deleted with the run directory.
 
