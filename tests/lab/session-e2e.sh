@@ -310,18 +310,21 @@ api -X DELETE "$CTRL_URL/v1/sessions/$A_ID" -H 'X-Subject: alice' \
     >"$RUN_DIR/revoke-a.json" || { cat "$RUN_DIR/revoke-a.json" >&2; fail "revoke request failed"; }
 [ "$(jq -r '.data.status' "$RUN_DIR/revoke-a.json")" = revoking ] || fail "A did not enter revoking"
 if [ "$MODE" = drop ]; then
-    # Wait until the control plane has dispatched RevokePeer, then close
+    # Wait until the control plane has written RevokePeer, then close
     # the delayed proxy while that command/ACK is still in flight. The
     # 900 ms one-way delay makes the interruption deterministic without
-    # inspecting the TLS stream.
+    # inspecting the TLS stream. `delivered_at` is stronger than the
+    # pre-write `sent` state; the short settle delay lets the bytes enter
+    # the proxy but remains well inside its forwarding delay.
     DISPATCHED=0
     for _ in $(seq 40); do
         OUTBOX_STATUS=$("$PGBIN/psql" -h 127.0.0.1 -p "$PGPORT" -U "$(id -un)" -d postgres -Atc \
-            "select status from outbox where command_type='RevokePeer' order by created_at desc limit 1" 2>/dev/null || true)
+            "select status from outbox where command_type='RevokePeer' and delivered_at is not null order by created_at desc limit 1" 2>/dev/null || true)
         [ "$OUTBOX_STATUS" = sent ] && { DISPATCHED=1; break; }
         sleep 0.05
     done
     [ "$DISPATCHED" = 1 ] || fail "drop scenario: RevokePeer was not dispatched before interruption"
+    sleep 0.15
     kill "$PROXY_PID" 2>/dev/null || true
     PROXY_PID=""
 fi
