@@ -14,6 +14,7 @@
 #   tests/lab/session-e2e.sh          normal revocation acceptance
 #   tests/lab/session-e2e.sh --drop   gRPC interruption/reconciliation acceptance
 set -euo pipefail
+umask 077
 # Logs stay in the caller-owned run directory; the sudo process only writes stdout.
 
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -50,7 +51,7 @@ for ns in "$NS_EXIT" "$NS_A" "$NS_B" "$NS_SVC"; do
 done
 
 RUN_DIR=$(mktemp -d /tmp/hk-m4-session.XXXXXX)
-chmod 755 "$RUN_DIR"
+chmod 700 "$RUN_DIR"
 AGENT="$RUN_DIR/vpn-agent"
 PGBIN=""
 PGDATA="$RUN_DIR/pgdata"
