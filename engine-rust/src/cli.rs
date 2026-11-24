@@ -39,8 +39,10 @@ pub struct ServerArgs {
     #[arg(long)]
     pub tun_cidr: Ipv4Cidr,
     /// Virtual IPv4 address of the single allowed lab peer, e.g. 10.80.1.2.
+    /// Required for plaintext static-key server mode; omit it when the
+    /// control socket provisions peers dynamically.
     #[arg(long)]
-    pub peer: Ipv4Addr,
+    pub peer: Option<Ipv4Addr>,
     #[command(flatten)]
     pub common: CommonArgs,
 }
@@ -57,8 +59,9 @@ pub struct ClientArgs {
     #[arg(long)]
     pub tun_cidr: Ipv4Cidr,
     /// Virtual IPv4 address of the server inside the tunnel, e.g. 10.80.1.1.
-    /// Authenticated packets whose inner source differs are dropped:
-    /// cryptographic peer authentication does not authorize inner IPs.
+    /// The client requires every accepted inner destination to be its own
+    /// assigned tunnel address; cryptographic authentication alone does not
+    /// authorize inner IPs.
     #[arg(long)]
     pub peer: Ipv4Addr,
     #[command(flatten)]
@@ -109,6 +112,13 @@ pub struct CommonArgs {
     /// the two direction keys.
     #[arg(long, default_value_t = 0)]
     pub peer_index: u32,
+    /// Exact 32-byte transmit key as hex for lab client bootstrap. Mutually
+    /// exclusive with --key; unlike --key this is not HKDF-derived.
+    #[arg(long)]
+    pub tx_key: Option<String>,
+    /// Exact 32-byte receive key as hex for lab client bootstrap.
+    #[arg(long)]
+    pub rx_key: Option<String>,
     /// Idle seconds before a KEEPALIVE datagram is sent (encrypted mode
     /// only). Defaults to 25.
     #[arg(long, default_value_t = 25)]

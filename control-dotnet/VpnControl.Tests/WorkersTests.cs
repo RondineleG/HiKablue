@@ -282,10 +282,14 @@ public sealed class WorkersTests : IAsyncLifetime
 
         var provision = OutboxDispatcherWorker.BuildCommand(
             Make("ProvisionPeer",
-                """{"peer":{"session_id":"s1","lab_session_id":1,"virtual_ip":"10.0.0.1","expires_at":"2026-11-21T00:00:00+00:00","key_ref":"ref","key_epoch":3}}"""),
+                """{"peer":{"session_id":"s1","lab_session_id":1,"virtual_ip":"10.0.0.1","expires_at":"2026-11-21T00:00:00+00:00","key_ref":"ref","key_epoch":3},"key_material":{"key_epoch":3,"egress_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","ingress_key":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=","sender_index":11,"peer_index":22}}"""),
             stream, now);
         Assert.Equal("s1", provision!.ProvisionPeer.Peer.SessionId);
         Assert.Equal(3UL, provision.ProvisionPeer.Peer.KeyEpoch);
+        Assert.Equal(32, provision.ProvisionPeer.KeyMaterial.EgressKey.Length);
+        Assert.Equal(32, provision.ProvisionPeer.KeyMaterial.IngressKey.Length);
+        Assert.Equal(11U, provision.ProvisionPeer.KeyMaterial.SenderIndex);
+        Assert.Equal(22U, provision.ProvisionPeer.KeyMaterial.PeerIndex);
 
         var revoke = OutboxDispatcherWorker.BuildCommand(
             Make("RevokePeer",
@@ -306,7 +310,7 @@ public sealed class WorkersTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task ReaperQuarantinesExpiredSessionsOnDeadNodes()
+    public async Task ReaperMovesExpiredSessionsToRevokingAndKeepsLease()
     {
         var sessionId = Guid.NewGuid();
         var before = ControlMetrics.Snapshot().ReapedLeases;
@@ -336,17 +340,20 @@ public sealed class WorkersTests : IAsyncLifetime
         var reaped = await NewReaper().ReapOnceAsync(CancellationToken.None);
 
         Assert.Equal(1, reaped);
-        Assert.Equal(before + 1, ControlMetrics.Snapshot().ReapedLeases);
+        Assert.Equal(before, ControlMetrics.Snapshot().ReapedLeases);
         await using var verify = NewDb();
         var session = await verify.Sessions.SingleAsync();
-        Assert.Equal(SessionStatus.Quarantined, session.Status);
-        Assert.Equal("FORCED_REAPER_RELEASE", session.FailureReason);
-        Assert.Equal(0,
+        Assert.Equal(SessionStatus.Revoking, session.Status);
+        Assert.Equal("expired", session.FailureReason);
+        Assert.Equal(1,
             await verify.IpLeases.CountAsync(l => l.SessionId == sessionId));
+        var command = await verify.Outbox.SingleAsync();
+        Assert.Equal("RevokePeer", command.CommandType);
+        Assert.Contains("expired", command.Payload);
     }
 
     [Fact]
-    public async Task ReaperLeavesSessionsOnLiveNodesAlone()
+    public async Task ReaperExpiresSessionsEvenWhenNodeIsLive()
     {
         await using (var db = NewDb())
         {
@@ -368,9 +375,9 @@ public sealed class WorkersTests : IAsyncLifetime
             await db.SaveChangesAsync();
         }
 
-        Assert.Equal(0, await NewReaper().ReapOnceAsync(CancellationToken.None));
+        Assert.Equal(1, await NewReaper().ReapOnceAsync(CancellationToken.None));
         await using var verify = NewDb();
-        Assert.Equal(SessionStatus.Active, (await verify.Sessions.SingleAsync()).Status);
+        Assert.Equal(SessionStatus.Revoking, (await verify.Sessions.SingleAsync()).Status);
     }
 
     private LeaseReaperWorker NewReaper(TimeSpan interval) => new(_scopes,
@@ -403,7 +410,7 @@ public sealed class WorkersTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task ReaperLoopQuarantinesAndStopsCleanly()
+    public async Task ReaperLoopMovesExpirationToRevokingAndStopsCleanly()
     {
         await SeedExpiredSessionOnDeadNodeAsync();
         var worker = NewReaper(TimeSpan.FromMilliseconds(50));
@@ -412,11 +419,11 @@ public sealed class WorkersTests : IAsyncLifetime
         {
             await using var db = NewDb();
             return await db.Sessions.AnyAsync(
-                s => s.Status == SessionStatus.Quarantined);
+                s => s.Status == SessionStatus.Revoking);
         });
         await worker.StopAsync(CancellationToken.None);
         Assert.True(await NewDb().Sessions.AnyAsync(
-            s => s.FailureReason == "FORCED_REAPER_RELEASE"));
+            s => s.FailureReason == "expired"));
     }
 
     private static async Task WaitForAsync(Func<Task<bool>> cond,

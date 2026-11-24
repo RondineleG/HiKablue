@@ -5,12 +5,10 @@ using VpnControl.Services;
 namespace VpnControl.Workers;
 
 /// <summary>
-/// Reaper policy (ADR-0001 §4, M3 spec §7): every 60 s, sessions whose
-/// TTL expired while their node stayed silent past the quarantine window
-/// are moved to QUARANTINED and their lease force-released. Each release
-/// is audit-logged FORCED_REAPER_RELEASE and counted in
-/// ipam_reaped_leases_total. Late ACKs for reaped commands are fenced by
-/// stream_epoch/backend_instance_id on the stream, not by this worker.
+/// Expiration worker: expired pending/active sessions move to revoking and
+/// receive a RevokePeer outbox command in the same transaction. Leases stay
+/// reserved until the backend confirms removal; this worker never performs
+/// a forced release merely because a node is unavailable.
 /// </summary>
 public sealed class LeaseReaperWorker(
     IServiceScopeFactory scopeFactory,
@@ -23,15 +21,6 @@ public sealed class LeaseReaperWorker(
         {
             var ms = int.TryParse(config["VpnControl:ReaperIntervalMs"], out var v) ? v : 60000;
             return TimeSpan.FromMilliseconds(Math.Max(ms, 10));
-        }
-    }
-
-    private TimeSpan QuarantineWindow
-    {
-        get
-        {
-            var s = int.TryParse(config["VpnControl:QuarantineSeconds"], out var v) ? v : 300;
-            return TimeSpan.FromSeconds(Math.Max(s, 60));
         }
     }
 
@@ -60,35 +49,43 @@ public sealed class LeaseReaperWorker(
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<ControlDbContext>();
         var now = DateTimeOffset.UtcNow;
-        var staleBefore = now - QuarantineWindow;
 
-        // Expired sessions on nodes that have been silent past the
-        // quarantine window — heartbeats on a live stream would have
-        // refreshed last_seen_at, so staleness means the node is gone.
+        // Spec §6: expiration moves the session to revoking. It never
+        // force-releases the lease while backend removal is unconfirmed —
+        // especially not when the node is offline.
         var expired = await db.Sessions
             .Where(s => s.ExpiresAt < now &&
-                        (s.Status == SessionStatus.Pending ||
-                         s.Status == SessionStatus.Active ||
-                         s.Status == SessionStatus.Revoking))
-            .Join(db.Nodes.Where(n => n.LastSeenAt == null || n.LastSeenAt < staleBefore),
-                s => s.NodeId, n => n.NodeId, (s, n) => s)
+                        (s.Status == SessionStatus.Pending || s.Status == SessionStatus.Active))
             .ToListAsync(ct);
 
         var reaped = 0;
-        // Quarantine + lease release must commit atomically: a crash between
-        // them would leave a live session whose IP was already freed.
         await using var tx = await db.Database.BeginTransactionAsync(ct);
         foreach (var session in expired)
         {
-            session.Status = SessionStatus.Quarantined;
-            session.UpdatedAt = now;
-            session.FailureReason = "FORCED_REAPER_RELEASE";
             await db.Database.ExecuteSqlAsync(
-                $"DELETE FROM ip_leases WHERE session_id = {session.SessionId}", ct);
-            logger.LogWarning(
-                "FORCED_REAPER_RELEASE session={SessionId} node={NodeId} ip={VirtualIp}",
+                $"SELECT node_id FROM nodes WHERE node_id = {session.NodeId} FOR UPDATE", ct);
+            var node = await db.Nodes.FirstAsync(n => n.NodeId == session.NodeId, ct);
+            node.DesiredRevision += 1;
+            session.Status = SessionStatus.Revoking;
+            session.UpdatedAt = now;
+            session.FailureReason = "expired";
+            db.Outbox.Add(new OutboxRow
+            {
+                CommandId = Guid.NewGuid(),
+                NodeId = session.NodeId,
+                CommandType = "RevokePeer",
+                Revision = node.DesiredRevision,
+                CreatedAt = now,
+                Payload = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    session_id = session.SessionId,
+                    lab_session_id = session.LabSessionId,
+                    reason = "expired"
+                })
+            });
+            logger.LogInformation(
+                "session expired and revocation enqueued session={SessionId} node={NodeId} ip={VirtualIp}",
                 session.SessionId, session.NodeId, session.VirtualIp);
-            ControlMetrics.LeaseReaped();
             reaped++;
         }
 
@@ -99,4 +96,5 @@ public sealed class LeaseReaperWorker(
         await tx.CommitAsync(ct);
         return reaped;
     }
+
 }

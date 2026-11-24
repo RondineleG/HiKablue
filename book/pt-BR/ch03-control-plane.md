@@ -158,15 +158,15 @@ prometia:
   com o Docker ativo. Localize os dois escritores de teste: o stream
   saudável deve conseguir confirmar o comando enquanto a outra escrita
   permanece bloqueada.
-- **[`LeaseReaperWorker`](../../control-dotnet/VpnControl/Workers/LeaseReaperWorker.cs).** Por padrão, roda a cada 60 s e
-  move sessões vencidas para `quarantined` se o nó estiver sem reportar há
-  mais de 300 s ou nunca tiver sido visto. Apaga o lease sem ACK de remoção,
-  registra `FORCED_REAPER_RELEASE` e incrementa `ipam_reaped_leases_total`.
-  Isso **diverge da [especificação (§4)](../../vpn-debian-specification.md#4-session-lifecycle)**, que mantém o IP reservado
-  até confirmar a remoção, inclusive se o nó estiver indisponível. O
-  [ADR-0001](../../.agc/adr/0001-ipam-and-session-persistence.md) registra a exceção proposta, não uma mudança aprovada
-  na especificação. O silêncio do nó não prova que o peer foi removido.
-  Esse comportamento não atende ao critério de revogação.
+- **[`LeaseReaperWorker`](../../control-dotnet/VpnControl/Workers/LeaseReaperWorker.cs).** Na implementação
+  do Marco 3, ele rodava a cada 60 s e movia sessões vencidas para
+  `quarantined` após silêncio do nó, apagando o lease sem ACK de remoção
+  (`FORCED_REAPER_RELEASE`). Esse comportamento **divergia da
+  [especificação (§4)](../../vpn-debian-specification.md#4-session-lifecycle)** e nunca foi aceite de revogação.
+  O Marco 4 o substitui: o worker agora move sessões pending/active vencidas
+  diretamente para `revoking`, enfileira `RevokePeer` na mesma transação e
+  não toca `ip_leases` até o ACK do backend. Não há quórum por silêncio nem
+  liberação forçada.
 - **O lado Go.** O `pkg/orchestrator` disca com `credentials.NewTLS` (a
   CA de laboratório como única raiz, o cert do nó como identidade de
   cliente), keepalive 30 s/10 s e backoff de reconexão. O `Channel.Run`
@@ -320,6 +320,18 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
 - **`stream_epoch`** — id emitido pelo plano de controle para um stream
   autenticado; uma reconexão o incrementa e cerca os ACKs do stream
   antigo.
+- **`key_epoch`** — número monotônico da geração de material de chave de
+  um par em um backend; o Rust recusa reutilizá-lo com chaves diferentes.
+- **Chave egress / ingress** — chaves AEAD direcionais de 32 bytes:
+  engine→cliente e cliente→engine. São propositalmente diferentes.
+- **`sender_index` / `peer_index`** — identificadores wire não nulos que o
+  emissor estampa e o receptor espera; escolhem épocas cifradas, não linhas
+  do banco.
+- **`StagePeer` / `Activate` / `RevokePeer`** — operações do socket de
+  controle Rust aplicadas pelo agente: preparar material, ativá-lo para
+  transmitir e remover o par.
+- **`SyncState`** — snapshot de reconciliação do plano de controle. Leva
+  referências de pares e enquadramento de integridade, nunca chaves cruas.
 - **Testcontainers** — a biblioteca com que os testes sobem um
   PostgreSQL real em Docker, para testar as corridas do alocador contra
   o motor real.
@@ -409,6 +421,68 @@ o epoch antigo. Dica: use
 `SameMillisecondReconnectGetsANewEpochAndSurvivesOldDetach`; confira que o
 segundo epoch é maior e `TryGet` ainda o retorna. Não altere o relógio do host.
 
+## Integração do Marco 4 — chaves, ACKs e um lease que não adivinha
+
+O Marco 3 já tinha a forma correta do ciclo, mas `ProvisionPeer` ainda não
+carregava chaves reais e o worker de expiração violava a especificação:
+liberava o lease à força quando o nó ficava em silêncio. O Marco 4 fecha
+as duas lacunas porque o teste de ponta a ponta depende delas.
+
+`SessionService` gera uma chave egress de 32 bytes, uma chave ingress
+distinta e dois índices wire distintos na mesma transação PostgreSQL que
+cria sessão, lease e comando na outbox. O lock da linha do nó faz
+`key_epoch` avançar monotonicamente por nó; dois pares não podem dividir a
+época que o Rust protege com tombstones. A migration `session-key-material`
+persiste chaves e índices, e os índices únicos transformam reutilização em
+erro de banco. `.1` fica reservado como gateway do nó e nunca é alugado.
+
+O payload carrega `key_material` com `key_epoch`, as duas chaves em base64,
+`sender_index` e `peer_index`. O dispatcher converte esses campos para
+`bytes` de protobuf sem mudar a direção: egress é engine→cliente e ingress
+é cliente→engine. O handler Go valida comprimentos, chaves distintas,
+índices não nulos e igualdade de época antes de tocar o engine. Depois
+executa `StagePeer` e `Activate`; somente quando as duas chamadas ao socket
+terminam ele envia o ACK aplicado que move a sessão REST de `pending` para
+`active`.
+
+A expiração agora segue a especificação:
+
+```csharp
+session.Status = SessionStatus.Revoking;
+session.FailureReason = "expired";
+db.Outbox.Add(new OutboxRow { CommandType = "RevokePeer", ... });
+```
+
+A primeira linha inicia a revogação sem fingir que o peer já sumiu. A
+segunda registra a razão. A terceira pede ao nó remover exatamente aquela
+sessão. Não há `DELETE FROM ip_leases` neste worker: a reserva sobrevive à
+indisponibilidade do nó. O lease só é apagado no caminho do ACK confirmado
+de `RevokePeer`, depois da validação de stream epoch, backend instance e
+revisão.
+
+O agente também aplica expiração localmente. Se o plano de controle estiver
+fora quando `expires_at` passar, o nó revoga no engine; a convergência
+chega depois por reenvio e `SyncState`. O snapshot valida contagem
+declarada, comprimento e SHA-256 antes de mutar, e a guarda de remoção impede
+que um snapshot vazio ou massivo sem force limpe o backend.
+
+Nota de contrato: a tabela da especificação ainda nomeia os métodos
+Go↔Rust `AddPeer`/`RemovePeer`/`SyncPeers` em `/run/vpn/engine.sock`. O
+Marco 4 preserva a fronteira já entregue — um socket de controle separado
+com `StagePeer`, `Activate`, `Retire`, `RevokePeer` e `GetSessions` —
+porque renomeá-la não era necessário para o comportamento de aceite. O
+reprovisionamento após reinício do backend não é reivindicado: snapshots
+levam referências de chave, não chaves cruas, então um backend novo não
+consegue reconstruir épocas antigas sem provisionamento explícito e novo.
+
+### Resultado observado do plano de controle
+
+A execução normal observou leases distintos, estado `pending` até os ACKs e
+depois `active` nos dois clientes. Na execução de interrupção, fechar o
+proxy antes do ACK deixou A em `revoking` com uma entrada em `ip_leases`.
+Ao restaurar o proxy, a outbox reenviou/reconciliou o comando; somente então
+a sessão ficou `revoked` e o lease chegou a zero. A não foi reativada.
+
 ## Revisões
 
 - `r0` — contratos (proto, AckErrorCode, campos de fencing), CA de
@@ -425,6 +499,7 @@ segundo epoch é maior e `TryGet` ainda o retorna. Não altere o relógio do hos
 - `r2` — [PR #15](https://github.com/RondineleG/HiKablue/pull/15): cancelamento do contexto filho e espera do heartbeat; epochs
   monotônicos no processo; regressões e gate de qualidade/cobertura para
   PRs. Nenhum novo aceite de milestone ou resultado de rede é alegado.
+- `r4` — integração de ponta a ponta: chaves direcionais, expiração conforme a especificação e ciclo observado no laboratório.
 - `r3` — [PR #16](https://github.com/RondineleG/HiKablue/pull/16): recupera comandos sem ACK na outbox, isola
   escritas entre nós, preserva o estado de replay em memória entre canais do
   mesmo backend e rejeita prazos e epochs malformados. O prazo continua

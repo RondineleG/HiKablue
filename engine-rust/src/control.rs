@@ -26,6 +26,7 @@
 //! `Zeroizing` buffers and never logged.
 
 use std::io;
+use std::net::Ipv4Addr;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -36,7 +37,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::cli::parse_key_hex;
 use crate::metrics::{self, Metrics};
-use crate::sessions::{SessionTable, TableError};
+use crate::sessions::{SessionTable, StagePeerRequest, TableError};
 
 /// Upper bound on simultaneous control connections — far fewer than
 /// metrics: only the agent talks here.
@@ -173,6 +174,22 @@ fn take_opt_u32(
     }
 }
 
+fn take_opt_ipv4(
+    payload: &serde_json::Value,
+    field: &str,
+) -> Result<Option<Ipv4Addr>, (&'static str, String)> {
+    match payload.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(raw)) => raw.parse::<Ipv4Addr>().map(Some).map_err(|_| {
+            (
+                "invalid_field",
+                format!("payload.{field} must be an IPv4 address"),
+            )
+        }),
+        _ => Err(("invalid_field", format!("payload.{field} must be a string"))),
+    }
+}
+
 fn table_err(e: TableError) -> (&'static str, String) {
     let code = match &e {
         TableError::BadInput(_) => "invalid_field",
@@ -200,15 +217,17 @@ fn apply(
             let peer_index = take_u32(payload, "peer_index")?;
             let egress_key = take_key(payload, "egress_key")?;
             let ingress_key = take_key(payload, "ingress_key")?;
+            let virtual_ip = take_opt_ipv4(payload, "virtual_ip")?;
             sessions
-                .stage(
+                .stage(StagePeerRequest {
                     lab_session_id,
+                    virtual_ip,
                     key_epoch,
                     sender_index,
                     peer_index,
-                    egress_key,
-                    ingress_key,
-                )
+                    tx_key: egress_key,
+                    rx_key: ingress_key,
+                })
                 .map_err(table_err)?;
             Ok(serde_json::json!({
                 "key_epoch": key_epoch,
@@ -217,7 +236,10 @@ fn apply(
         }
         "Activate" => {
             let key_epoch = take_u64(payload, "key_epoch")?;
-            let previous = sessions.activate(key_epoch).map_err(table_err)?;
+            let lab_session_id = take_opt_u32(payload, "lab_session_id")?;
+            let previous = sessions
+                .activate(lab_session_id, key_epoch)
+                .map_err(table_err)?;
             metrics.rotations_total.fetch_add(1, Ordering::Relaxed);
             Ok(serde_json::json!({
                 "key_epoch": key_epoch,
@@ -227,7 +249,10 @@ fn apply(
         }
         "Retire" => {
             let key_epoch = take_u64(payload, "key_epoch")?;
-            sessions.retire(key_epoch).map_err(table_err)?;
+            let lab_session_id = take_opt_u32(payload, "lab_session_id")?;
+            sessions
+                .retire(lab_session_id, key_epoch)
+                .map_err(table_err)?;
             Ok(serde_json::json!({
                 "key_epoch": key_epoch,
                 "retired": true,
@@ -239,23 +264,48 @@ fn apply(
             Ok(serde_json::json!({"revoked": true}))
         }
         "GetSessions" => {
-            let rows: Vec<serde_json::Value> = sessions
-                .snapshot()
+            let peers: Vec<serde_json::Value> = sessions
+                .peers_snapshot()
                 .iter()
-                .map(|e| {
+                .map(|p| {
+                    let epochs: Vec<serde_json::Value> = p
+                        .epochs
+                        .iter()
+                        .map(|e| {
+                            serde_json::json!({
+                                "key_epoch": e.key_epoch,
+                                "sender_index": e.sender_index,
+                                "peer_index": e.peer_index,
+                                "role": format!("{:?}", e.role).to_lowercase(),
+                                "tx_pkts": e.tx_pkts,
+                                "rx_pkts": e.rx_pkts,
+                            })
+                        })
+                        .collect();
                     serde_json::json!({
-                        "key_epoch": e.key_epoch,
-                        "sender_index": e.sender_index,
-                        "peer_index": e.peer_index,
-                        "role": format!("{:?}", e.role).to_lowercase(),
-                        "tx_pkts": e.tx_pkts,
-                        "rx_pkts": e.rx_pkts,
+                        "lab_session_id": p.lab_session_id,
+                        "virtual_ip": p.virtual_ip.map(|ip| ip.to_string()),
+                        "endpoint": p.endpoint.map(|ep| ep.to_string()),
+                        "epochs": epochs,
                     })
                 })
                 .collect();
+            let epochs: Vec<serde_json::Value> = peers
+                .iter()
+                .flat_map(|p| p["epochs"].as_array().cloned().unwrap_or_default())
+                .collect();
+            let single_lab = if peers.len() == 1 {
+                peers[0]["lab_session_id"].clone()
+            } else {
+                serde_json::Value::Null
+            };
             Ok(serde_json::json!({
-                "epochs": rows,
-                "lab_session_id": sessions.lab_session_id(),
+                "backend_instance_id": sessions.backend_instance_id(),
+                "revocations": sessions.revocations(),
+                "peers": peers,
+                "lab_session_id": single_lab,
+                // Compatibility for the single-peer rotation consumers.
+                "epochs": epochs,
             }))
         }
         other => Err(("unknown_op", format!("unknown op {other:?}"))),
@@ -314,6 +364,7 @@ mod tests {
     const HEX_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const HEX_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
     const HEX_C: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    const HEX_D: &str = "4444444444444444444444444444444444444444444444444444444444444444";
 
     fn sock_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -323,9 +374,15 @@ mod tests {
     }
 
     fn table() -> Arc<SessionTable> {
-        Arc::new(SessionTable::new(Some(
-            crate::crypto::SessionState::from_lab_psk(Zeroizing::new([9u8; 32]), 1, 2),
-        )))
+        Arc::new(SessionTable::new(
+            Some(crate::crypto::SessionState::from_lab_psk(
+                Zeroizing::new([9u8; 32]),
+                1,
+                2,
+            )),
+            Some(Ipv4Addr::new(10, 80, 1, 2)),
+            false,
+        ))
     }
 
     async fn spawn_server(
@@ -397,6 +454,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bind_refuses_regular_file_and_replaces_stale_socket() {
+        let regular = sock_path("regular");
+        let _ = std::fs::remove_file(&regular);
+        std::fs::write(&regular, b"not a socket").unwrap();
+        let err = bind(&regular, None).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_file(&regular);
+
+        let stale = sock_path("stale");
+        let _ = std::fs::remove_file(&stale);
+        {
+            let _listener = std::os::unix::net::UnixListener::bind(&stale).unwrap();
+        } // dropping the listener leaves the filesystem entry behind
+        let listener = bind(&stale, None).unwrap();
+        drop(listener);
+        cleanup(&stale);
+    }
+
+    #[test]
+    fn table_error_mapping_is_stable_for_agent_and_tests() {
+        assert_eq!(
+            table_err(TableError::BadInput("bad".into())).0,
+            "invalid_field"
+        );
+        assert_eq!(table_err(TableError::StagedPending(1)).0, "staged_pending");
+        assert_eq!(table_err(TableError::UnknownEpoch(1)).0, "unknown_epoch");
+        assert_eq!(table_err(TableError::ActiveEpoch(1)).0, "active_epoch");
+        assert_eq!(table_err(TableError::IndexInUse(1)).0, "index_in_use");
+        assert_eq!(
+            table_err(TableError::UnknownLabSession(1)).0,
+            "unknown_lab_session"
+        );
+    }
+
+    #[test]
+    fn scrub_strings_wipes_nested_arrays_and_objects() {
+        let mut v = serde_json::json!({
+            "outer": [{"key": "secret"}, ["nested-secret"]],
+            "plain": 7,
+        });
+        scrub_strings(&mut v);
+        assert_eq!(v["outer"][0]["key"], "");
+        assert_eq!(v["outer"][1][0], "");
+        assert_eq!(v["plain"], 7);
+    }
+
+    #[tokio::test]
     async fn full_rotation_over_the_socket() {
         let (path, sessions, metrics) = spawn_server("rot", Some(unsafe { libc::geteuid() })).await;
 
@@ -406,7 +510,7 @@ mod tests {
         assert_eq!(resp["result"]["role"], "staged");
         assert_eq!(resp["request_id"], "r1");
         assert!(sessions.rx_lookup(22).is_some());
-        assert!(sessions.tx().is_some()); // epoch 0 still seals
+        assert!(sessions.single_tx().map(|target| target.session).is_some()); // epoch 0 still seals
 
         // Replaying the identical stage is a no-op, not an error.
         let resp = request(&path, "StagePeer", stage_payload(1, 11, 22, HEX_A, HEX_B)).await;
@@ -417,8 +521,23 @@ mod tests {
         assert_eq!(resp["result"]["role"], "active");
         assert_eq!(resp["result"]["previous_epoch"], 0);
         assert_eq!(metrics.rotations_total.load(Ordering::Relaxed), 1);
-        assert_eq!(sessions.tx().unwrap().key_epoch(), 1);
+        assert_eq!(
+            sessions
+                .single_tx()
+                .map(|target| target.session)
+                .unwrap()
+                .key_epoch(),
+            1
+        );
         assert!(sessions.rx_lookup(2).is_some());
+
+        // If the activation ACK was lost, at-least-once delivery replays
+        // the whole provision operation. The exact active epoch accepts
+        // that replay instead of treating it as key reuse.
+        let resp = request(&path, "StagePeer", stage_payload(1, 11, 22, HEX_A, HEX_B)).await;
+        assert_eq!(resp["status"], "ok");
+        let resp = request(&path, "Activate", serde_json::json!({"key_epoch": 1})).await;
+        assert_eq!(resp["status"], "ok");
 
         // Retire ends the drain window for epoch 0.
         let resp = request(&path, "Retire", serde_json::json!({"key_epoch": 0})).await;
@@ -453,7 +572,7 @@ mod tests {
         // A colliding peer_index is refused.
         let resp = request(&path, "StagePeer", stage_payload(1, 11, 2, HEX_A, HEX_B)).await;
         assert_eq!(resp["error"]["code"], "index_in_use");
-        assert!(sessions.tx().is_some());
+        assert!(sessions.single_tx().map(|target| target.session).is_some());
 
         let resp = request(&path, "Bogus", serde_json::json!({})).await;
         assert_eq!(resp["error"]["code"], "unknown_op");
@@ -489,7 +608,7 @@ mod tests {
         )
         .await;
         assert_eq!(resp["status"], "ok");
-        assert!(sessions.tx().is_none());
+        assert!(sessions.single_tx().map(|target| target.session).is_none());
         assert!(sessions.keyed());
 
         cleanup(&path);
@@ -515,6 +634,51 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn invalid_optional_ip_and_envelope_errors_are_reported() {
+        let (path, ..) = spawn_server("invalid-ip", None).await;
+        let mut bad = stage_payload(1, 11, 22, HEX_A, HEX_B);
+        bad["virtual_ip"] = serde_json::json!("not-an-ip");
+        let resp = request(&path, "StagePeer", bad).await;
+        assert_eq!(resp["error"]["code"], "invalid_field");
+
+        let mut bad = stage_payload(1, 11, 22, HEX_A, HEX_B);
+        bad["virtual_ip"] = serde_json::json!(7);
+        let resp = request(&path, "StagePeer", bad).await;
+        assert_eq!(resp["error"]["code"], "invalid_field");
+
+        let mut c = UnixStream::connect(&path).await.unwrap();
+        let req = serde_json::json!({
+            "request_id": "bad-env", "version": 1, "op": 7, "payload": {},
+        })
+        .to_string();
+        c.write_u32(req.len() as u32).await.unwrap();
+        c.write_all(req.as_bytes()).await.unwrap();
+        let n = c.read_u32().await.unwrap() as usize;
+        let mut buf = vec![0u8; n];
+        c.read_exact(&mut buf).await.unwrap();
+        let resp: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(resp["error"]["code"], "invalid_op");
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn getsessions_with_multiple_peers_has_no_single_lab_alias() {
+        let (path, ..) = spawn_server("multi-get", None).await;
+        let first = stage_payload(1, 11, 22, HEX_A, HEX_B);
+        assert_eq!(request(&path, "StagePeer", first).await["status"], "ok");
+        let mut second = stage_payload(2, 33, 44, HEX_C, HEX_D);
+        second["lab_session_id"] = serde_json::json!(43);
+        second["virtual_ip"] = serde_json::json!("10.80.1.3");
+        assert_eq!(request(&path, "StagePeer", second).await["status"], "ok");
+
+        let resp = request(&path, "GetSessions", serde_json::json!({})).await;
+        assert_eq!(resp["status"], "ok");
+        assert!(resp["result"]["lab_session_id"].is_null());
+        assert_eq!(resp["result"]["peers"].as_array().unwrap().len(), 2);
         cleanup(&path);
     }
 }

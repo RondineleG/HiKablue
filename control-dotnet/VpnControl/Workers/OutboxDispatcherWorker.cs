@@ -203,6 +203,19 @@ public sealed class OutboxDispatcherWorker(
                             KeyEpoch = (ulong)peer.GetProperty("key_epoch").GetInt64()
                         }
                     };
+                    if (payload.TryGetProperty("key_material", out var km))
+                    {
+                        command.ProvisionPeer.KeyMaterial = new PeerKeyMaterial
+                        {
+                            KeyEpoch = (ulong)km.GetProperty("key_epoch").GetInt64(),
+                            EgressKey = ByteString.CopyFrom(
+                                Convert.FromBase64String(km.GetProperty("egress_key").GetString()!)),
+                            IngressKey = ByteString.CopyFrom(
+                                Convert.FromBase64String(km.GetProperty("ingress_key").GetString()!)),
+                            SenderIndex = km.GetProperty("sender_index").GetUInt32(),
+                            PeerIndex = km.GetProperty("peer_index").GetUInt32()
+                        };
+                    }
                     return command;
                 case "RevokePeer":
                     command.RevokePeer = new RevokePeer

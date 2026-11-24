@@ -151,15 +151,15 @@ contract promised:
   **Exercise:** Run `dotnet test control-dotnet/VpnControl.Tests --filter FullyQualifiedName~DispatcherDoesNotHoldLocksDuringWritesOrRollBackOtherNodes`
   with Docker running. Find the two test writers: the healthy stream
   must be able to ACK while the other write is still blocked.
-- **[`LeaseReaperWorker`](../../control-dotnet/VpnControl/Workers/LeaseReaperWorker.cs).** By default, it runs every 60 s and
-  moves expired sessions to `quarantined` if the node has been silent for
-  more than 300 s or has no last-seen timestamp. It deletes the lease without
-  a removal ACK, logs `FORCED_REAPER_RELEASE` and increments
-  `ipam_reaped_leases_total`. This **diverges from the [specification (§4)](../../vpn-debian-specification.md#4-session-lifecycle)**,
-  which reserves the IP until removal is confirmed, including when a node is
-  unreachable. [ADR-0001](../../.agc/adr/0001-ipam-and-session-persistence.md) records the proposed exception, not an
-  approved change to the specification. Silence alone does not prove the peer
-  is gone. Do not treat this behavior as revocation acceptance.
+- **[`LeaseReaperWorker`](../../control-dotnet/VpnControl/Workers/LeaseReaperWorker.cs).** In the milestone-3
+  implementation it ran every 60 s and moved expired sessions to
+  `quarantined` after node silence, deleting the lease without a removal
+  ACK (`FORCED_REAPER_RELEASE`). That behavior **diverged from the
+  [specification (§4)](../../vpn-debian-specification.md#4-session-lifecycle)** and was never revocation acceptance.
+  Milestone 4 supersedes it: the worker now moves expired pending/active
+  sessions directly to `revoking`, enqueues `RevokePeer` in the same
+  transaction, and leaves `ip_leases` untouched until the backend ACK.
+  There is no quorum-by-silence and no forced release.
 - **The Go side.** `pkg/orchestrator` dials with `credentials.NewTLS`
   (lab CA as the only root, node cert as client identity), keepalive
   30 s/10 s and reconnect backoff. `Channel.Run` sends `NodeRegister`
@@ -298,6 +298,18 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   `spiffe://lab.hikablue/node/<id>` naming each node.
 - **`stream_epoch`** — control-plane-issued id for one authenticated
   stream; a reconnect bumps it and fences the old stream's ACKs.
+- **`key_epoch`** — the monotonic generation number for one peer's key
+  material on a backend; Rust refuses to reuse it for different keys.
+- **egress / ingress key** — the 32-byte directional AEAD keys: engine to
+  client and client to engine. They are deliberately different.
+- **`sender_index` / `peer_index`** — the nonzero wire identifiers stamped
+  by the sender and expected by the receiver; they select encrypted epochs,
+  not database rows.
+- **`StagePeer` / `Activate` / `RevokePeer`** — the Rust control-socket
+  operations the agent applies: prepare key material, make it the transmit
+  epoch, then remove the peer.
+- **`SyncState`** — the control-plane reconciliation snapshot. It carries
+  peer references and integrity framing, never raw key material.
 - **Testcontainers** — the library tests use to boot a real PostgreSQL
   in Docker, so allocator races are tested against the real engine.
 
@@ -384,6 +396,87 @@ old epoch. Hint: use `SameMillisecondReconnectGetsANewEpochAndSurvivesOldDetach`
 check that the second epoch is larger and `TryGet` still returns it.
 Do not test this by changing the host clock.
 
+
+## Milestone 4 integration — keys, ACKs, and the lease that refuses to guess
+
+Milestone 3 already had the right lifecycle shape, but the provision command
+still lacked real key material and the expiration worker violated the
+specification in one important way: after a node stayed silent, it force-
+released the lease. Milestone 4 closes both gaps because the end-to-end
+test depends on them.
+
+`SessionService` now generates a fresh 32-byte egress key, a distinct
+32-byte ingress key and two distinct nonzero wire indexes in the same
+PostgreSQL transaction that creates the session, lease and outbox command.
+The node row is locked first, so `key_epoch` advances monotonically per
+node and two concurrent peers cannot share the epoch Rust tombstones. The
+migration `session-key-material` persists the keys and indexes; the unique
+indexes make wire-index reuse a database error rather than a data-plane
+ambiguity. `.1` in the pool is reserved as the node-side gateway and is
+never leased.
+
+The command payload now carries:
+
+```json
+"key_material": {
+  "key_epoch": 2,
+  "egress_key": "base64…",
+  "ingress_key": "base64…",
+  "sender_index": 713651965,
+  "peer_index": 22788512
+}
+```
+
+Only the shape is reproduced here — never real lab key bytes. The outbox
+worker converts those fields into protobuf `bytes` without changing their
+meaning: egress is engine-to-client, ingress is client-to-engine. The Go
+handler validates lengths, distinct keys, distinct nonzero indexes and the
+peer/key epoch match before touching the engine. It then performs
+`StagePeer` followed by `Activate`; only after both control-socket calls
+succeed does it send an applied ACK. That ACK is what moves the REST session
+from `pending` to `active`.
+
+Expiration now follows the specification instead of guessing:
+
+```csharp
+session.Status = SessionStatus.Revoking;
+session.FailureReason = "expired";
+db.Outbox.Add(new OutboxRow { CommandType = "RevokePeer", ... });
+```
+
+Line by line: the first line starts revocation but does not pretend the
+peer is gone. The second records why it started. The third asks the node
+to remove exactly that lab session. There is no `DELETE FROM ip_leases` in
+this worker: the reservation survives node unavailability. The lease is
+deleted only in the confirmed `RevokePeer` ACK path, after stream epoch,
+backend instance and revision fencing have matched the command.
+
+The agent also enforces expiration locally. If the control plane is offline
+when `expires_at` passes, the node still calls the engine's `RevokePeer`;
+control-plane convergence happens later through redelivery and
+`SyncState`. `SyncState` validates declared count, byte length and SHA-256
+before mutation, and the deletion guard prevents a non-forced empty or
+mass-deletion snapshot from wiping the backend.
+
+Contract note: the specification table still calls the Go↔Rust methods
+`AddPeer`/`RemovePeer`/`SyncPeers` on `/run/vpn/engine.sock`. Milestone 4
+keeps the already delivered boundary instead — a separate control socket
+with `StagePeer`, `Activate`, `Retire`, `RevokePeer`, and `GetSessions` —
+because renaming it was not needed for the acceptance behavior. Backend
+restart reprovisioning is deliberately not claimed: snapshots carry key
+references, not raw keys, so a new backend cannot reconstruct old epochs
+without fresh explicit provisioning.
+
+### Observed control-plane result
+
+The normal laboratory run observed distinct leases (`10.80.1.66` and
+`10.80.1.150` in one recorded run), `pending` state until provisioning
+ACKs, then `active` for both clients. In the interruption run, killing the
+delayed proxy before the removal ACK left A in `revoking` with
+`ip_leases` count 1. Restoring the proxy let the outbox redeliver/reconcile
+the command; only then did the session become `revoked` and the lease count
+become 0. A was not reactivated.
+
 ## Revisions
 
 - `r0` — contracts (proto, AckErrorCode, fencing fields), lab CA, ADR-0001
@@ -398,6 +491,7 @@ Do not test this by changing the host clock.
 - `r2` — [PR #15](https://github.com/RondineleG/HiKablue/pull/15): child-context cancellation and heartbeat join; monotonic
   process-local stream epochs; regression tests and a PR quality/coverage
   gate. No new milestone acceptance or live-network result is claimed.
+- `r4` — end-to-end integration: control-plane-issued directional key material and wire indexes, spec-compliant expiration without forced lease release, exact agent validation, local expiration, and observed pending/active/revoking/revoked behavior in the two-client laboratory.
 - `r3` — [PR #16](https://github.com/RondineleG/HiKablue/pull/16): recover unacknowledged outbox commands,
   isolate writes across nodes, keep replay state in memory across channels on
   the same backend, and reject malformed deadlines and epochs. The deadline

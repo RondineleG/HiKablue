@@ -46,7 +46,10 @@ public sealed class SessionService(
     private static SessionView ToView(SessionRow row) => new(
         row.SessionId, row.Status.ToString().ToLowerInvariant(),
         row.VirtualIp?.ToString(), row.NodeId, row.LabSessionId,
-        row.ExpiresAt, row.FailureReason, StatusUrl(row.SessionId));
+        row.ExpiresAt, row.FailureReason, StatusUrl(row.SessionId),
+        row.EgressKey is null ? null : Convert.ToBase64String(row.EgressKey),
+        row.IngressKey is null ? null : Convert.ToBase64String(row.IngressKey),
+        row.SenderIndex, row.PeerIndex);
 
     private static string HashRequest(string subject, CreateSessionRequest request)
     {
@@ -124,6 +127,14 @@ public sealed class SessionService(
                 }
 
                 var now = DateTimeOffset.UtcNow;
+                var (senderIndex, peerIndex) = await AllocateWireIndexesAsync(cancellationToken);
+                // key_epoch is unique per node stream while the node row lock
+                // makes this single-issuer. Rust tombstoning treats epochs as
+                // backend-unique, so two peers must never share epoch 1.
+                var keyEpoch = await db.Sessions
+                    .Where(s => s.NodeId == node.NodeId)
+                    .Select(s => (long?)s.KeyEpoch)
+                    .MaxAsync(cancellationToken) + 1 ?? 1;
                 var row = new SessionRow
                 {
                     SessionId = sessionId,
@@ -135,7 +146,11 @@ public sealed class SessionService(
                     VirtualIp = free,
                     NodeId = node.NodeId,
                     LabSessionId = labId,
-                    KeyEpoch = 1,
+                    KeyEpoch = keyEpoch,
+                    EgressKey = RandomNumberGenerator.GetBytes(32),
+                    IngressKey = RandomNumberGenerator.GetBytes(32),
+                    SenderIndex = senderIndex,
+                    PeerIndex = peerIndex,
                     ExpiresAt = now.AddSeconds(ttl),
                     CreatedAt = now,
                     UpdatedAt = now
@@ -155,6 +170,14 @@ public sealed class SessionService(
                             session_id = sessionId, lab_session_id = labId,
                             virtual_ip = free.ToString(), expires_at = row.ExpiresAt,
                             key_epoch = row.KeyEpoch, key_ref = request.PeerPublicKey
+                        },
+                        key_material = new
+                        {
+                            key_epoch = row.KeyEpoch,
+                            egress_key = row.EgressKey,
+                            ingress_key = row.IngressKey,
+                            sender_index = row.SenderIndex,
+                            peer_index = row.PeerIndex
                         }
                     })
                 };
@@ -274,6 +297,28 @@ public sealed class SessionService(
             : eligible.FirstOrDefault(n => n.NodeId == requested);
     }
 
+    private async Task<(uint Sender, uint Peer)> AllocateWireIndexesAsync(CancellationToken ct)
+    {
+        var used = (await db.Sessions.AsNoTracking()
+                .Where(s => s.SenderIndex != null || s.PeerIndex != null)
+                .Select(s => new { s.SenderIndex, s.PeerIndex })
+                .ToListAsync(ct))
+            .SelectMany(x => new[] { x.SenderIndex, x.PeerIndex })
+            .Where(x => x.HasValue)
+            .Select(x => x!.Value)
+            .ToHashSet();
+        for (var tries = 0; tries < 128; tries++)
+        {
+            var sender = (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue);
+            var peer = (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue);
+            if (sender != peer && !used.Contains(sender) && !used.Contains(peer))
+            {
+                return (sender, peer);
+            }
+        }
+        throw new InvalidOperationException("unable to allocate unique wire indexes");
+    }
+
     private async Task EnsureNodeLockedAsync(string nodeId, Entities.Node node, CancellationToken ct)
     {
         // Upsert the row then lock it FOR UPDATE — single-issuer for
@@ -323,7 +368,8 @@ public sealed class SessionService(
         uint network = (((uint)bytes[0] << 24) | ((uint)bytes[1] << 16) | ((uint)bytes[2] << 8) | bytes[3])
             & (0xFFFFFFFFu << hostBits);
         uint count = (1u << hostBits) - 2; // usable hosts, skip network + broadcast
-        for (uint i = 1; i <= count; i++)
+        // .1 is the node-side gateway/service address and is never leased.
+        for (uint i = 2; i <= count; i++)
         {
             uint addr = network + i;
             yield return new IPAddress(new byte[] { (byte)(addr >> 24), (byte)(addr >> 16), (byte)(addr >> 8), (byte)addr });

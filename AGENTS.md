@@ -31,15 +31,14 @@ Name branches `feat/<slug>` for additive work and `fix/<slug>` for bug fixes. Us
   wiring it into `cmd/vpn-agent` — which still fetches M1 metrics once
   (the lab harness posts the HTTP heartbeat) — is deferred to milestone-4 integration along
   with the end-to-end gRPC lab.
-- **Milestone 4 in progress; phase 2 delivered (PR #14) and the zero-drop
-  control boundary delivered (PR #18).** Rust has the
-  versioned AEAD wire format, directional keys, atomic replay acceptance,
-  nonce-exhaustion latch and symmetric inner-VIP validation in lab `--key`
-  mode, plus the multi-epoch `SessionTable` (rx dispatch by `sender_index`),
-  the `--control-sock` IPC boundary (0600, `SO_PEERCRED`) with the
-  StagePeer/Activate/Retire/RevokePeer/GetSessions ops, tombstoned key
-  material, and per-epoch/rotation metrics. Remaining: agent-side drain
-  timing and key lifecycle integration with `agent-go`, CLI coverage, local
-  expiration/reconciliation, and the end-to-end gRPC lab. Do not treat the
-  control boundary as end-to-end session acceptance or advance milestones
-  5–6.
+- **Milestone 4 (end-to-end sessions) validated locally.** Rust has the
+  versioned AEAD wire format, directional keys, multi-peer `SessionTable`,
+  per-peer endpoint pinning, tombstoned key material and the
+  StagePeer/Activate/Retire/RevokePeer/GetSessions control socket. The Go
+  `vpn-agent -serve` loop owns the mTLS `NodeChannel`, applies commands to
+  that socket, enforces expiration locally and reconciles `SyncState`. The
+  C# control plane issues epoch-1 directional key material, keeps leases
+  reserved through `revoking`, and releases them only on fenced removal
+  ACKs. `tests/checks.sh --lab` includes the isolated two-client HTTP
+  laboratory in normal-revocation and gRPC-interruption modes. Do not
+  advance milestones 5–6.

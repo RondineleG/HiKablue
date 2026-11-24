@@ -19,4 +19,8 @@ public sealed record SessionView(
     int? LabSessionId,
     DateTimeOffset ExpiresAt,
     string? FailureReason,
-    string StatusUrl);
+    string StatusUrl,
+    string? EgressKey = null,
+    string? IngressKey = null,
+    uint? SenderIndex = null,
+    uint? PeerIndex = null);

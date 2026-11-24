@@ -138,6 +138,10 @@ if [ "$run_lab" -eq 1 ]; then
         tests/lab/telemetry-demo.sh
     run_step "lab integration: telemetry demo preserves foreign resources (sudo)" \
         sudo tests/lab/telemetry-demo-safety.test.sh
+    run_step "lab integration: milestone 4 sessions normal revocation" \
+        tests/lab/session-e2e.sh
+    run_step "lab integration: milestone 4 sessions gRPC reconciliation" \
+        tests/lab/session-e2e.sh --drop
 else
     record_skip "lab integration: ip netns ping + telemetry demo" \
         "privileged — run 'tests/checks.sh --lab' in the authorized lab"

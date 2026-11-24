@@ -331,6 +331,14 @@ fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
   nada.
 - **`--key <64-hex>`** — PSK de laboratorio: 64 dígitos hexadecimales =
   32 bytes, pasado en ambos extremos. Solo lab.
+- **`backend_instance_id`** — identificador aleatorio emitido por una
+  instancia del motor; los ACK de otra instancia quedan cercados.
+- **Endpoint pinning** — asociar un par cifrado con la primera dirección
+  externa que autentica tráfico válido y descartar copias de otros endpoints
+  antes de la verificación AEAD.
+- **`lab_session_id`** — identificador numérico de sesión del plano de
+  control usado como clave de la tabla; distinto de los índices wire de un
+  solo uso.
 - **Keepalive (0x02)** — datagrama sellado sin payload, emitido cuando
   el túnel está ocioso ≥ 25s para mantener abierto el mapeo NAT.
 - **MAC / etiqueta** — los 16 bytes de autenticación del Poly1305 al
@@ -397,9 +405,59 @@ queda 44 — `rx_unknown_sender_index` empieza a contar rezagados de la
 no-op exitoso, y reutilizar la época 1, el índice 33 o las mismas claves
 es rechazado por el tombstone.
 
+## Integración del milestone 4 — dos pares en un mismo motor de salida
+
+La frontera de rotación anterior era de un solo par. El milestone 4 la
+convierte en el plano de datos que el plano de control necesita: varios
+clientes comparten un motor de salida y eliminar uno no puede tocar paquetes
+ni endpoints de otro. La clave de la tabla es el `lab_session_id` numérico;
+el `peer_index` del wire sigue siendo global y de un solo uso:
+
+```rust
+rx: HashMap<u32, (u32, Arc<SessionState>)>,
+retired: Vec<Tombstone>,
+used_indexes: HashSet<u32>,
+```
+
+`rx` relaciona el índice enviado por un cliente con su sesión y época, así
+las épocas staged y retiring siguen descifrando sin recorrer la tabla.
+`retired` conserva huellas de claves muertas. `used_indexes` impide
+reemitir un índice incluso después de retirar su época. `StagePeer` y
+`RevokePeer` repetidos son idempotentes; índices, épocas o huellas en
+conflicto se rechazan.
+
+El endpoint aprendido también vive por par. El servidor descarta antes de
+`open` un datagrama cuya época pertenece a otro endpoint; de lo contrario
+una copia falsa consumiría el nonce real en la ventana de replay. Tras la
+autenticación, la fuente interna debe ser la VIP de ese par. La política de
+reenvío queda deliberadamente estrecha: el cliente autoriza la VIP de
+destino asignada, acepta respuestas originadas por el servicio detrás del
+nodo, y el tráfico de una VIP cliente a otra VIP cliente se descarta. La
+salida del servidor elige la época activa por la VIP cliente de destino.
+
+`GetSessions` devuelve `backend_instance_id` y una entrada por par. El
+agente lee esa identidad antes de abrir `NodeChannel`; un reinicio del
+motor cambia el backend y los ACK dirigidos al backend anterior quedan
+cercados. Los clientes del laboratorio reciben claves exactas por
+`--tx-key`/`--rx-key`, en dirección inversa a la del motor. Es transporte
+de claves solo de laboratorio, no el diseño final de aprovisionamiento.
+
+### Resultado observado del plano de datos
+
+`tests/lab/session-e2e.sh` y `tests/lab/session-e2e.sh --drop` pasaron en
+la VM Ubuntu de desarrollo. Los dos clientes recibieron `hikablue-m4-ok`
+por el túnel cifrado y la sonda directa no alcanzó el servicio. Durante la
+revocación de A, las solicitudes continuas de B no tuvieron fallos. La
+corrida normal registró `rx_pkts=105`, `tx_pkts=105`, `dropped_pkts=4`,
+`peers=1`; la de caída registró `rx_pkts=152`, `tx_pkts=151`,
+`dropped_pkts=5`, `peers=1`. Los conteos varían; la línea PASS es el
+resultado estable. Compilación, reenvío y conectividad HTTP se separan en
+`tests/lab/session-e2e.md`.
+
 ## Revisiones
 
 - `r1` — Época de 64 bits, borrado de claves, límite de nonces y vector RFC.
+- `r4` — Tabla multipar, endpoints por par, claves exactas y escenarios extremo a extremo.
 - `r3` — Verificado en la VM de desarrollo: 108 tests de Rust, gate local
   12/12 (lab privilegiado omitido); GitHub Actions bloqueado por cobro.
 - `r0` — AEAD, ventana de replay, latch de nonce, ingreso simétrico,
