@@ -376,7 +376,11 @@ impl SessionTable {
                 || p.staged
                     .as_ref()
                     .is_some_and(|s| s.key_epoch() == req.key_epoch)
-        }) || state.retired.iter().any(|t| t.key_epoch == req.key_epoch)
+        }) || state
+            .rx
+            .values()
+            .any(|(_, s)| s.key_epoch() == req.key_epoch)
+            || state.retired.iter().any(|t| t.key_epoch == req.key_epoch)
         {
             return Err(TableError::BadInput(format!(
                 "epoch {} already exists or was retired",
@@ -708,6 +712,21 @@ mod tests {
         assert!(matches!(
             t.retire(Some(1), 2),
             Err(TableError::ActiveEpoch(2))
+        ));
+    }
+
+    #[test]
+    fn draining_epochs_still_reserve_their_epoch_number() {
+        let t = SessionTable::new(None, None, true);
+        t.stage(req(1, 1, 11, 12, A, B)).unwrap();
+        t.activate(Some(1), 1).unwrap();
+        t.stage(req(1, 2, 13, 14, C, D)).unwrap();
+        t.activate(Some(1), 2).unwrap();
+        assert!(t.rx_lookup(12).is_some());
+
+        assert!(matches!(
+            t.stage(req(2, 1, 21, 22, D, A)),
+            Err(TableError::BadInput(_))
         ));
     }
 
