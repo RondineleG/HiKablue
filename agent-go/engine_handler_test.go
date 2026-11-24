@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -283,6 +284,80 @@ func TestExpiryStateSurvivesAgentRestart(t *testing.T) {
 	restarted.mu.Unlock()
 	if remaining != 0 {
 		t.Fatalf("expired peer remained in persisted state: %d entries", remaining)
+	}
+}
+
+func TestExpiryStateValidationAndPersistenceFailures(t *testing.T) {
+	disabled := NewEngineHandler("missing", "missing")
+	disabled.ExpiryStatePath = ""
+	if err := disabled.LoadExpiryState(); err != nil {
+		t.Fatal(err)
+	}
+	if err := disabled.rememberExpiry(7, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "expiry.json")
+	h := NewEngineHandler(filepath.Join(dir, "control.sock"), "missing")
+	h.ExpiryStatePath = dir
+	if err := h.LoadExpiryState(); err == nil {
+		t.Fatal("directory accepted as expiry state")
+	}
+	h.ExpiryStatePath = statePath
+	if err := os.WriteFile(statePath, []byte("not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.LoadExpiryState(); err == nil {
+		t.Fatal("invalid JSON accepted as expiry state")
+	}
+	for _, raw := range []string{
+		`{"peers":{"0":"2026-01-01T00:00:00Z"}}`,
+		`{"peers":{"7":"0001-01-01T00:00:00Z"}}`,
+	} {
+		if err := os.WriteFile(statePath, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.LoadExpiryState(); err == nil {
+			t.Fatalf("invalid expiry state accepted: %s", raw)
+		}
+	}
+}
+
+func TestProvisionAndRevokeReportExpiryPersistenceFailures(t *testing.T) {
+	path, _ := controlServer(t, ControlSessions{})
+	h := NewEngineHandler(path, "missing")
+	h.ExpiryStatePath = filepath.Join(t.TempDir(), "missing", "expiry.json")
+	if err := h.ProvisionPeer(context.Background(), testProvision(8, 1)); err == nil {
+		t.Fatal("provision with unwritable expiry state accepted")
+	}
+
+	h.ExpiryStatePath = filepath.Join(t.TempDir(), "expiry.json")
+	if err := h.ProvisionPeer(context.Background(), testProvision(8, 1)); err != nil {
+		t.Fatal(err)
+	}
+	h.ExpiryStatePath = filepath.Join(t.TempDir(), "missing", "expiry.json")
+	if err := h.RevokePeer(context.Background(), &edgev1.RevokePeer{LabSessionId: 8}); err == nil {
+		t.Fatal("revoke with unwritable expiry state accepted")
+	}
+	h.mu.Lock()
+	_, stillTracked := h.expires[8]
+	h.mu.Unlock()
+	if !stillTracked {
+		t.Fatal("failed expiry-state delete dropped the in-memory deadline")
+	}
+}
+
+func TestExpiryStateRenameFailureIsReported(t *testing.T) {
+	path, _ := controlServer(t, ControlSessions{})
+	h := NewEngineHandler(path, "missing")
+	statePath := filepath.Join(t.TempDir(), "expiry.json")
+	if err := os.Mkdir(statePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	h.ExpiryStatePath = statePath
+	if err := h.ProvisionPeer(context.Background(), testProvision(8, 1)); err == nil {
+		t.Fatal("expiry state rename failure accepted")
 	}
 }
 
