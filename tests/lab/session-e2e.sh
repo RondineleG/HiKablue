@@ -133,11 +133,11 @@ chmod 644 "$RUN_DIR/pki/server/server.crt"
 chmod 600 "$RUN_DIR/pki/server/server.key"
 
 log "isolated network namespaces"
+CREATED_NS=1
 sudo ip netns add "$NS_EXIT"
 sudo ip netns add "$NS_A"
 sudo ip netns add "$NS_B"
 sudo ip netns add "$NS_SVC"
-CREATED_NS=1
 # One bridge inside the exit namespace; client outer traffic cannot leave
 # these namespaces. The service is separately connected behind the exit node.
 sudo ip netns exec "$NS_EXIT" ip link add hkm4br0 type bridge
