@@ -217,6 +217,26 @@ func TestSyncStateValidatesFramingAndKeepsDesiredPeers(t *testing.T) {
 	}
 }
 
+func TestSyncStateToleratesLocallyExpiredPeer(t *testing.T) {
+	peer := testPeer(7, 1)
+	peer.ExpiresAt = timestamppb.New(time.Now().Add(-time.Second))
+	_, snap := snapshotBytes(t, peer)
+	path, ops := controlServer(t, ControlSessions{})
+	h := NewEngineHandler(path, "missing")
+	if err := h.SyncState(context.Background(), &edgev1.SyncState{Snapshot: snap}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ops()) != 1 {
+		t.Fatalf("expired missing peer caused mutation: %+v", ops())
+	}
+
+	peer.ExpiresAt = timestamppb.New(time.Now().Add(time.Hour))
+	_, snap = snapshotBytes(t, peer)
+	if err := h.SyncState(context.Background(), &edgev1.SyncState{Snapshot: snap}); err == nil {
+		t.Fatal("unexpired missing peer accepted")
+	}
+}
+
 func TestSyncStateDeletionGuardAndForcedRemoval(t *testing.T) {
 	_, snap := snapshotBytes(t)
 	path, ops := controlServer(t, ControlSessions{

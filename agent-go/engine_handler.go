@@ -177,7 +177,14 @@ func (h *EngineHandler) SyncState(ctx context.Context, p *edgev1.SyncState) erro
 	for _, peer := range list.Peers {
 		lab := peer.LabSessionId
 		if !local[lab] {
-			return fmt.Errorf("snapshot peer %d is missing locally; key material cannot be reconstructed", lab)
+			if time.Now().Before(peer.ExpiresAt.AsTime()) {
+				return fmt.Errorf("snapshot peer %d is missing locally; key material cannot be reconstructed", lab)
+			}
+			// The agent's offline expiry loop may already have removed this
+			// peer before the control-plane reaper learns of the deadline.
+			// That state is convergent: reconciliation must wait for the
+			// revisioned RevokePeer command instead of rejecting every sync.
+			continue
 		}
 		// Rehydrate the local expiration deadline after an agent restart.
 		// The engine owns enforcement; this map only drives the agent's timer.
