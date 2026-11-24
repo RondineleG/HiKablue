@@ -293,6 +293,7 @@ func TestEngineHealthyAndExpiryLoop(t *testing.T) {
 	}
 	path, ops := controlServer(t, ControlSessions{})
 	h.Control.SocketPath = path
+	h.ExpiryStatePath = filepath.Join(t.TempDir(), "expiry.json")
 	h.mu.Lock()
 	h.expires[8] = time.Now().Add(-time.Second)
 	h.mu.Unlock()
