@@ -10,7 +10,8 @@ public sealed record CreateSessionRequest(
 
 /// What the session endpoints return. statusUrl is self-referential so a
 /// 202 poller needs no URL knowledge; virtualIp stays null until the lease
-/// is reserved (pending) and after release (revoked/failed).
+/// is reserved (pending) and after release (revoked/failed). sessionToken is
+/// returned only by the create/idempotent-replay bootstrap response.
 public sealed record SessionView(
     Guid SessionId,
     string Status,
@@ -23,4 +24,5 @@ public sealed record SessionView(
     string? EgressKey = null,
     string? IngressKey = null,
     uint? SenderIndex = null,
-    uint? PeerIndex = null);
+    uint? PeerIndex = null,
+    string? SessionToken = null);

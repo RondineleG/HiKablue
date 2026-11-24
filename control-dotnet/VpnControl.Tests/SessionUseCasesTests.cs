@@ -20,12 +20,12 @@ public sealed class SessionUseCasesTests
             Task.FromResult(result);
 
         public Task<RequestResult<SessionView>> GetSessionAsync(Guid sessionId,
-            string subject, bool isAdmin,
+            string subject, bool isAdmin, string? sessionToken = null,
             CancellationToken cancellationToken = default) =>
             Task.FromResult(result);
 
         public Task<RequestResult<SessionView>> RevokeSessionAsync(Guid sessionId,
-            string subject, bool isAdmin,
+            string subject, bool isAdmin, string? sessionToken = null,
             CancellationToken cancellationToken = default) =>
             Task.FromResult(result);
     }

@@ -10,14 +10,16 @@ using VpnControl.UseCases.Sessions;
 namespace VpnControl.Endpoints.V1.Sessions;
 
 /// /v1/sessions — create (POST, Idempotency-Key), read (GET/{id}), revoke
-/// (DELETE/{id}). Lab identity: X-Subject names the owner; X-Admin-Token
-/// matches VpnControl:AdminToken for administrative reads/revocations.
+/// (DELETE/{id}). Lab identity: X-Subject names the owner; the one-time
+/// X-Session-Token capability returned by POST authorizes owner access.
+/// X-Admin-Token matches VpnControl:AdminToken for administrative access.
 /// Every response carries Cache-Control: no-store (session material).
 public sealed class SessionsEndpoint : BaseEndPoint<Node>, IEndpointAsync
 {
     private const int V1 = 1;
     private const string SubjectHeader = "X-Subject";
     private const string AdminHeader = "X-Admin-Token";
+    private const string SessionTokenHeader = "X-Session-Token";
     private const string AdminConfigKey = "VpnControl:AdminToken";
     private const string IdempotencyHeader = "Idempotency-Key";
     private static readonly string Route = GetVersionedRoute(V1, "sessions");
@@ -77,11 +79,13 @@ public sealed class SessionsEndpoint : BaseEndPoint<Node>, IEndpointAsync
     {
         http.Response.Headers.CacheControl = "no-store";
         var subject = http.Request.Headers[SubjectHeader].ToString();
-        if (string.IsNullOrWhiteSpace(subject) && !IsAdmin(http, configuration))
+        var sessionToken = http.Request.Headers[SessionTokenHeader].ToString();
+        var admin = IsAdmin(http, configuration);
+        if (!admin && (string.IsNullOrWhiteSpace(subject) || string.IsNullOrWhiteSpace(sessionToken)))
         {
             return Task.FromResult(Unauthorized());
         }
-        return HandleUseCase(useCase, new GetSessionQuery(id, subject, IsAdmin(http, configuration)),
+        return HandleUseCase(useCase, new GetSessionQuery(id, subject, admin, sessionToken),
             loggerFactory.CreateLogger<SessionsEndpoint>(), http.RequestAborted);
     }
 
@@ -94,11 +98,13 @@ public sealed class SessionsEndpoint : BaseEndPoint<Node>, IEndpointAsync
     {
         http.Response.Headers.CacheControl = "no-store";
         var subject = http.Request.Headers[SubjectHeader].ToString();
-        if (string.IsNullOrWhiteSpace(subject) && !IsAdmin(http, configuration))
+        var sessionToken = http.Request.Headers[SessionTokenHeader].ToString();
+        var admin = IsAdmin(http, configuration);
+        if (!admin && (string.IsNullOrWhiteSpace(subject) || string.IsNullOrWhiteSpace(sessionToken)))
         {
             return Unauthorized();
         }
-        return await HandleUseCaseAsync(useCase, new GetSessionQuery(id, subject, IsAdmin(http, configuration)),
+        return await HandleUseCaseAsync(useCase, new GetSessionQuery(id, subject, admin, sessionToken),
             result => Results.Accepted(uri: result.Data?.StatusUrl,
                 value: CreateApiResponse(result, StatusCodes.Status202Accepted, includeData: true)),
             "Session revocation failed",

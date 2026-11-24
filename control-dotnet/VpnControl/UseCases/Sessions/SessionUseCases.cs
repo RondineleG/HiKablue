@@ -59,7 +59,7 @@ public interface IGetSessionUseCase : IUseCase<GetSessionQuery, SessionView>
 {
 }
 
-public sealed record GetSessionQuery(Guid SessionId, string Subject, bool IsAdmin);
+public sealed record GetSessionQuery(Guid SessionId, string Subject, bool IsAdmin, string? SessionToken = null);
 
 public sealed class GetSessionUseCase(ISessionService sessions) : IGetSessionUseCase
 {
@@ -67,7 +67,7 @@ public sealed class GetSessionUseCase(ISessionService sessions) : IGetSessionUse
         CancellationToken cancellationToken = default)
     {
         var result = await sessions.GetSessionAsync(request.SessionId, request.Subject, request.IsAdmin,
-            cancellationToken);
+            request.SessionToken, cancellationToken);
         if (!result.IsSuccess || result.Data is null)
         {
             return RequestResult<SessionView>.WithError(result.ErrorMessage ?? result.Message,
@@ -87,7 +87,7 @@ public sealed class RevokeSessionUseCase(ISessionService sessions) : IRevokeSess
         CancellationToken cancellationToken = default)
     {
         var result = await sessions.RevokeSessionAsync(request.SessionId, request.Subject, request.IsAdmin,
-            cancellationToken);
+            request.SessionToken, cancellationToken);
         if (!result.IsSuccess || result.Data is null)
         {
             return RequestResult<SessionView>.WithError(result.ErrorMessage ?? result.Message,

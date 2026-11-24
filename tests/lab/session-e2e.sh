@@ -241,11 +241,14 @@ create_session() {
         -H 'Content-Type: application/json' -H "X-Subject: $subject" \
         -d '{"nodeId":"exit-node","ttlSeconds":180}' >"$out" \
         || { cat "$out" >&2; fail "create $subject failed"; }
-    local id
-    id=$(jq -r '.data.sessionId' "$out")
-    [ "$(jq -r '.data.status' "$out")" = pending ] || fail "session $subject did not start pending"
+    cp "$out" "$out.bootstrap"
+    local id token
+    id=$(jq -r '.data.sessionId' "$out.bootstrap")
+    token=$(jq -r '.data.sessionToken' "$out.bootstrap")
+    [ "$(jq -r '.data.status' "$out.bootstrap")" = pending ] || fail "session $subject did not start pending"
     for _ in $(seq 30); do
-        api "$CTRL_URL/v1/sessions/$id" -H "X-Subject: $subject" >"$out" || true
+        api "$CTRL_URL/v1/sessions/$id" -H "X-Subject: $subject" \
+            -H "X-Session-Token: $token" >"$out" || true
         [ "$(jq -r '.data.status' "$out" 2>/dev/null)" = active ] && return 0
         sleep 0.2
     done
@@ -290,14 +293,15 @@ create_session alice "$RUN_DIR/session-a.json"
 create_session bob "$RUN_DIR/session-b.json"
 A_ID=$(jq -r '.data.sessionId' "$RUN_DIR/session-a.json")
 B_ID=$(jq -r '.data.sessionId' "$RUN_DIR/session-b.json")
+A_TOKEN=$(jq -r '.data.sessionToken' "$RUN_DIR/session-a.json.bootstrap")
 [ -n "$B_ID" ] || fail "session B id missing"
 A_IP=$(jq -r '.data.virtualIp' "$RUN_DIR/session-a.json")
 B_IP=$(jq -r '.data.virtualIp' "$RUN_DIR/session-b.json")
 [ "$A_IP" != "$B_IP" ] || fail "clients received the same IP"
 echo "  OBSERVED: A=$A_IP B=$B_IP; both pending until ACK, then active"
 
-start_client "$NS_A" "$RUN_DIR/session-a.json" tun0 client-a
-start_client "$NS_B" "$RUN_DIR/session-b.json" tun0 client-b
+start_client "$NS_A" "$RUN_DIR/session-a.json.bootstrap" tun0 client-a
+start_client "$NS_B" "$RUN_DIR/session-b.json.bootstrap" tun0 client-b
 
 log "HTTP connectivity over both tunnels"
 [ "$(curl_client "$NS_A")" = "hikablue-m4-ok" ] || fail "client A did not receive the expected HTTP body"
@@ -321,6 +325,7 @@ BEFORE=$(grep -c '^ok$' "$RUN_DIR/b-continuous.log" || true)
 
 log "revoke session A"
 api -X DELETE "$CTRL_URL/v1/sessions/$A_ID" -H 'X-Subject: alice' \
+    -H "X-Session-Token: $A_TOKEN" \
     >"$RUN_DIR/revoke-a.json" || { cat "$RUN_DIR/revoke-a.json" >&2; fail "revoke request failed"; }
 [ "$(jq -r '.data.status' "$RUN_DIR/revoke-a.json")" = revoking ] || fail "A did not enter revoking"
 if [ "$MODE" = drop ]; then
@@ -344,7 +349,8 @@ if [ "$MODE" = drop ]; then
 fi
 sleep 0.5
 STATUS=$(
-    api "$CTRL_URL/v1/sessions/$A_ID" -H 'X-Subject: alice' | jq -r '.data.status'
+    api "$CTRL_URL/v1/sessions/$A_ID" -H 'X-Subject: alice' \
+        -H "X-Session-Token: $A_TOKEN" | jq -r '.data.status'
 )
 LEASES=$("$PGBIN/psql" -h 127.0.0.1 -p "$PGPORT" -U "$(id -un)" -d postgres -Atc \
     "select count(*) from ip_leases where session_id='$A_ID'")
@@ -376,7 +382,8 @@ if [ "$MODE" = drop ]; then
 fi
 
 for _ in $(seq 60); do
-    STATUS=$(api "$CTRL_URL/v1/sessions/$A_ID" -H 'X-Subject: alice' | jq -r '.data.status')
+    STATUS=$(api "$CTRL_URL/v1/sessions/$A_ID" -H 'X-Subject: alice' \
+        -H "X-Session-Token: $A_TOKEN" | jq -r '.data.status')
     [ "$STATUS" = revoked ] && break
     sleep 0.25
 done

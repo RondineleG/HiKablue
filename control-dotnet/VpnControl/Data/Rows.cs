@@ -26,6 +26,9 @@ public sealed class SessionRow
     // same key + same payload replays, same key + different payload → 409.
     public string? RequestHash { get; set; }
     public required string OwnerSubject { get; set; }
+    // SHA-256 hex of the one-time session bearer token returned at
+    // provisioning. The plaintext token is never persisted.
+    public string? SessionTokenHash { get; set; }
     // Client key material reference, opaque to the control plane but
     // persisted so the ProvisionPeer command can carry it to the backend.
     public string? PeerPublicKey { get; set; }

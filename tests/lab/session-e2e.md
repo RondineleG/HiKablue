@@ -26,7 +26,9 @@ POST /v1/sessions
 
 The two client namespaces run `vpn-engine client`. For milestone 4 their
 first epoch is bootstrapped with the exact keys returned by the lab session
-API (`--tx-key`, `--rx-key`, and complementary wire indexes). The client
+API (`--tx-key`, `--rx-key`, and complementary wire indexes). Status polling
+and revocation present the bootstrap `sessionToken` as `X-Session-Token`;
+the script preserves the create response separately for that purpose. The client
 direction is the inverse of the exit engine direction. This is lab-only
 bootstrap, not the later user-facing client provisioning flow.
 

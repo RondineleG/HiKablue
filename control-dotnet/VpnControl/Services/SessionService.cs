@@ -16,9 +16,9 @@ public interface ISessionService
     Task<RequestResult<SessionView>> CreateSessionAsync(CreateSessionRequest request, string subject,
         string? idempotencyKey, CancellationToken cancellationToken = default);
     Task<RequestResult<SessionView>> GetSessionAsync(Guid sessionId, string subject, bool isAdmin,
-        CancellationToken cancellationToken = default);
+        string? sessionToken = null, CancellationToken cancellationToken = default);
     Task<RequestResult<SessionView>> RevokeSessionAsync(Guid sessionId, string subject, bool isAdmin,
-        CancellationToken cancellationToken = default);
+        string? sessionToken = null, CancellationToken cancellationToken = default);
 }
 
 /// IPAM + session lifecycle on PostgreSQL (ADR-0001). Every write bundles
@@ -43,13 +43,49 @@ public sealed class SessionService(
 
     private static string StatusUrl(Guid id) => $"/v1/sessions/{id}";
 
-    private static SessionView ToView(SessionRow row) => new(
+    private static SessionView ToView(SessionRow row, string? sessionToken = null) => new(
         row.SessionId, row.Status.ToString().ToLowerInvariant(),
         row.VirtualIp?.ToString(), row.NodeId, row.LabSessionId,
         row.ExpiresAt, row.FailureReason, StatusUrl(row.SessionId),
         row.EgressKey is null ? null : Convert.ToBase64String(row.EgressKey),
         row.IngressKey is null ? null : Convert.ToBase64String(row.IngressKey),
-        row.SenderIndex, row.PeerIndex);
+        row.SenderIndex, row.PeerIndex, sessionToken);
+
+    private static string HashSessionToken(string token) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
+
+    // The bootstrap token is derived from secret session key material rather
+    // than stored plaintext. Replaying the idempotent create therefore returns
+    // the same capability without weakening the database-at-rest posture.
+    private static string DeriveSessionToken(SessionRow row)
+    {
+        if (row.EgressKey is null)
+        {
+            return "";
+        }
+        using var hmac = new HMACSHA256(row.EgressKey);
+        return Convert.ToHexString(hmac.ComputeHash(
+            Encoding.UTF8.GetBytes($"hikablue-session-token:{row.SessionId}")));
+    }
+
+    private static bool SessionTokenMatches(SessionRow row, string? token)
+    {
+        if (row.SessionTokenHash is null || string.IsNullOrWhiteSpace(token) ||
+            row.SessionTokenHash.Length != 64 || token.Length != 64)
+        {
+            return false;
+        }
+        try
+        {
+            return CryptographicOperations.FixedTimeEquals(
+                Convert.FromHexString(row.SessionTokenHash),
+                Convert.FromHexString(HashSessionToken(token.ToUpperInvariant())));
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+    }
 
     private static string HashRequest(string subject, CreateSessionRequest request)
     {
@@ -69,7 +105,7 @@ public sealed class SessionService(
             if (replay is not null)
             {
                 return replay.RequestHash == hash
-                    ? RequestResult<SessionView>.Success(ToView(replay), "idempotent replay")
+                    ? RequestResult<SessionView>.Success(ToView(replay, DeriveSessionToken(replay)), "idempotent replay")
                     : RequestResult<SessionView>.WithError(
                         "idempotency key was already used with a different payload",
                         EResultStatus.EntityAlreadyExists);
@@ -155,6 +191,7 @@ public sealed class SessionService(
                     CreatedAt = now,
                     UpdatedAt = now
                 };
+                row.SessionTokenHash = HashSessionToken(DeriveSessionToken(row));
                 var revision = await BumpRevisionAsync(node.NodeId, cancellationToken);
                 var command = new OutboxRow
                 {
@@ -214,7 +251,7 @@ public sealed class SessionService(
             if (replay is not null)
             {
                 return replay.RequestHash == hash
-                    ? RequestResult<SessionView>.Success(ToView(replay), "idempotent replay")
+                    ? RequestResult<SessionView>.Success(ToView(replay, DeriveSessionToken(replay)), "idempotent replay")
                     : RequestResult<SessionView>.WithError(
                         "idempotency key was already used with a different payload",
                         EResultStatus.EntityAlreadyExists);
@@ -228,14 +265,15 @@ public sealed class SessionService(
                 EResultStatus.Unavailable);
         }
 
-        return RequestResult<SessionView>.Success(ToView(created), "session pending");
+        return RequestResult<SessionView>.Success(ToView(created, DeriveSessionToken(created)), "session pending");
     }
 
     public async Task<RequestResult<SessionView>> GetSessionAsync(Guid sessionId, string subject, bool isAdmin,
-        CancellationToken cancellationToken = default)
+        string? sessionToken = null, CancellationToken cancellationToken = default)
     {
         var row = await db.Sessions.AsNoTracking().FirstOrDefaultAsync(s => s.SessionId == sessionId, cancellationToken);
-        if (row is null || (!isAdmin && row.OwnerSubject != subject))
+        if (row is null || (!isAdmin &&
+                (row.OwnerSubject != subject || !SessionTokenMatches(row, sessionToken))))
         {
             return RequestResult<SessionView>.WithError("session not found", EResultStatus.EntityNotFound);
         }
@@ -243,10 +281,11 @@ public sealed class SessionService(
     }
 
     public async Task<RequestResult<SessionView>> RevokeSessionAsync(Guid sessionId, string subject, bool isAdmin,
-        CancellationToken cancellationToken = default)
+        string? sessionToken = null, CancellationToken cancellationToken = default)
     {
         var row = await db.Sessions.FirstOrDefaultAsync(s => s.SessionId == sessionId, cancellationToken);
-        if (row is null || (!isAdmin && row.OwnerSubject != subject))
+        if (row is null || (!isAdmin &&
+                (row.OwnerSubject != subject || !SessionTokenMatches(row, sessionToken))))
         {
             return RequestResult<SessionView>.WithError("session not found", EResultStatus.EntityNotFound);
         }

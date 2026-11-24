@@ -16,9 +16,10 @@ primeras fases: el contrato y su identidad, luego la memoria.
 > **Límite del laboratorio.** Todo sigue corriendo en un laboratorio
 > aislado y autorizado (`.agc/RULES.md` LAB-01). La CA en
 > `tests/lab/pki/` es generada localmente por `gen-lab-pki.sh` y es
-> *solo de laboratorio* — nunca promovida. La propiedad de sesiones usa un
-> encabezado `X-Subject` más un token de administrador; la autenticación
-> real de usuarios queda para el hito de cuentas de usuario.
+> *solo de laboratorio* — nunca promovida. La propiedad de sesiones combina el
+> encabezado de laboratorio `X-Subject` con una capability de bootstrap por
+> sesión; un token de administrador sigue disponible para operadores. La
+> autenticación real de usuarios queda para el hito de cuentas de usuario.
 
 ## Primero el contrato: `NodeChannel`
 
@@ -104,10 +105,15 @@ así un pool desalineado jamás puede alquilar direcciones fuera del bloque.
 `POST /v1/sessions` con `Idempotency-Key` devuelve **202** más una URL
 de estado — el aprovisionamiento es asíncrono por diseño. La misma clave
 con el mismo payload reproduce la respuesta original; la misma clave con
-payload distinto es un conflicto **409**. `DELETE` mueve la sesión a
-`revoking` y encola `RevokePeer`. La liberación normal espera un `CommandAck`
-que confirme la eliminación. La excepción del reaper en el código actual se
-describe abajo. Las respuestas de sesión llevan `no-store`.
+payload distinto es un conflicto **409**. La respuesta de bootstrap también
+devuelve `sessionToken`, una capability de 256 bits derivada con HMAC del
+material secreto de sesión. Solo se guarda su resumen SHA-256, pero repetir
+el create idempotente deriva el mismo token. El `GET`/`DELETE` del dueño
+debe enviarlo como `X-Session-Token`; `X-Subject` sigue siendo solo la
+etiqueta de propiedad del laboratorio hasta la autenticación real de
+usuarios. `DELETE` mueve la sesión a `revoking` y encola `RevokePeer`. La
+liberación normal espera un `CommandAck` que confirme la eliminación. Las
+respuestas de sesión llevan `no-store`.
 
 ## El bucle se cierra: `NodeChannel`
 
@@ -264,7 +270,7 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
 | `.agc/adr/0001-ipam-and-session-persistence.md` | Esquema + invariantes: lock de la fila del nodo, sondeo disperso, política del reaper |
 | `control-dotnet/VpnControl/Data/` | `ControlDbContext` + filas: `nodes`, `sessions`, `ip_leases` (fila EF sin clave, PK real vía migración), `outbox` |
 | `control-dotnet/VpnControl/Services/SessionService.cs` | El bucle de asignación de arriba + `RevokeSessionAsync` (revoking + outbox `RevokePeer`, lease retenido) |
-| `control-dotnet/VpnControl/Endpoints/V1/Sessions/` | `POST`/`GET`/`DELETE /v1/sessions` — `X-Subject`, `X-Admin-Token`, `Idempotency-Key`, 202 + `statusUrl`, `no-store` |
+| `control-dotnet/VpnControl/Endpoints/V1/Sessions/` | `POST`/`GET`/`DELETE /v1/sessions` — `X-Subject`, `X-Session-Token`, `X-Admin-Token`, `Idempotency-Key`, 202 + `statusUrl`, `no-store` |
 | `control-dotnet/VpnControl/Endpoints/HealthEndpoint.cs` | `/health/live` estático, `/health/ready` = `SELECT 1` real |
 | `control-dotnet/VpnControl.Tests/SessionServiceTests.cs` | Testcontainers Postgres: carrera por la última /30, idempotencia concurrente, enmascaramiento CIDR, ciclo del lease |
 

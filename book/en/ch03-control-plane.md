@@ -16,7 +16,8 @@ then the memory.
 > **Lab boundary.** Everything still runs in an isolated, authorized lab
 > (`.agc/RULES.md` LAB-01). The CA under `tests/lab/pki/` is generated
 > locally by `gen-lab-pki.sh` and is *lab-only* — never promoted. Session
-> ownership uses an `X-Subject` header plus an admin token; real user
+> ownership pairs the lab `X-Subject` header with a per-session bootstrap
+> capability; an admin token remains available for operators. Real user
 > authentication is deferred to the user-accounts milestone.
 
 ## The contract comes first: `NodeChannel`
@@ -101,9 +102,14 @@ block.
 `POST /v1/sessions` with `Idempotency-Key` returns **202** plus a status
 URL — provisioning is async by design. Same key + same payload replays the
 original response; same key + different payload is a **409** conflict.
+The bootstrap response also returns `sessionToken`, a 256-bit capability
+derived from secret session material with HMAC. Only its SHA-256 digest is
+stored, yet replaying the idempotent create derives the same token again.
+Owner `GET`/`DELETE` must send it as `X-Session-Token`; `X-Subject` remains
+only the lab ownership label until real user authentication arrives.
 `DELETE` moves a session to `revoking` and enqueues `RevokePeer`. The normal
-release path waits for a matching `CommandAck` confirming removal. The reaper
-exception in the current code is described below. Session responses are `no-store`.
+release path waits for a matching `CommandAck` confirming removal. Session
+responses are `no-store`.
 
 ## The loop closes: `NodeChannel`
 
@@ -253,7 +259,7 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
 | `.agc/adr/0001-ipam-and-session-persistence.md` | Schema + invariants: node-row lock, dispersed probing, reaper policy |
 | `control-dotnet/VpnControl/Data/` | `ControlDbContext` + rows: `nodes`, `sessions`, `ip_leases` (keyless EF row, real PK via migration), `outbox` |
 | `control-dotnet/VpnControl/Services/SessionService.cs` | The allocation loop above + `RevokeSessionAsync` (revoking + `RevokePeer` outbox, lease retained) |
-| `control-dotnet/VpnControl/Endpoints/V1/Sessions/` | `POST`/`GET`/`DELETE /v1/sessions` — `X-Subject`, `X-Admin-Token`, `Idempotency-Key`, 202 + `statusUrl`, `no-store` |
+| `control-dotnet/VpnControl/Endpoints/V1/Sessions/` | `POST`/`GET`/`DELETE /v1/sessions` — `X-Subject`, `X-Session-Token`, `X-Admin-Token`, `Idempotency-Key`, 202 + `statusUrl`, `no-store` |
 | `control-dotnet/VpnControl/Endpoints/HealthEndpoint.cs` | `/health/live` static, `/health/ready` = real `SELECT 1` round-trip |
 | `control-dotnet/VpnControl.Tests/SessionServiceTests.cs` | Testcontainers Postgres: last-/30 race, concurrent idempotency, CIDR masking, lease lifecycle |
 

@@ -222,6 +222,11 @@ namespace VpnControl.Data.Migrations
                         .HasColumnType("bigint")
                         .HasColumnName("sender_index");
 
+                    b.Property<string>("SessionTokenHash")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("session_token_hash");
+
                     b.Property<string>("Status")
                         .IsRequired()
                         .HasColumnType("text")
