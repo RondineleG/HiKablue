@@ -19,7 +19,6 @@ public sealed class OutboxDispatcherWorker(
     ILogger<OutboxDispatcherWorker> logger) : BackgroundService
 {
     private const int BatchSize = 32;
-    private const int MaxAttempts = 3;
     private static readonly TimeSpan CommandDeadline = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(250);
 
@@ -124,16 +123,10 @@ public sealed class OutboxDispatcherWorker(
         var claims = new List<DispatchClaim>(due.Count);
         foreach (var row in due)
         {
-            if (row.Attempts >= MaxAttempts)
-            {
-                row.Status = "failed";
-                row.NextRetryAt = null;
-                ControlMetrics.CommandFailed();
-                logger.LogWarning("outbox command {CommandId} exhausted delivery attempts for node {NodeId}",
-                    row.CommandId, row.NodeId);
-                continue;
-            }
-
+            // Specification §4: response timeouts leave commands pending
+            // for reconciliation. There is no attempt-count funeral here;
+            // deterministic payload/ACK failures are marked failed by their
+            // own validation paths instead.
             if (!streams.TryGet(row.NodeId, out var stream) || stream.Closed.IsCancellationRequested)
             {
                 row.Status = "pending";

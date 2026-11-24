@@ -175,9 +175,10 @@ public sealed class WorkersTests : IAsyncLifetime
     }
 
     [Theory]
-    [InlineData(1, "pending")]
-    [InlineData(3, "failed")]
-    public async Task DispatcherRecoversExpiredAttemptsWithNoLiveStream(int attempts, string expected)
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(30)]
+    public async Task DispatcherRecoversExpiredAttemptsWithNoLiveStream(int attempts)
     {
         var row = await SeedPendingAsync();
         await using var db = NewDb();
@@ -188,9 +189,9 @@ public sealed class WorkersTests : IAsyncLifetime
         Assert.Equal(0, await NewDispatcher().DispatchOnceAsync(CancellationToken.None));
 
         var stored = await db.Outbox.SingleAsync();
-        Assert.Equal(expected, stored.Status);
+        Assert.Equal("pending", stored.Status);
         Assert.Equal(attempts, stored.Attempts);
-        Assert.Equal(expected == "pending", stored.NextRetryAt.HasValue);
+        Assert.True(stored.NextRetryAt.HasValue);
     }
 
     [Fact]
