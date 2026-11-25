@@ -14,10 +14,12 @@ authentication.
 > **Lab boundary.** The phase-2 crypto exercises use `--key <64-hex>`, a
 > lab pre-shared key passed on both ends. The end-to-end session laboratory
 > instead receives per-session directional keys through `ProvisionPeer` and
-> starts clients with `--tx-key`/`--rx-key`. Both forms are lab bootstrap,
-> not final client key delivery. Restarting an engine with the same key
-> reuses key material and resets counter and window: outside the lab that
-> is a vulnerability, not a detail.
+> starts clients with `--tx-key-file`/`--rx-key-file` — hex keys in
+> `0600` files, so no key material appears in the process command line.
+> The inline `--tx-key`/`--rx-key` forms still exist, warn on use, and
+> remain lab bootstrap, not final client key delivery. Restarting an
+> engine with the same key reuses key material and resets counter and
+> window: outside the lab that is a vulnerability, not a detail.
 
 ## The wire format
 
@@ -445,10 +447,13 @@ fenced instead of being mistaken for confirmations.
 
 The clients in the laboratory do not use the derived lab `--key`: the
 control plane issues exact directional keys and the client engine receives
-them with `--tx-key`/`--rx-key`. The client direction is inverted —
-engine `ingress_key` is client transmit key, engine `sender_index` is the
-client's expected receive index. Process arguments are still lab-only key
-transport and are not the final client provisioning design.
+them through `--tx-key-file`/`--rx-key-file` pointing at `0600` files
+inside the private run directory; the laboratory asserts that no key
+material leaks into `/proc/<pid>/cmdline`. The client direction is
+inverted — engine `ingress_key` is client transmit key, engine
+`sender_index` is the client's expected receive index. Key-file bootstrap
+is still lab-only key transport, not the final client provisioning
+design.
 
 ### Observed end-to-end data-plane result
 
@@ -458,7 +463,11 @@ the encrypted tunnel; the direct probe did not reach the service. During
 revocation of A, B's continuous requests had no failure. Final server
 metrics in the recorded normal run were `rx_pkts=105`, `tx_pkts=105`,
 `dropped_pkts=4`, `peers=1`; the drop run reported `rx_pkts=152`,
-`tx_pkts=151`, `dropped_pkts=5`, `peers=1`. Counts vary with keepalives and
+`tx_pkts=151`, `dropped_pkts=5`, `peers=1`. The laboratory also provides
+`tests/lab/session-e2e.sh --expire-restart`, which kills and restarts the
+Go agent while the backend stays up and the control plane is unreachable:
+the restarted agent enforces A's persisted deadline locally while B keeps
+passing traffic. Counts vary with keepalives and
 probe timing; the stable result is the PASS line. Compilation, forwarding
 and HTTP connectivity are reported separately in
 `tests/lab/session-e2e.md`.
@@ -466,6 +475,11 @@ and HTTP connectivity are reported separately in
 ## Revisions
 
 - `r1` — 64-bit epoch, zeroizing keys, concurrent nonce ceiling and RFC vector.
+- `r5` — Review hardening (PR #21): client lab keys now arrive through
+  `--tx-key-file`/`--rx-key-file` (`0600` files; inline forms warn and
+  conflict), the laboratory registers and cleans only the resources it
+  created, and `--expire-restart` proves local expiry enforcement across
+  an agent restart.
 - `r3` — Verified on the dev VM: 108 Rust tests, local gate 12/12
   (privileged lab skipped); GitHub Actions blocked by billing.
 - `r0` — AEAD, replay window, nonce latch, symmetric ingress,

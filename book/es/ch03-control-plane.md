@@ -177,7 +177,10 @@ contrato prometía:
   por silencio ni liberación forzada.
 - **El lado Go.** `pkg/orchestrator` marca con `credentials.NewTLS` (la
   CA de laboratorio como única raíz, el cert del nodo como identidad de
-  cliente), keepalive 30 s/10 s y backoff de reconexión. `Channel.Run`
+  cliente), keepalive 30 s/10 s y backoff de reconexión que se duplica
+  hasta un tope de 10 s y vuelve al retardo inicial solo cuando un stream
+  supera el umbral de estabilidad — nunca solo porque `Dial` tuvo éxito.
+  `Channel.Run`
   envía `NodeRegister` primero, hace heartbeat cada 10 s en una goroutine
   (un `sendMu` serializa los `Send` concurrentes, que grpc-go prohíbe), y
   `evaluate` verifica antes de despachar: `stream_epoch` inválido o
@@ -546,3 +549,14 @@ reactivó.
   sigue exigiendo relojes sincronizados. Las pruebas cubren estos componentes,
   no el aprovisionamiento entre procesos ni la revocación vía el backend Rust.
 - `r4` — integración extremo a extremo: claves direccionales, expiración conforme a la especificación y ciclo observado en el laboratorio.
+- `r5` — endurecimiento de revisión: los plazos de expiración persisten en
+  un `-state-dir` privado (`expiry.json`, fsync, solo del propietario) en
+  lugar de junto al socket del motor; el backoff de reconexión se
+  reinicia solo cuando un stream supera el umbral de estabilidad; el
+  token de bootstrap se deriva de un secreto del servicio (columna
+  `session_token_key` eliminada) y el replay idempotente autenticado del
+  dueño rellena `session_token_hash` en filas migradas; las claves de
+  cliente del laboratorio llegan por `--tx-key-file`/`--rx-key-file`
+  protegidos; el laboratorio gana ownership de recursos por ejecución y
+  el escenario `--expire-restart` que prueba la expiración local a través
+  de un reinicio del agente.

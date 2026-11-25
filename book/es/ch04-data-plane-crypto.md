@@ -15,10 +15,13 @@ autenticación.
 > usan `--key <64-hex>`, una pre-shared key de laboratorio pasada en ambos
 > lados. El laboratorio de sesiones extremo a extremo, en cambio, recibe
 > claves direccionales por sesión mediante `ProvisionPeer` y arranca los
-> clientes con `--tx-key`/`--rx-key`. Ambas formas son bootstrap de
-> laboratorio, no la entrega final de claves al cliente. Reiniciar un motor
-> con la misma clave reutiliza material de clave y reinicia contador y
-> ventana: fuera del laboratorio eso es una vulnerabilidad, no un detalle.
+> clientes con `--tx-key-file`/`--rx-key-file` — claves hex en archivos
+> `0600`, sin material de clave en la línea de comandos del proceso. Las
+> formas inline `--tx-key`/`--rx-key` siguen existiendo, avisan al usarse
+> y siguen siendo bootstrap de laboratorio, no la entrega final de claves
+> al cliente. Reiniciar un motor con la misma clave reutiliza material de
+> clave y reinicia contador y ventana: fuera del laboratorio eso es una
+> vulnerabilidad, no un detalle.
 
 ## El formato del hilo
 
@@ -441,8 +444,11 @@ salida del servidor elige la época activa por la VIP cliente de destino.
 agente lee esa identidad antes de abrir `NodeChannel`; un reinicio del
 motor cambia el backend y los ACK dirigidos al backend anterior quedan
 cercados. Los clientes del laboratorio reciben claves exactas por
-`--tx-key`/`--rx-key`, en dirección inversa a la del motor. Es transporte
-de claves solo de laboratorio, no el diseño final de aprovisionamiento.
+`--tx-key-file`/`--rx-key-file` apuntando a archivos `0600` en el
+directorio privado de la ejecución, y el laboratorio comprueba que ningún
+material de clave se filtra a `/proc/<pid>/cmdline` — en dirección
+inversa a la del motor. Sigue siendo transporte de claves solo de
+laboratorio, no el diseño final de aprovisionamiento.
 
 ### Resultado observado del plano de datos
 
@@ -452,7 +458,11 @@ por el túnel cifrado y la sonda directa no alcanzó el servicio. Durante la
 revocación de A, las solicitudes continuas de B no tuvieron fallos. La
 corrida normal registró `rx_pkts=105`, `tx_pkts=105`, `dropped_pkts=4`,
 `peers=1`; la de caída registró `rx_pkts=152`, `tx_pkts=151`,
-`dropped_pkts=5`, `peers=1`. Los conteos varían; la línea PASS es el
+`dropped_pkts=5`, `peers=1`. El laboratorio también ofrece
+`tests/lab/session-e2e.sh --expire-restart`, que mata y reinicia el agente
+Go con el backend activo y el plano de control inalcanzable: el agente
+reiniciado aplica localmente el plazo persistido de A mientras B sigue
+pasando tráfico. Los conteos varían; la línea PASS es el
 resultado estable. Compilación, reenvío y conectividad HTTP se separan en
 `tests/lab/session-e2e.md`.
 
@@ -460,6 +470,11 @@ resultado estable. Compilación, reenvío y conectividad HTTP se separan en
 
 - `r1` — Época de 64 bits, borrado de claves, límite de nonces y vector RFC.
 - `r4` — Tabla multipar, endpoints por par, claves exactas y escenarios extremo a extremo.
+- `r5` — Endurecimiento de revisión (PR #21): las claves de los clientes
+  llegan por `--tx-key-file`/`--rx-key-file` (archivos `0600`; las formas
+  inline avisan y son mutuamente excluyentes), el laboratorio registra y
+  limpia solo los recursos que crea, y `--expire-restart` prueba la
+  expiración local a través de un reinicio del agente.
 - `r3` — Verificado en la VM de desarrollo: 108 tests de Rust, gate local
   12/12 (lab privilegiado omitido); GitHub Actions bloqueado por cobro.
 - `r0` — AEAD, ventana de replay, latch de nonce, ingreso simétrico,

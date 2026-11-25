@@ -171,7 +171,9 @@ contract promised:
   There is no quorum-by-silence and no forced release.
 - **The Go side.** `pkg/orchestrator` dials with `credentials.NewTLS`
   (lab CA as the only root, node cert as client identity), keepalive
-  30 s/10 s and reconnect backoff. `Channel.Run` sends `NodeRegister`
+  30 s/10 s and reconnect backoff that doubles to a 10 s cap and resets to
+  its initial delay only after a stream survives a stability threshold —
+  never merely because `Dial` succeeded. `Channel.Run` sends `NodeRegister`
   first, heartbeats every 10 s on a goroutine (a `sendMu` serialises
   concurrent `Send` calls, which grpc-go forbids), and `evaluate` fences
   before dispatch: invalid or older `stream_epoch` → `FENCED_STREAM`,
@@ -531,3 +533,13 @@ become 0. A was not reactivated.
   still requires synchronized clocks. The tests cover these building blocks,
   not cross-process provisioning or revocation through the Rust backend.
 - `r4` — end-to-end integration: control-plane-issued directional key material and wire indexes, spec-compliant expiration without forced lease release, exact agent validation, local expiration, and observed pending/active/revoking/revoked behavior in the two-client laboratory.
+- `r5` — review hardening: expiry deadlines persist in a private
+  `-state-dir` (`expiry.json`, fsync'd, owner-only) instead of beside the
+  engine socket; reconnect backoff resets only after a stream survives the
+  stability threshold; the bootstrap token derives from a service-held
+  secret (`session_token_key` column dropped) and owner-authenticated
+  idempotent replay backfills `session_token_hash` for migrated rows; lab
+  client keys arrive through protected `--tx-key-file`/`--rx-key-file`;
+  the laboratory gains run-scoped resource ownership and the
+  `--expire-restart` scenario proving local expiry across an agent
+  restart.
