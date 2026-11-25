@@ -489,7 +489,11 @@ control-plane convergence happens later through redelivery and
 `SyncState`. Deadlines are persisted in an owner-only `expiry.json` under a
 validated private agent state directory and reloaded before the channel
 starts, so a deadline that passed while only the agent was down is enforced
-immediately after restart.
+immediately after restart. `ProvisionPeer` writes the deadline before
+`StagePeer`, which already enables ingress. The agent can enforce expiry
+even if the engine applies a command and its response is lost. The agent holds the same mutex while applying
+peer changes and checking and revoking expired peers, so a reused lab
+session ID cannot inherit an in-flight revocation from the expiry loop.
 `SyncState` validates declared count, byte length and SHA-256
 before mutation, and the deletion guard prevents a non-forced empty or
 mass-deletion snapshot from wiping the backend.

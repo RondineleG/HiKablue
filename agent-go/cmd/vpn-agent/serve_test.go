@@ -172,8 +172,8 @@ func TestServeKeepsExpiryStateOutsideReadOnlySocketDir(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan int, 1)
+	var out, errout bytes.Buffer
 	go func() {
-		var out, errout bytes.Buffer
 		done <- runWithContext(ctx, []string{
 			"-serve", "-orchestrator", "127.0.0.1:1",
 			"-ca", ca, "-cert", cert, "-key", key, "-node-id", "exit-node",
@@ -213,7 +213,10 @@ func TestServeRejectsSharedExpiryStateDirectory(t *testing.T) {
 	dir := t.TempDir()
 	ca, cert, key := writeTestPKI(t, dir)
 	shared := filepath.Join(dir, "shared")
-	if err := os.Mkdir(shared, 0o755); err != nil {
+	if err := os.Mkdir(shared, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	var out, errout bytes.Buffer

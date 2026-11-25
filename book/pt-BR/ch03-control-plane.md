@@ -500,6 +500,12 @@ chega depois por reenvio e `SyncState`. Os prazos são persistidos em um
 `expiry.json` somente do dono dentro de um diretório de estado privado do
 agente e recarregados antes da abertura do canal; um prazo vencido enquanto
 apenas o agente estava fora é aplicado imediatamente na reinicialização.
+`ProvisionPeer` grava o prazo antes de `StagePeer`, que já habilita a
+recepção. O agente pode aplicar a expiração mesmo se o engine executar um
+comando e a resposta se perder.
+O agente usa o mesmo mutex para aplicar mudanças e para verificar e revogar
+peers expirados, impedindo que uma revogação do loop de expiração atinja
+outra sessão que reutilizou o mesmo ID de laboratório.
 O snapshot valida contagem declarada, comprimento e SHA-256 antes de mutar, e a guarda de remoção impede
 que um snapshot vazio ou massivo sem force limpe o backend.
 

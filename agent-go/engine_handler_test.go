@@ -26,6 +26,11 @@ type recordedOp struct {
 
 func controlServer(t *testing.T, sessions ControlSessions) (string, func() []recordedOp) {
 	t.Helper()
+	return controlServerWithHook(t, sessions, nil)
+}
+
+func controlServerWithHook(t *testing.T, sessions ControlSessions, respond func(string) bool) (string, func() []recordedOp) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "control.sock")
 	l, err := net.Listen("unix", path)
 	if err != nil {
@@ -61,6 +66,9 @@ func controlServer(t *testing.T, sessions ControlSessions) (string, func() []rec
 				mu.Lock()
 				ops = append(ops, recordedOp{Op: req.Op, Payload: payload})
 				mu.Unlock()
+				if respond != nil && !respond(req.Op) {
+					return
+				}
 				result := map[string]any{}
 				if req.Op == "GetSessions" {
 					out, _ := json.Marshal(sessions)
@@ -306,7 +314,10 @@ func TestPrepareExpiryStateDirValidatesPrivateWritableDirectory(t *testing.T) {
 		t.Fatalf("state dir mode %v", info.Mode().Perm())
 	}
 	shared := filepath.Join(t.TempDir(), "shared")
-	if err := os.Mkdir(shared, 0o755); err != nil {
+	if err := os.Mkdir(shared, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := PrepareExpiryStateDir(shared); err == nil {
@@ -341,7 +352,10 @@ func TestExpiryStateValidationAndPersistenceFailures(t *testing.T) {
 	if err := disabled.LoadExpiryState(); err != nil {
 		t.Fatal(err)
 	}
-	if err := disabled.rememberExpiry(7, time.Now()); err != nil {
+	disabled.mu.Lock()
+	err := disabled.rememberExpiry(7, time.Now())
+	disabled.mu.Unlock()
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -373,11 +387,14 @@ func TestExpiryStateValidationAndPersistenceFailures(t *testing.T) {
 }
 
 func TestProvisionAndRevokeReportExpiryPersistenceFailures(t *testing.T) {
-	path, _ := controlServer(t, ControlSessions{})
+	path, ops := controlServer(t, ControlSessions{})
 	h := NewEngineHandler(path, "missing")
 	h.ExpiryStatePath = filepath.Join(t.TempDir(), "missing", "expiry.json")
 	if err := h.ProvisionPeer(context.Background(), testProvision(8, 1)); err == nil {
 		t.Fatal("provision with unwritable expiry state accepted")
+	}
+	if got := ops(); len(got) != 0 {
+		t.Fatalf("failed write must leave the engine untouched, got %+v", got)
 	}
 
 	h.ExpiryStatePath = filepath.Join(t.TempDir(), "expiry.json")
@@ -393,6 +410,59 @@ func TestProvisionAndRevokeReportExpiryPersistenceFailures(t *testing.T) {
 	h.mu.Unlock()
 	if !stillTracked {
 		t.Fatal("failed expiry-state delete dropped the in-memory deadline")
+	}
+}
+
+func TestProvisionPersistsDeadlineBeforeStaging(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "expiry.json")
+	provision := testProvision(8, 1)
+	deadline := provision.Peer.ExpiresAt.AsTime()
+	path, _ := controlServerWithHook(t, ControlSessions{}, func(op string) bool {
+		if op != "StagePeer" && op != "Activate" {
+			return true
+		}
+		restarted := NewEngineHandler("unused", "unused")
+		restarted.ExpiryStatePath = statePath
+		if err := restarted.LoadExpiryState(); err != nil {
+			t.Error(err)
+		} else if got := restarted.expires[8]; !got.Equal(deadline) {
+			t.Errorf("deadline at %s = %v, want %v", op, got, deadline)
+		}
+		return op != "Activate" // The engine may have applied Activate before disconnecting.
+	})
+	h := NewEngineHandler(path, "unused")
+	h.ExpiryStatePath = statePath
+	if err := h.ProvisionPeer(context.Background(), provision); err == nil {
+		t.Fatal("lost activation response accepted")
+	}
+	if got := h.expires[8]; !got.Equal(deadline) {
+		t.Fatalf("deadline after lost response = %v, want %v", got, deadline)
+	}
+}
+
+func TestExpirySerializesRevocationWithPeerReplacement(t *testing.T) {
+	h := NewEngineHandler("unused", "unused")
+	path, ops := controlServerWithHook(t, ControlSessions{}, func(op string) bool {
+		if op == "RevokePeer" && h.mu.TryLock() {
+			h.mu.Unlock()
+			t.Error("peer operations can interleave with the expiration revoke")
+		}
+		return true
+	})
+	h.Control.SocketPath = path
+	h.expires[8] = time.Now().Add(-time.Second)
+	h.ExpireDuePeers(context.Background())
+
+	replacement := testProvision(8, 2)
+	if err := h.ProvisionPeer(context.Background(), replacement); err != nil {
+		t.Fatal(err)
+	}
+	h.ExpireDuePeers(context.Background())
+	if got := ops(); len(got) != 3 || got[0].Op != "RevokePeer" || got[2].Op != "Activate" {
+		t.Fatalf("replacement should stay active after expiry: %+v", got)
+	}
+	if got := h.expires[8]; !got.Equal(replacement.Peer.ExpiresAt.AsTime()) {
+		t.Fatalf("replacement deadline was lost: %v", got)
 	}
 }
 

@@ -504,7 +504,12 @@ llega después por reenvío y `SyncState`. Los vencimientos se persisten en
 un `expiry.json` solo del propietario dentro de un directorio de estado
 privado del agente y se recargan antes de abrir el canal; un vencimiento
 cumplido mientras solo el agente estaba caído se aplica inmediatamente al
-reiniciar. El snapshot valida cuenta
+reiniciar. `ProvisionPeer` guarda el vencimiento antes de `StagePeer`,
+que ya habilita la recepción. El agente puede aplicar el vencimiento
+aunque el motor aplique un comando y se pierda su respuesta. El agente usa el mismo mutex para aplicar cambios y para
+comprobar y revocar peers vencidos, evitando que una revocación del bucle
+de expiración alcance otra sesión con el mismo ID de laboratorio.
+El snapshot valida cuenta
 declarada, longitud y SHA-256 antes de mutar, y la guardia de borrado impide
 que un snapshot vacío o masivo no forzado limpie el backend.
 
