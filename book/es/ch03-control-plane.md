@@ -85,7 +85,8 @@ migración, y el insert/delete del lease va por SQL crudo — Npgsql mapea
 
 1. `INSERT ... ON CONFLICT DO NOTHING` del nodo, luego
    `SELECT node_id ... FOR UPDATE` — un aprovisionamiento a la vez por
-   nodo.
+   nodo. El registro del backend toma este mismo lock, y un nodo con un
+   reset de backend pendiente de ACK no es elegible para sesiones nuevas.
 2. `lab_session_id = COALESCE(MAX(...), 0) + 1` bajo ese lock.
 3. Las direcciones candidatas vienen de **todo** el CIDR, barajadas por
    hash con `HashCode.Combine(node_id, session_id, address)` — sondeo
@@ -198,6 +199,16 @@ contrato prometía:
   el registro solicita reconciliación mediante `SyncState`. No se
   guarda en disco, por lo que el handler debe seguir siendo idempotente.
 
+  En el plano de control, el registro del backend es una sola transacción:
+  actualización de identidad del nodo, invalidación de comandos de la
+  generación vieja y encolado del `SyncState` de reset hacen commit o
+  rollback juntos. La transacción primero bloquea la misma fila de nodo
+  usada en el aprovisionamiento. Si el stream se desconecta antes del ACK
+  del reset, una reconexión del mismo backend reencola esa fila pendiente
+  o enviada en vez de duplicarla con un snapshot que incluya sesiones
+  anteriores al reinicio. El nodo marcado por reset queda excluido de la
+  creación de sesiones hasta que un ACK válido complete la recuperación.
+
 Verificado localmente: 16 nuevos tests de C# (matriz de aceptación y
 rechazo SPIFFE, fencing, liberación del lease ante ack de revocación) y
 14 tests de Go — un handshake mTLS real contra una CA de prueba, rechazo
@@ -237,6 +248,9 @@ private Task<int> LockNodeAsync(string nodeId, CancellationToken ct) =>
   `CreateSessionAsync` concurrente de este nodo se serializa aquí, así
   que el `MAX(lab_session_id)+1` siguiente lo calcula exactamente una
   transacción.
+  `NodeChannelService.OnRegisterAsync` toma deliberadamente el mismo
+  lock, así los cambios de generación del backend no pueden intercalarse
+  con el aprovisionamiento.
 - `ExecuteSqlAsync` interpola parámetros (`{nodeId}`) — **no** es
   concatenación de strings; Npgsql los envía como parámetros ligados.
 
@@ -576,3 +590,4 @@ reactivó.
   el escenario `--expire-restart` que prueba la expiración local a través
   de un reinicio del agente.
 - `r6` — semántica del reinicio del backend refinada en el milestone 5: las sesiones viejas quedan fuera del primer snapshot del backend nuevo, pasan a `failed` solo tras aplicación confirmada y exigen una nueva sesión API.
+- `r7` — recuperación del reset serializada con aprovisionamiento: registro atómico, resets pendientes conservados entre reconexiones antes del ACK y nodos inelegibles hasta el ACK confirmador.

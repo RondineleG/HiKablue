@@ -101,7 +101,8 @@ exec /opt/hikablue/current/bin/vpn-engine server \
     --metrics-sock /run/hikablue-engine/engine.sock \
     --metrics-group "$AGENT_USER" \
     --control-sock /run/hikablue-engine/control.sock \
-    --control-uid "$agent_uid"
+    --control-uid "$agent_uid" \
+    --control-group "$AGENT_USER"
 ```
 
 Line by line:
@@ -118,7 +119,13 @@ Line by line:
 - The metrics socket is telemetry; the control socket is separate because
   provisioning commands can carry key material.
 - `--control-uid` admits the agent account (root and the engine user are
-  also accepted by the socket policy).
+  also accepted by the socket policy); `--control-group` gives the socket
+  file group ownership and mode `0660`. This separation matters: group
+  membership opens the filesystem door, but every accepted connection is
+  still checked by `SO_PEERCRED` against the numeric UID. The unprivileged
+  engine can group-chown a file it owns because systemd places it in the
+  agent group as a supplementary group; it does not need the privileged
+  `chown` operation that made the first version of the unit fail.
 
 ## Backend restart is a new identity
 
@@ -166,7 +173,19 @@ than replayed, because replay could reinstall state before the reset snapshot.
 Registration with a changed backend therefore creates a special empty-state
 `SyncState`. It excludes pre-restart pending/active sessions from the desired
 peer list and carries their IDs plus already-`revoking` IDs as metadata. The agent can apply it
-because the empty desired state matches the fresh backend.
+because the empty desired state matches the fresh backend. The database work
+is atomic: the backend identity change, terminal invalidation of commands
+from the dead generation, and the reset snapshot are committed in one
+transaction. Registration takes the same node-row `FOR UPDATE` lock used by
+session creation, so a concurrent create cannot slip between those writes.
+
+If the stream drops before the reset ACK, the next registration for the same
+backend requeues that same reset row. It does not enqueue a replacement
+snapshot that would resurrect the old peer list. While a reset row with
+backend-reset metadata remains `pending` or `sent`, the node is ineligible
+for new sessions. After the valid applied ACK, creation is allowed again;
+the new session's `ProvisionPeer` command belongs to the new generation and
+is never part of the pre-registration invalidation sweep.
 
 Only an applied ACK has a side effect:
 
@@ -239,7 +258,7 @@ post-restart session.
 |---|---|---|
 | repeatable Debian installation | `deploy/debian/build-release.sh`, `install.sh` | `tests/deploy/install-rollback.test.sh` |
 | upgrade and binary rollback | `deploy/debian/rollback.sh` | same offline test |
-| service ownership | `deploy/debian/systemd/`, `service-scripts/` | shell syntax/static review + runbook |
+| service ownership | `deploy/debian/systemd/`, `service-scripts/` | shell syntax/static review + real systemd socket check |
 | backend restart requires new session | `agent-go/cmd/vpn-agent/main.go`, `control-dotnet/VpnControl/Services/NodeChannelService.cs` | Go/.NET tests + `--engine-restart` lab |
 | stream loss still reconciles | milestone-4 outbox/NodeChannel | `session-e2e.sh --drop` |
 | network restoration | transient TUN ownership | `session-e2e.sh --engine-restart` |
@@ -272,6 +291,7 @@ post-restart session.
 - **`GetSessions`** — engine control operation that reports the backend ID and live peer/key references.
 - **`SO_PEERCRED`** — Unix-socket credential check used to identify the local peer process.
 - **`SyncState`** — control-plane snapshot command carrying the desired peer set plus validation metadata.
+- **`--control-group`** — engine flag choosing the local group that owns the control socket file at mode `0660`; it does not replace UID authorization.
 - **systemd** — Linux service manager responsible for starting, restarting,
   and logging services.
 - **transient TUN** — TUN interface owned by an open file descriptor; it is
@@ -310,4 +330,5 @@ pass line means those transitions were observed in the test root.
 ## Revisions
 
 - `r0` — milestone-5 implementation: repeatable Debian release/install/upgrade/rollback automation, supervised backend restart detection, confirmed invalidation of pre-restart sessions, fresh-session recovery, and observed transient-TUN/route rollback in the isolated laboratory.
+- `r1` — review hardening: unprivileged group-owned control socket with UID authorization preserved; atomic backend-reset registration; reset reuse across pre-ACK reconnects; node exclusion from provisioning until the reset ACK.
 

@@ -99,7 +99,8 @@ exec /opt/hikablue/current/bin/vpn-engine server \
     --metrics-sock /run/hikablue-engine/engine.sock \
     --metrics-group "$AGENT_USER" \
     --control-sock /run/hikablue-engine/control.sock \
-    --control-uid "$agent_uid"
+    --control-uid "$agent_uid" \
+    --control-group "$AGENT_USER"
 ```
 
 Línea por línea:
@@ -114,7 +115,13 @@ Línea por línea:
 - El socket de métricas es telemetría; el de control es separado porque
   puede transportar material de claves.
 - `--control-uid` admite la cuenta del agente (root y el propio motor también
-  pasan la política del socket).
+  pasan la política del socket); `--control-group` da grupo propietario y
+  modo `0660` al archivo. La separación importa: el grupo abre la puerta del
+  filesystem, pero cada conexión aceptada sigue verificándose con
+  `SO_PEERCRED` contra el UID numérico. El motor sin privilegios puede
+  asignar ese grupo porque systemd lo coloca en el grupo del agente como
+  grupo suplementario; no necesita el `chown` privilegiado que hacía fallar
+  la primera versión de la unit.
 
 ## Reiniciar el backend es una identidad nueva
 
@@ -163,6 +170,19 @@ especial de estado vacío. Excluye las sesiones pending/active anteriores al
 reinicio de la lista deseada y transporta sus IDs, junto con IDs ya `revoking`,
 como metadatos. El agente
 puede aplicarlo porque el estado deseado vacío coincide con el backend nuevo.
+El trabajo de base de datos es atómico: cambio de identidad del backend,
+invalidación terminal de comandos de la generación muerta y encolado del
+snapshot de reset se confirman o revierten juntos. El registro toma el mismo
+lock `FOR UPDATE` de la fila del nodo usado al crear sesiones, así una
+creación concurrente no puede colarse entre esas escrituras.
+
+Si el stream cae antes del ACK del reset, el siguiente registro del mismo
+backend reencola esa misma fila de reset. No encola un snapshot de reemplazo
+que resucite la lista vieja de peers. Mientras una fila con metadatos de
+reset siga `pending` o `sent`, el nodo no es elegible para sesiones nuevas.
+Tras el ACK aplicado válido, la creación vuelve a permitirse; el comando
+`ProvisionPeer` de la sesión nueva pertenece a la generación nueva y nunca
+entra en el barrido de invalidación anterior al registro.
 
 Solo un ACK aplicado produce el efecto lateral:
 
@@ -233,7 +253,7 @@ cuerpo exacto `hikablue-m4-ok` por la sesión posterior al reinicio.
 |---|---|---|
 | instalación Debian repetible | `deploy/debian/build-release.sh`, `install.sh` | `tests/deploy/install-rollback.test.sh` |
 | upgrade y rollback binario | `deploy/debian/rollback.sh` | misma prueba offline |
-| propiedad de servicios | `deploy/debian/systemd/`, `service-scripts/` | sintaxis shell/revisión estática + runbook |
+| propiedad de servicios | `deploy/debian/systemd/`, `service-scripts/` | sintaxis shell/revisión estática + verificación real de sockets bajo systemd |
 | reinicio del backend exige nueva sesión | `agent-go/cmd/vpn-agent/main.go`, `control-dotnet/VpnControl/Services/NodeChannelService.cs` | tests Go/.NET + laboratorio `--engine-restart` |
 | pérdida de stream reconcilia | outbox/NodeChannel del milestone 4 | `session-e2e.sh --drop` |
 | restauración de red | TUN transitorio | `session-e2e.sh --engine-restart` |
@@ -265,6 +285,7 @@ cuerpo exacto `hikablue-m4-ok` por la sesión posterior al reinicio.
 - **`GetSessions`** — operación de control del motor que informa el ID del backend y referencias vivas de peers/claves.
 - **`SO_PEERCRED`** — comprobación de credenciales de socket Unix usada para identificar el proceso local par.
 - **`SyncState`** — comando snapshot del plano de control con el conjunto deseado de peers y metadatos de validación.
+- **`--control-group`** — flag del motor que elige el grupo local propietario del socket de control en modo `0660`; no sustituye la autorización por UID.
 - **systemd** — administrador Linux de servicios, reinicios y logs.
 - **TUN transitorio** — interfaz TUN perteneciente a un descriptor; se
   destruye al cerrarse el último descriptor.
@@ -302,4 +323,5 @@ transiciones fueron observadas.
 ## Revisiones
 
 - `r0` — implementación del milestone 5: automatización repetible de release/instalación/upgrade/rollback Debian, detección supervisada del reinicio del backend, invalidación/finalización confirmada de sesiones anteriores al reinicio, recuperación con sesión fresca y reversión observada de TUN/ruta transitorios en el laboratorio aislado.
+- `r1` — endurecimiento de revisión: socket de control con grupo propietario sin privilegios y autorización UID preservada; registro atómico del reset de backend; reutilización del reset entre reconexiones antes del ACK; exclusión del nodo del aprovisionamiento hasta ese ACK.
 

@@ -83,6 +83,8 @@ natively.
 
 1. `INSERT ... ON CONFLICT DO NOTHING` the node, then
    `SELECT node_id ... FOR UPDATE` — one provisioning at a time per node.
+   Backend registration takes this same lock, and a node with a backend
+   reset still waiting for ACK is not eligible for new sessions.
 2. `lab_session_id = COALESCE(MAX(...), 0) + 1` under that lock.
 3. Candidate addresses come from the **whole** CIDR, hash-shuffled by
    `HashCode.Combine(node_id, session_id, address)` — dispersed probing,
@@ -191,6 +193,15 @@ contract promised:
   requests reconciliation via `SyncState`. This is not disk persistence;
   the handler still has to be idempotent.
 
+  On the control-plane side, backend registration is one transaction: node
+  identity update, old-generation command invalidation, and the reset
+  `SyncState` enqueue commit or roll back together. The transaction first
+  locks the same node row used by provisioning. If the stream disconnects
+  before the reset ACK, a reconnect for the same backend requeues that
+  pending/sent reset row instead of duplicating it with a snapshot that
+  includes pre-restart sessions. The reset-marked node is excluded from
+  new session creation until the valid ACK completes recovery.
+
 Verified locally: 16 new C# tests (SPIFFE acceptance/rejection matrix,
 fencing, lease release on revoke ack) plus 14 Go tests — a real mTLS
 handshake against a test CA, untrusted-cert rejection, and an in-process
@@ -227,6 +238,8 @@ private Task<int> LockNodeAsync(string nodeId, CancellationToken ct) =>
 - `SELECT ... FOR UPDATE` is the lease on the *parent* row: every
   concurrent `CreateSessionAsync` for this node serializes here, so the
   `MAX(lab_session_id)+1` below is computed by exactly one transaction.
+  `NodeChannelService.OnRegisterAsync` deliberately takes the same lock,
+  so backend generation changes cannot interleave with provisioning.
 - `ExecuteSqlAsync` interpolates parameters (`{nodeId}`) — it is **not**
   string concatenation; Npgsql sends them as bound parameters.
 
@@ -557,3 +570,4 @@ become 0. A was not reactivated.
   `--expire-restart` scenario proving local expiry across an agent
   restart.
 - `r6` — backend restart semantics refined in milestone 5: old sessions are excluded from the first fresh-backend snapshot, become `failed` only after confirmed application, and require a fresh API session.
+- `r7` — reset recovery serialized with provisioning: registration writes are atomic, pending resets survive pre-ACK reconnects, and reset-marked nodes are ineligible for new sessions until the confirming ACK.

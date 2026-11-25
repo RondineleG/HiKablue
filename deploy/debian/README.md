@@ -49,8 +49,13 @@ mutated in place. A different version becomes the new `current`; the former
 The real install creates these service users when absent:
 `hikablue-engine`, `hikablue-agent`, and `hikablue-control`. The engine unit
 runs with only `CAP_NET_ADMIN`; the agent and control plane receive no
-network-admin capability. The agent's expiry state directory is
-`/var/lib/hikablue/agent-state`, owner-only (`0700`).
+network-admin capability. The engine unit also joins `hikablue-agent` as a
+supplementary group only so the unprivileged engine can group-own its local
+Unix sockets. Both sockets are mode `0660`; socket ownership grants the IPC
+connection, while the control socket still authorizes every peer with
+`SO_PEERCRED` and the numeric agent UID. No unprivileged `chown` is needed.
+The agent's expiry state directory is `/var/lib/hikablue/agent-state`,
+owner-only (`0700`).
 
 For offline validation or tests, use a temporary root. This touches no host
 users, services, routes, or firewall state:
@@ -94,6 +99,14 @@ therefore restarts the agent; the agent also exits by itself when it observes
 a changed engine `backend_instance_id`, so `Restart=always` starts it with
 the fresh identity even if the engine is replaced outside systemd.
 
+Offline installation and real service startup are separate verifications.
+`tests/deploy/install-rollback.test.sh` proves file layout and symlink
+transitions in a temporary root; it does not prove that systemd can start
+the units. On a real Debian host, verify startup separately: both units
+must be `active`, the engine and agent sockets must be group-owned by
+`hikablue-agent` with mode `0660`, and a shell running as `hikablue-agent`
+must receive successful `GetMetrics` and `GetSessions` responses.
+
 Stop services explicitly:
 
 ```bash
@@ -120,6 +133,16 @@ Before upgrading the control plane, back up PostgreSQL with your normal lab
 backup procedure. Apply EF Core migrations with `dotnet ef database update`
 or the service startup path used by the deployment. Roll back the database
 only from a backup or an explicitly tested reverse migration.
+
+## Backend-reset ordering
+
+Backend registration, old-generation command invalidation, and reset snapshot
+enqueue are one PostgreSQL transaction under the same node-row `FOR UPDATE`
+lock used by session creation. Reconnecting the same backend before the reset
+ACK reuses the pending reset row rather than enqueueing another snapshot that
+contains old sessions. While that row is `pending` or `sent`, the node is
+ineligible for new sessions. After a valid applied ACK, fresh provisioning is
+allowed and its commands are not part of the invalidated old generation.
 
 ## Failure tracing order
 

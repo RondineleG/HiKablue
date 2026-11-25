@@ -87,6 +87,8 @@ migration, e insert/delete do lease vão por SQL bruto — Npgsql mapea
 
 1. `INSERT ... ON CONFLICT DO NOTHING` do nó, depois
    `SELECT node_id ... FOR UPDATE` — um provisionamento por vez por nó.
+   O registro do backend toma esse mesmo lock, e um nó com reset de backend
+   ainda esperando ACK não é elegível para novas sessões.
 2. `lab_session_id = COALESCE(MAX(...), 0) + 1` sob esse lock.
 3. Endereços candidatos vêm do CIDR **inteiro**, embaralhados por hash
    com `HashCode.Combine(node_id, session_id, address)` — sondagem
@@ -200,6 +202,16 @@ prometia:
   solicita reconciliação via `SyncState`. O estado não é salvo em disco;
   o handler continua precisando ser idempotente.
 
+  No lado do plano de controle, o registro do backend é uma única transação:
+  atualização da identidade do nó, invalidação dos comandos da geração
+  antiga e enfileiramento do `SyncState` de reset fazem commit ou rollback
+  juntos. A transação primeiro bloqueia a mesma linha do nó usada no
+  provisionamento. Se o stream desconecta antes do ACK do reset, uma
+  reconexão do mesmo backend reenfileira essa linha pendente ou enviada em
+  vez de duplicá-la com um snapshot que inclua sessões anteriores ao
+  reinício. O nó marcado pelo reset fica excluído da criação de sessões
+  até que um ACK válido complete a recuperação.
+
 Verificado localmente: 16 novos testes C# (matriz de aceitação e rejeição
 SPIFFE, fencing, liberação do lease em ack de revogação) e 14 testes Go —
 um handshake mTLS real contra uma CA de teste, rejeição de certificado
@@ -238,6 +250,9 @@ private Task<int> LockNodeAsync(string nodeId, CancellationToken ct) =>
   `CreateSessionAsync` concorrente deste nó se serializa aqui, então o
   `MAX(lab_session_id)+1` abaixo é calculado por exatamente uma
   transação.
+  O `NodeChannelService.OnRegisterAsync` toma deliberadamente o mesmo
+  lock, então mudanças de geração do backend não podem se intercalar com
+  o provisionamento.
 - `ExecuteSqlAsync` interpola parâmetros (`{nodeId}`) — **não** é
   concatenação de string; Npgsql os envia como parâmetros vinculados.
 
@@ -567,3 +582,4 @@ a sessão ficou `revoked` e o lease chegou a zero. A não foi reativada.
   ownership de recursos por execução e o cenário `--expire-restart` que
   prova a expiração local através de um reinício do agente.
 - `r6` — semântica do reinício do backend refinada no Marco 5: sessões antigas ficam fora do primeiro snapshot do backend novo, viram `failed` só após aplicação confirmada e exigem nova sessão de API.
+- `r7` — recuperação do reset serializada com provisionamento: registro atômico, resets pendentes preservados entre reconexões antes do ACK e nós inelegíveis até o ACK confirmador.
