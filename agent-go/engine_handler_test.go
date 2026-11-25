@@ -261,12 +261,14 @@ func TestExpiryStateSurvivesAgentRestart(t *testing.T) {
 	provision.Peer.ExpiresAt = timestamppb.New(time.Now().Add(20 * time.Millisecond))
 	path, ops := controlServer(t, ControlSessions{})
 	h := NewEngineHandler(path, "missing")
+	h.ExpiryStatePath = filepath.Join(t.TempDir(), "expiry.json")
 	if err := h.ProvisionPeer(context.Background(), provision); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(30 * time.Millisecond)
 
 	restarted := NewEngineHandler(path, "missing")
+	restarted.ExpiryStatePath = h.ExpiryStatePath
 	if err := restarted.LoadExpiryState(); err != nil {
 		t.Fatal(err)
 	}
@@ -284,6 +286,52 @@ func TestExpiryStateSurvivesAgentRestart(t *testing.T) {
 	restarted.mu.Unlock()
 	if remaining != 0 {
 		t.Fatalf("expired peer remained in persisted state: %d entries", remaining)
+	}
+}
+
+func TestPrepareExpiryStateDirValidatesPrivateWritableDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "agent", "state")
+	path, err := PrepareExpiryStateDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(path) != "expiry.json" || filepath.Dir(path) != dir {
+		t.Fatalf("unexpected expiry state path %q", path)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("state dir mode %v", info.Mode().Perm())
+	}
+	shared := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PrepareExpiryStateDir(shared); err == nil {
+		t.Fatal("group/other-accessible state dir accepted")
+	}
+}
+
+func TestExpiryStateAlreadyExpiredAtStartupIsEnforced(t *testing.T) {
+	path, ops := controlServer(t, ControlSessions{})
+	statePath := filepath.Join(t.TempDir(), "expiry.json")
+	raw, _ := json.Marshal(expiryStateFile{Peers: map[uint32]time.Time{
+		9: time.Now().Add(-time.Second),
+	}})
+	if err := os.WriteFile(statePath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := NewEngineHandler(path, "missing")
+	h.ExpiryStatePath = statePath
+	if err := h.LoadExpiryState(); err != nil {
+		t.Fatal(err)
+	}
+	h.ExpireDuePeers(context.Background())
+	got := ops()
+	if len(got) != 1 || got[0].Op != "RevokePeer" || got[0].Payload["lab_session_id"].(float64) != 9 {
+		t.Fatalf("expired deadline was not enforced at startup: %+v", got)
 	}
 }
 

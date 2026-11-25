@@ -18,6 +18,26 @@ import (
 	"github.com/RondineleG/HiKablue/agent-go/pkg/orchestrator"
 )
 
+const (
+	reconnectInitialDelay = 500 * time.Millisecond
+	reconnectMaxDelay     = 10 * time.Second
+	reconnectStableAfter  = 4 * time.Second
+)
+
+func reconnectDelays(current time.Duration, establishedAt, endedAt time.Time) (delay, next time.Duration) {
+	if !establishedAt.IsZero() && endedAt.Sub(establishedAt) >= reconnectStableAfter {
+		return reconnectInitialDelay, reconnectInitialDelay
+	}
+	if current <= 0 || current > reconnectMaxDelay {
+		current = reconnectInitialDelay
+	}
+	next = current * 2
+	if next > reconnectMaxDelay {
+		next = reconnectMaxDelay
+	}
+	return current, next
+}
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -39,6 +59,7 @@ func runWithContext(parent context.Context, args []string, stdout, stderr io.Wri
 	keyPath := fs.String("key", "", "node client private key PEM")
 	nodeID := fs.String("node-id", "", "SPIFFE node id embedded in the node certificate")
 	agentVersion := fs.String("agent-version", "dev", "agent version reported on NodeRegister")
+	stateDir := fs.String("state-dir", "/run/vpn/agent-state", "private writable directory for agent expiry state")
 	if err := fs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			return 0
@@ -66,6 +87,11 @@ func runWithContext(parent context.Context, args []string, stdout, stderr io.Wri
 
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	expiryStatePath, err := agent.PrepareExpiryStateDir(*stateDir)
+	if err != nil {
+		fmt.Fprintln(stderr, "vpn-agent:", err)
+		return 1
+	}
 	control := agent.ControlClient{SocketPath: *controlSock, Timeout: 2 * time.Second}
 	sessions, err := control.Sessions(ctx)
 	if err != nil {
@@ -73,6 +99,7 @@ func runWithContext(parent context.Context, args []string, stdout, stderr io.Wri
 		return 1
 	}
 	handler := agent.NewEngineHandler(*controlSock, *sock)
+	handler.ExpiryStatePath = expiryStatePath
 	if err := handler.LoadExpiryState(); err != nil {
 		fmt.Fprintln(stderr, "vpn-agent: load expiry state:", err)
 		return 1
@@ -91,30 +118,29 @@ func runWithContext(parent context.Context, args []string, stdout, stderr io.Wri
 	}
 	cfg.ReplayState = orchestrator.NewReplayState(cfg.NodeId, cfg.BackendInstanceId)
 
-	backoff := 500 * time.Millisecond
+	backoff := reconnectInitialDelay
 	for ctx.Err() == nil {
 		conn, err := orchestrator.Dial(ctx, cfg)
+		establishedAt := time.Time{}
 		if err != nil {
 			fmt.Fprintln(stderr, "vpn-agent:", err)
 		} else {
-			err = orchestrator.NewChannel(cfg, handler).Run(ctx, conn)
+			channel := orchestrator.NewChannel(cfg, handler)
+			err = channel.Run(ctx, conn)
+			establishedAt = channel.EstablishedAt()
 			_ = conn.Close()
 			if ctx.Err() != nil {
 				return 0
 			}
 			fmt.Fprintln(stderr, "vpn-agent: NodeChannel ended:", err)
 		}
+		delay, next := reconnectDelays(backoff, establishedAt, time.Now())
 		select {
 		case <-ctx.Done():
 			return 0
-		case <-time.After(backoff):
+		case <-time.After(delay):
 		}
-		if backoff < 10*time.Second {
-			backoff *= 2
-			if backoff > 10*time.Second {
-				backoff = 10 * time.Second
-			}
-		}
+		backoff = next
 	}
 	return 0
 }

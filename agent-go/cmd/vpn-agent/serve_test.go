@@ -128,6 +128,7 @@ func TestServeStartsChannelAndStopsWithContext(t *testing.T) {
 			"-ca", ca, "-cert", cert, "-key", key, "-node-id", "exit-node",
 			"-control-sock", sessionsSocket(t),
 			"-metrics-sock", filepath.Join(dir, "metrics.sock"),
+			"-state-dir", filepath.Join(dir, "agent-state"),
 		}, &out, &errout)
 	}()
 	time.Sleep(650 * time.Millisecond)
@@ -142,6 +143,57 @@ func TestServeStartsChannelAndStopsWithContext(t *testing.T) {
 	}
 }
 
+func TestServeKeepsExpiryStateOutsideReadOnlySocketDir(t *testing.T) {
+	dir := t.TempDir()
+	ca, cert, key := writeTestPKI(t, dir)
+	socketDir := filepath.Join(dir, "engine")
+	if err := os.Mkdir(socketDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(socketDir, "control.sock")
+	l, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	if err := os.Chmod(socketDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(socketDir, 0o755) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() {
+		var out, errout bytes.Buffer
+		done <- runWithContext(ctx, []string{
+			"-serve", "-orchestrator", "127.0.0.1:1",
+			"-ca", ca, "-cert", cert, "-key", key, "-node-id", "exit-node",
+			"-control-sock", sock,
+			"-metrics-sock", filepath.Join(dir, "metrics.sock"),
+			"-state-dir", filepath.Join(dir, "agent-state"),
+		}, &out, &errout)
+	}()
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	select {
+	case code := <-done:
+		if code != 1 || !bytes.Contains(errout.Bytes(), []byte("read engine backend instance")) {
+			t.Fatalf("exit %d stderr %q", code, errout.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("serve did not stop with context")
+	}
+}
+
 func TestServeReportsMissingControlSocket(t *testing.T) {
 	dir := t.TempDir()
 	ca, cert, key := writeTestPKI(t, dir)
@@ -150,8 +202,44 @@ func TestServeReportsMissingControlSocket(t *testing.T) {
 		"-serve", "-orchestrator", "127.0.0.1:1",
 		"-ca", ca, "-cert", cert, "-key", key, "-node-id", "exit-node",
 		"-control-sock", filepath.Join(dir, "missing.sock"),
+		"-state-dir", filepath.Join(dir, "agent-state"),
 	}, &out, &errout)
 	if code != 1 {
 		t.Fatalf("exit %d stderr %q", code, errout.String())
+	}
+}
+
+func TestServeRejectsSharedExpiryStateDirectory(t *testing.T) {
+	dir := t.TempDir()
+	ca, cert, key := writeTestPKI(t, dir)
+	shared := filepath.Join(dir, "shared")
+	if err := os.Mkdir(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var out, errout bytes.Buffer
+	code := runWithContext(context.Background(), []string{
+		"-serve", "-orchestrator", "127.0.0.1:1",
+		"-ca", ca, "-cert", cert, "-key", key, "-node-id", "exit-node",
+		"-control-sock", filepath.Join(dir, "missing.sock"),
+		"-state-dir", shared,
+	}, &out, &errout)
+	if code != 1 || !bytes.Contains(errout.Bytes(), []byte("private")) {
+		t.Fatalf("exit %d stderr %q", code, errout.String())
+	}
+}
+
+func TestReconnectDelayResetsOnlyAfterStableStream(t *testing.T) {
+	now := time.Now()
+	delay, next := reconnectDelays(8*time.Second, time.Time{}, now)
+	if delay != 8*time.Second || next != 10*time.Second {
+		t.Fatalf("unstable connection delay = %s next = %s", delay, next)
+	}
+	delay, next = reconnectDelays(500*time.Millisecond, now.Add(-time.Second), now)
+	if delay != 500*time.Millisecond || next != time.Second {
+		t.Fatalf("short-lived connection delay = %s next = %s", delay, next)
+	}
+	delay, next = reconnectDelays(10*time.Second, now.Add(-reconnectStableAfter), now)
+	if delay != reconnectInitialDelay || next != reconnectInitialDelay {
+		t.Fatalf("stable connection delay = %s next = %s", delay, next)
 	}
 }

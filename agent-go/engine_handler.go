@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -34,11 +35,14 @@ type expiryStateFile struct {
 }
 
 func NewEngineHandler(controlSock, metricsSock string) *EngineHandler {
+	// Expiry persistence is explicit opt-in: callers must point
+	// ExpiryStatePath at an agent-owned directory (see
+	// PrepareExpiryStateDir). A sibling-of-the-socket default would write
+	// state into a directory the agent may not own.
 	return &EngineHandler{
-		Control:         ControlClient{SocketPath: controlSock, Timeout: 2 * time.Second},
-		MetricsSock:     metricsSock,
-		ExpiryStatePath: controlSock + ".expiry.json",
-		expires:         make(map[uint32]time.Time),
+		Control:     ControlClient{SocketPath: controlSock, Timeout: 2 * time.Second},
+		MetricsSock: metricsSock,
+		expires:     make(map[uint32]time.Time),
 	}
 }
 
@@ -49,10 +53,17 @@ func (h *EngineHandler) LoadExpiryState() error {
 	if h.ExpiryStatePath == "" {
 		return nil
 	}
-	raw, err := os.ReadFile(h.ExpiryStatePath)
+	info, err := os.Stat(h.ExpiryStatePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
+	if err != nil {
+		return fmt.Errorf("stat expiry state: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("expiry state path is not a regular file")
+	}
+	raw, err := os.ReadFile(h.ExpiryStatePath)
 	if err != nil {
 		return fmt.Errorf("read expiry state: %w", err)
 	}
@@ -74,44 +85,109 @@ func (h *EngineHandler) LoadExpiryState() error {
 	return nil
 }
 
-func (h *EngineHandler) persistExpiryLocked() error {
-	if h.ExpiryStatePath == "" {
+// PrepareExpiryStateDir provisions the agent-owned deadline directory.
+// It is deliberately separate from the engine socket directory: connecting
+// to a root-owned control socket must not require directory write access.
+func PrepareExpiryStateDir(dir string) (string, error) {
+	if dir == "" {
+		return "", fmt.Errorf("expiry state directory is required")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create expiry state directory: %w", err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("stat expiry state directory: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("expiry state path %q is not a directory", dir)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("expiry state directory %q must be private (0700)", dir)
+	}
+	probe, err := os.CreateTemp(dir, ".write-test-*")
+	if err != nil {
+		return "", fmt.Errorf("expiry state directory is not writable: %w", err)
+	}
+	probeName := probe.Name()
+	if err := probe.Close(); err != nil {
+		_ = os.Remove(probeName)
+		return "", fmt.Errorf("close expiry state write probe: %w", err)
+	}
+	if err := os.Remove(probeName); err != nil {
+		return "", fmt.Errorf("remove expiry state write probe: %w", err)
+	}
+	return filepath.Join(dir, "expiry.json"), nil
+}
+
+func persistExpiryFile(path string, peers map[uint32]time.Time) error {
+	if path == "" {
 		return nil
 	}
-	raw, err := json.Marshal(expiryStateFile{Peers: h.expires})
+	raw, err := json.Marshal(expiryStateFile{Peers: peers})
 	if err != nil {
 		return err
 	}
-	tmp := h.ExpiryStatePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	tmp := path + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return fmt.Errorf("write expiry state: %w", err)
 	}
-	if err := os.Rename(tmp, h.ExpiryStatePath); err != nil {
+	if _, err := file.Write(raw); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("write expiry state: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("sync expiry state: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("close expiry state: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("replace expiry state: %w", err)
 	}
-	_ = os.Chmod(h.ExpiryStatePath, 0o600)
+	_ = os.Chmod(path, 0o600)
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
 	return nil
 }
 
 func (h *EngineHandler) rememberExpiry(lab uint32, expires time.Time) error {
 	h.mu.Lock()
-	h.expires[lab] = expires
-	err := h.persistExpiryLocked()
-	h.mu.Unlock()
-	return err
+	defer h.mu.Unlock()
+	next := make(map[uint32]time.Time, len(h.expires)+1)
+	for id, deadline := range h.expires {
+		next[id] = deadline
+	}
+	next[lab] = expires
+	if err := persistExpiryFile(h.ExpiryStatePath, next); err != nil {
+		return err
+	}
+	h.expires = next
+	return nil
 }
 
 func (h *EngineHandler) forgetExpiry(lab uint32) error {
 	h.mu.Lock()
-	old, existed := h.expires[lab]
-	delete(h.expires, lab)
-	err := h.persistExpiryLocked()
-	if err != nil && existed {
-		h.expires[lab] = old
+	defer h.mu.Unlock()
+	next := make(map[uint32]time.Time, len(h.expires))
+	for id, deadline := range h.expires {
+		if id != lab {
+			next[id] = deadline
+		}
 	}
-	h.mu.Unlock()
-	return err
+	if err := persistExpiryFile(h.ExpiryStatePath, next); err != nil {
+		return err
+	}
+	h.expires = next
+	return nil
 }
 
 func validKeyMaterial(k *edgev1.PeerKeyMaterial) error {
@@ -181,6 +257,10 @@ func (h *EngineHandler) ProvisionPeer(ctx context.Context, p *edgev1.ProvisionPe
 		return fmt.Errorf("activate peer %d epoch %d: %w", lab, km.KeyEpoch, err)
 	}
 	if err := h.rememberExpiry(lab, p.Peer.ExpiresAt.AsTime()); err != nil {
+		// A peer that cannot persist its deadline must not remain active
+		// without a local expiry path. Best-effort revoke is the safest
+		// compensation; the command still fails so dispatch can retry.
+		_ = h.Control.Call(ctx, "RevokePeer", map[string]any{"lab_session_id": lab}, nil)
 		return fmt.Errorf("persist peer %d expiration: %w", lab, err)
 	}
 	return nil
