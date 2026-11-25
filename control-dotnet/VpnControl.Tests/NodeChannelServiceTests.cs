@@ -1,8 +1,11 @@
 using Grpc.Core;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 using Testcontainers.PostgreSql;
 using VpnControl.Data;
+using VpnControl.Models;
+using VpnControl.Requests;
 using VpnControl.Proto;
 using VpnControl.Services;
 using Xunit;
@@ -590,6 +593,64 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
         var payload = System.Text.Json.JsonDocument.Parse(reset.Payload).RootElement;
         Assert.Equal(sessionId.ToString(),
             payload.GetProperty("backend_reset_session_ids")[0].GetString());
+    }
+
+    [Fact]
+    public async Task ConcurrentCreateWaitsBehindRegistrationAndCannotJoinInvalidatedGeneration()
+    {
+        await using (var db = NewDb())
+        {
+            db.Nodes.Add(new NodeRow
+            {
+                NodeId = "edge-1", BackendInstanceId = "b1",
+                RegisteredAt = DateTimeOffset.UtcNow, EngineHealthy = true
+            });
+            db.Sessions.Add(new SessionRow
+            {
+                SessionId = Guid.NewGuid(), OwnerSubject = "alice",
+                Status = SessionStatus.Active, NodeId = "edge-1",
+                LabSessionId = 7, ExpiresAt = DateTimeOffset.UtcNow.AddHours(1),
+                VirtualIp = System.Net.IPAddress.Parse("10.99.0.7"), KeyEpoch = 1,
+                CreatedAt = DateTimeOffset.UtcNow, UpdatedAt = DateTimeOffset.UtcNow
+            });
+            await db.SaveChangesAsync();
+            await db.Database.ExecuteSqlAsync($"""
+                CREATE OR REPLACE FUNCTION slow_registration_node_update() RETURNS trigger AS $fn$
+                BEGIN
+                    PERFORM pg_sleep(1);
+                    RETURN NEW;
+                END;
+                $fn$ LANGUAGE plpgsql
+                """);
+            await db.Database.ExecuteSqlAsync($"""
+                CREATE TRIGGER slow_registration_node_update_trigger BEFORE UPDATE ON nodes
+                FOR EACH ROW EXECUTE FUNCTION slow_registration_node_update()
+                """);
+        }
+        _nodeRegistry.Record(new Heartbeat("edge-1", true));
+        var sessions = new SessionService(
+            new ControlDbContext(_options), new NodeService(_nodeRegistry),
+            new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["VpnControl:IpPoolCidr"] = "10.99.0.0/24",
+                ["VpnControl:SessionTokenSecret"] = "0123456789abcdef0123456789abcdef"
+            }).Build(),
+            NullLogger<SessionService>.Instance);
+
+        var registerTask = NewService().OnRegisterAsync("edge-1",
+            new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b2" },
+            CancellationToken.None, "e2");
+        await Task.Delay(200);
+        var createTask = sessions.CreateSessionAsync(new CreateSessionRequest(), "bob", null);
+        await Task.WhenAll(registerTask, createTask);
+
+        var createResult = await createTask;
+        Assert.False(createResult.IsSuccess);
+        Assert.Equal(EResultStatus.Unavailable, createResult.Status);
+        Assert.Contains("backend reset", createResult.ErrorMessage);
+        await using var verify = NewDb();
+        Assert.False(await verify.Outbox.AnyAsync(o => o.CommandType == "ProvisionPeer"));
+        Assert.Equal(1, await verify.Outbox.CountAsync(o => o.CommandType == "SyncState"));
     }
 
     [Fact]
