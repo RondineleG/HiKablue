@@ -466,8 +466,10 @@ if [ "$MODE" = engine-restart ]; then
         sleep 0.1
     done
     [ "$AGENT_EXITED" = 1 ] || { tail -80 "$AGENT_LOG" >&2; fail "agent did not exit after backend instance change"; }
-    wait "$AGENT_PID" 2>/dev/null || true
+    if wait "$AGENT_PID" 2>/dev/null; then AGENT_STATUS=0; else AGENT_STATUS=$?; fi
     AGENT_PID=""
+    [ "$AGENT_STATUS" -eq 0 ] || { tail -80 "$AGENT_LOG" >&2; fail "agent crashed instead of supervised backend-change exit (status $AGENT_STATUS)"; }
+    grep -q "engine backend instance changed" "$AGENT_LOG" || { tail -80 "$AGENT_LOG" >&2; fail "agent exited without backend-change evidence"; }
     echo "  OBSERVED: agent detected the new backend instance and exited for supervised restart"
 
     start_agent "$CTRL_PORT" "$RUN_DIR/agent-backend-restart.log"
@@ -503,10 +505,13 @@ if [ "$MODE" = engine-restart ]; then
     echo "  OBSERVED: pre-restart keys cannot carry traffic on the new backend instance"
 
     stop_client client-a KILL
-    if lab_as_root ip netns exec "$NS_A" ip link show dev tun0 >/dev/null 2>&1; then
+    LINK_ERR=$(mktemp "$RUN_DIR/link-check.XXXXXX")
+    if lab_as_root ip netns exec "$NS_A" ip link show dev tun0 >/dev/null 2>"$LINK_ERR"; then
         fail "client A tun0 survived abrupt engine termination"
     fi
-    ROUTE_AFTER=$(lab_as_root ip netns exec "$NS_A" ip -4 route show 10.80.1.0/24 2>/dev/null || true)
+    grep -Eq 'does not exist|Cannot find device' "$LINK_ERR" || { cat "$LINK_ERR" >&2; fail "client A tun0 inspection failed"; }
+    ROUTE_ERR=$(mktemp "$RUN_DIR/route-check.XXXXXX")
+    ROUTE_AFTER=$(lab_as_root ip netns exec "$NS_A" ip -4 route show 10.80.1.0/24 2>"$ROUTE_ERR") || { cat "$ROUTE_ERR" >&2; fail "client A route inspection failed"; }
     [ -z "$ROUTE_AFTER" ] || fail "client A tunnel route survived abrupt termination: $ROUTE_AFTER"
     echo "  OBSERVED: abrupt client termination removed tun0 and rolled back its connected tunnel route"
 

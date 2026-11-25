@@ -94,7 +94,10 @@ agent_uid=$(id -u "$AGENT_USER")
 exec /opt/hikablue/current/bin/vpn-engine server \
     --bind "$ENGINE_BIND" \
     --tun-cidr "$ENGINE_TUN_CIDR" \
+    --tun-name "$ENGINE_TUN_NAME" \
+    --mtu "$ENGINE_MTU" \
     --metrics-sock /run/hikablue-engine/engine.sock \
+    --metrics-group "$AGENT_USER" \
     --control-sock /run/hikablue-engine/control.sock \
     --control-uid "$agent_uid"
 ```
@@ -106,7 +109,8 @@ Línea por línea:
 - `exec` reemplaza el shell, así systemd sigue al motor y no al wrapper.
 - `--bind` es el endpoint UDP externo del laboratorio aislado.
 - `--tun-cidr` asigna la dirección del túnel y crea la ruta conectada
-  mientras viva el proceso.
+  mientras viva el proceso; `--tun-name` y `--mtu` eligen nombre y tamaño, y
+  `--metrics-group` comparte telemetría con el grupo del agente.
 - El socket de métricas es telemetría; el de control es separado porque
   puede transportar material de claves.
 - `--control-uid` admite la cuenta del agente (root y el propio motor también
@@ -255,6 +259,9 @@ cuerpo exacto `hikablue-m4-ok` por la sesión posterior al reinicio.
   el upgrade y rollback de archivos.
 - **`SIGKILL`** — señal Unix imposible de capturar; prueba si la limpieza
   depende de un apagado cuidadoso o de propiedad del kernel.
+- **`GetSessions`** — operación de control del motor que informa el ID del backend y referencias vivas de peers/claves.
+- **`SO_PEERCRED`** — comprobación de credenciales de socket Unix usada para identificar el proceso local par.
+- **`SyncState`** — comando snapshot del plano de control con el conjunto deseado de peers y metadatos de validación.
 - **systemd** — administrador Linux de servicios, reinicios y logs.
 - **TUN transitorio** — interfaz TUN perteneciente a un descriptor; se
   destruye al cerrarse el último descriptor.

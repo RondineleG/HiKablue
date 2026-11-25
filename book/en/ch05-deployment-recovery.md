@@ -96,7 +96,10 @@ agent_uid=$(id -u "$AGENT_USER")
 exec /opt/hikablue/current/bin/vpn-engine server \
     --bind "$ENGINE_BIND" \
     --tun-cidr "$ENGINE_TUN_CIDR" \
+    --tun-name "$ENGINE_TUN_NAME" \
+    --mtu "$ENGINE_MTU" \
     --metrics-sock /run/hikablue-engine/engine.sock \
+    --metrics-group "$AGENT_USER" \
     --control-sock /run/hikablue-engine/control.sock \
     --control-uid "$agent_uid"
 ```
@@ -109,7 +112,9 @@ Line by line:
   than a wrapper process.
 - `--bind` is the outer UDP endpoint in the isolated lab.
 - `--tun-cidr` assigns the node-side tunnel address and creates the
-  connected route while the process lives.
+  connected route while the process lives; `--tun-name` and `--mtu` select the
+  interface name and packet size, and `--metrics-group` shares telemetry with
+  the agent group.
 - The metrics socket is telemetry; the control socket is separate because
   provisioning commands can carry key material.
 - `--control-uid` admits the agent account (root and the engine user are
@@ -261,6 +266,9 @@ post-restart session.
   and rollback atomic at the filesystem level.
 - **`SIGKILL`** — uncatchable Unix termination signal; a good test of whether
   cleanup depends on careful shutdown or kernel ownership.
+- **`GetSessions`** — engine control operation that reports the backend ID and live peer/key references.
+- **`SO_PEERCRED`** — Unix-socket credential check used to identify the local peer process.
+- **`SyncState`** — control-plane snapshot command carrying the desired peer set plus validation metadata.
 - **systemd** — Linux service manager responsible for starting, restarting,
   and logging services.
 - **transient TUN** — TUN interface owned by an open file descriptor; it is
