@@ -57,6 +57,10 @@ type Channel struct {
 	handler     Handler
 	replay      *ReplayState
 	streamEpoch uint64
+	// establishedAt records when NodeRegister was accepted on this stream;
+	// reconnect backoff is reset only after the stream survives beyond the
+	// healthy threshold, never merely because Dial succeeded.
+	establishedAt int64
 	// grpc-go forbids concurrent Send calls on one stream; the heartbeat
 	// goroutine and the command loop share this mutex.
 	sendMu sync.Mutex
@@ -70,6 +74,15 @@ func NewChannel(cfg Config, h Handler) *Channel {
 		replay = NewReplayState(cfg.NodeId, cfg.BackendInstanceId)
 	}
 	return &Channel{cfg: cfg, handler: h, replay: replay}
+}
+
+// EstablishedAt reports when NodeRegister was successfully sent on this
+// stream, or the zero time when the stream never reached that point.
+func (c *Channel) EstablishedAt() time.Time {
+	if ns := atomic.LoadInt64(&c.establishedAt); ns != 0 {
+		return time.Unix(0, ns)
+	}
+	return time.Time{}
 }
 
 // Run keeps one NodeChannel alive until ctx is cancelled or the stream
@@ -102,6 +115,7 @@ func (c *Channel) run(ctx context.Context, client edgev1.EdgeOrchestratorClient)
 	if err := stream.Send(register); err != nil {
 		return fmt.Errorf("orchestrator: send NodeRegister: %w", err)
 	}
+	atomic.StoreInt64(&c.establishedAt, time.Now().UnixNano())
 	// The numeric stream epoch is assigned monotonically by the server;
 	// fencing on a locally computed timestamp would reject the
 	// first command whenever the agent clock runs ahead.
@@ -143,8 +157,11 @@ func (c *Channel) run(ctx context.Context, client edgev1.EdgeOrchestratorClient)
 			} else {
 				if cmd.Revision > ack.AppliedRevision {
 					atomic.StoreUint64(&c.replay.appliedRevision, cmd.Revision)
-					ack.AppliedRevision = cmd.Revision
 				}
+				// APPLIED is a confirmation of this command's desired
+				// revision, even for a legacy zero revision; the backend
+				// high-water mark belongs in registrations and heartbeats.
+				ack.AppliedRevision = cmd.Revision
 				c.replay.appliedCommands[cmd.CommandId] = struct{}{}
 			}
 		}
@@ -202,7 +219,10 @@ func (c *Channel) evaluate(cmd *edgev1.ControlCommand, now time.Time) (
 		return ack, false
 	}
 	// An already-applied command can be confirmed without applying anything.
+	// APPLIED acknowledgements are command-specific: report the revision at
+	// which this command was applied, not the backend's newer high-water mark.
 	if _, applied := c.replay.appliedCommands[cmd.CommandId]; applied {
+		ack.AppliedRevision = cmd.Revision
 		c.streamEpoch = epoch
 		return ack, false
 	}

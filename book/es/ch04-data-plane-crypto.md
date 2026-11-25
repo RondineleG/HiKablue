@@ -1,8 +1,8 @@
 <!-- chapter-id: ch04-data-plane-crypto -->
 # Capítulo 4 — El hilo cifrado: AEAD, replay y la ventana que no perdona
 
-*The Journey of my VPN* · Capítulo `ch04-data-plane-crypto` · Hito 4,
-fase 2: criptografía del plano de datos en el motor Rust
+*The Journey of my VPN* · Capítulo `ch04-data-plane-crypto` · Hito 4:
+criptografía del plano de datos en el motor Rust y validación de sesiones
 
 Hasta aquí el túnel hablaba en claro: cualquiera entre los dos
 namespaces podía leer — y reescribir — cada datagrama. Este capítulo
@@ -11,12 +11,17 @@ separan "cifrado" de *seguro*: una clave por dirección, un nonce que
 nunca se repite y una ventana de replay que solo avanza tras la
 autenticación.
 
-> **Límite del laboratorio.** La clave viene de `--key <64-hex>`, un
-> pre-shared key de laboratorio pasado en ambos lados. La entrega real
-> de claves — `ProvisionPeer` y `key_epoch` del hito 3 — llega en una
-> fase posterior. Reiniciar un motor con el mismo `--key` reutiliza
-> material de clave y reinicia contador y ventana: fuera del laboratorio
-> eso es una vulnerabilidad, no un detalle.
+> **Límite del laboratorio.** Los ejercicios de criptografía de la fase 2
+> usan `--key <64-hex>`, una pre-shared key de laboratorio pasada en ambos
+> lados. El laboratorio de sesiones extremo a extremo, en cambio, recibe
+> claves direccionales por sesión mediante `ProvisionPeer` y arranca los
+> clientes con `--tx-key-file`/`--rx-key-file` — claves hex en archivos
+> `0600`, sin material de clave en la línea de comandos del proceso. Las
+> formas inline `--tx-key`/`--rx-key` siguen existiendo, avisan al usarse
+> y siguen siendo bootstrap de laboratorio, no la entrega final de claves
+> al cliente. Reiniciar un motor con la misma clave reutiliza material de
+> clave y reinicia contador y ventana: fuera del laboratorio eso es una
+> vulnerabilidad, no un detalle.
 
 ## El formato del hilo
 
@@ -331,6 +336,14 @@ fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
   nada.
 - **`--key <64-hex>`** — PSK de laboratorio: 64 dígitos hexadecimales =
   32 bytes, pasado en ambos extremos. Solo lab.
+- **`backend_instance_id`** — identificador aleatorio emitido por una
+  instancia del motor; los ACK de otra instancia quedan cercados.
+- **Endpoint pinning** — asociar un par cifrado con la primera dirección
+  externa que autentica tráfico válido y descartar copias de otros endpoints
+  antes de la verificación AEAD.
+- **`lab_session_id`** — identificador numérico de sesión del plano de
+  control usado como clave de la tabla; distinto de los índices wire de un
+  solo uso.
 - **Keepalive (0x02)** — datagrama sellado sin payload, emitido cuando
   el túnel está ocioso ≥ 25s para mantener abierto el mapeo NAT.
 - **MAC / etiqueta** — los 16 bytes de autenticación del Poly1305 al
@@ -397,9 +410,71 @@ queda 44 — `rx_unknown_sender_index` empieza a contar rezagados de la
 no-op exitoso, y reutilizar la época 1, el índice 33 o las mismas claves
 es rechazado por el tombstone.
 
+## Integración del milestone 4 — dos pares en un mismo motor de salida
+
+La frontera de rotación anterior era de un solo par. El milestone 4 la
+convierte en el plano de datos que el plano de control necesita: varios
+clientes comparten un motor de salida y eliminar uno no puede tocar paquetes
+ni endpoints de otro. La clave de la tabla es el `lab_session_id` numérico;
+el `peer_index` del wire sigue siendo global y de un solo uso:
+
+```rust
+rx: HashMap<u32, (u32, Arc<SessionState>)>,
+retired: Vec<Tombstone>,
+used_indexes: HashSet<u32>,
+```
+
+`rx` relaciona el índice enviado por un cliente con su sesión y época, así
+las épocas staged y retiring siguen descifrando sin recorrer la tabla.
+`retired` conserva huellas de claves muertas. `used_indexes` impide
+reemitir un índice incluso después de retirar su época. `StagePeer` y
+`RevokePeer` repetidos son idempotentes; índices, épocas o huellas en
+conflicto se rechazan.
+
+El endpoint aprendido también vive por par. El servidor descarta antes de
+`open` un datagrama cuya época pertenece a otro endpoint; de lo contrario
+una copia falsa consumiría el nonce real en la ventana de replay. Tras la
+autenticación, la fuente interna debe ser la VIP de ese par. La política de
+reenvío queda deliberadamente estrecha: el cliente autoriza la VIP de
+destino asignada, acepta respuestas originadas por el servicio detrás del
+nodo, y el tráfico de una VIP cliente a otra VIP cliente se descarta. La
+salida del servidor elige la época activa por la VIP cliente de destino.
+
+`GetSessions` devuelve `backend_instance_id` y una entrada por par. El
+agente lee esa identidad antes de abrir `NodeChannel`; un reinicio del
+motor cambia el backend y los ACK dirigidos al backend anterior quedan
+cercados. Los clientes del laboratorio reciben claves exactas por
+`--tx-key-file`/`--rx-key-file` apuntando a archivos `0600` en el
+directorio privado de la ejecución, y el laboratorio comprueba que ningún
+material de clave se filtra a `/proc/<pid>/cmdline` — en dirección
+inversa a la del motor. Sigue siendo transporte de claves solo de
+laboratorio, no el diseño final de aprovisionamiento.
+
+### Resultado observado del plano de datos
+
+`tests/lab/session-e2e.sh` y `tests/lab/session-e2e.sh --drop` pasaron en
+la VM Ubuntu de desarrollo. Los dos clientes recibieron `hikablue-m4-ok`
+por el túnel cifrado y la sonda directa no alcanzó el servicio. Durante la
+revocación de A, las solicitudes continuas de B no tuvieron fallos. La
+corrida normal registró `rx_pkts=105`, `tx_pkts=105`, `dropped_pkts=4`,
+`peers=1`; la de caída registró `rx_pkts=152`, `tx_pkts=151`,
+`dropped_pkts=5`, `peers=1`. El laboratorio también ofrece
+`tests/lab/session-e2e.sh --expire-restart`, que mata y reinicia el agente
+Go con el backend activo y el plano de control inalcanzable: el agente
+reiniciado aplica localmente el plazo persistido de A mientras B sigue
+pasando tráfico. Los conteos varían; la línea PASS es el
+resultado estable. Compilación, reenvío y conectividad HTTP se separan en
+`tests/lab/session-e2e.md`.
+
 ## Revisiones
 
 - `r1` — Época de 64 bits, borrado de claves, límite de nonces y vector RFC.
+- `r4` — Tabla multipar, endpoints por par, claves exactas y escenarios extremo a extremo.
+- `r5` — Endurecimiento de revisión (PR #21): las claves de los clientes
+  llegan por `--tx-key-file`/`--rx-key-file` (archivos `0600`; las formas
+  inline avisan y son mutuamente excluyentes), el laboratorio registra y
+  limpia solo los recursos que crea, y `--expire-restart` prueba la
+  expiración local a través de un reinicio del agente.
 - `r3` — Verificado en la VM de desarrollo: 108 tests de Rust, gate local
   12/12 (lab privilegiado omitido); GitHub Actions bloqueado por cobro.
 - `r0` — AEAD, ventana de replay, latch de nonce, ingreso simétrico,

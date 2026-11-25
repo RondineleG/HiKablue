@@ -71,12 +71,39 @@ issue_node() {
     echo "issued $nd (identity: $SAN_PREFIX/$node_id)"
 }
 
+
+issue_server() {
+    local dir="$1"
+    [[ -f "$dir/ca/ca.key" && -f "$dir/ca/ca.crt" ]] \
+        || die "no CA at $dir/ca — run 'init' first"
+    local sd="$dir/server"
+    mkdir -p "$sd"
+    chmod 700 "$sd"
+    openssl ecparam -name prime256v1 -genkey -noout -out "$sd/server.key"
+    chmod 600 "$sd/server.key"
+    openssl req -new -key "$sd/server.key" \
+        -subj "/CN=localhost/O=HiKablue lab-only" -out "$sd/server.csr"
+    openssl x509 -req -in "$sd/server.csr" \
+        -CA "$dir/ca/ca.crt" -CAkey "$dir/ca/ca.key" -CAcreateserial \
+        -days "$VALID_DAYS" -sha256 \
+        -extfile <(printf 'subjectAltName=DNS:localhost,IP:127.0.0.1
+keyUsage=critical,digitalSignature
+extendedKeyUsage=serverAuth
+basicConstraints=critical,CA:FALSE
+') \
+        -out "$sd/server.crt"
+    rm -f "$sd/server.csr"
+    chmod 600 "$sd/server.crt"
+    echo "issued $sd (server identity: localhost/127.0.0.1)"
+}
+
 main() {
     need openssl
     case "${1:-}" in
         init)  [[ $# -eq 2 ]] || die "usage: $0 init <outdir>";   init_ca "$2" ;;
         issue) [[ $# -eq 3 ]] || die "usage: $0 issue <outdir> <node-id>"; issue_node "$2" "$3" ;;
-        *) die "usage: $0 init <outdir> | issue <outdir> <node-id>" ;;
+        issue-server) [[ $# -eq 2 ]] || die "usage: $0 issue-server <outdir>"; issue_server "$2" ;;
+        *) die "usage: $0 init <outdir> | issue <outdir> <node-id> | issue-server <outdir>" ;;
     esac
 }
 main "$@"

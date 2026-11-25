@@ -168,6 +168,10 @@ namespace VpnControl.Data.Migrations
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("created_at");
 
+                    b.Property<byte[]>("EgressKey")
+                        .HasColumnType("bytea")
+                        .HasColumnName("egress_key");
+
                     b.Property<DateTimeOffset>("ExpiresAt")
                         .HasColumnType("timestamp with time zone")
                         .HasColumnName("expires_at");
@@ -179,6 +183,10 @@ namespace VpnControl.Data.Migrations
                     b.Property<string>("IdempotencyKey")
                         .HasColumnType("text")
                         .HasColumnName("idempotency_key");
+
+                    b.Property<byte[]>("IngressKey")
+                        .HasColumnType("bytea")
+                        .HasColumnName("ingress_key");
 
                     b.Property<long>("KeyEpoch")
                         .HasColumnType("bigint")
@@ -198,6 +206,10 @@ namespace VpnControl.Data.Migrations
                         .HasColumnType("text")
                         .HasColumnName("owner_subject");
 
+                    b.Property<long?>("PeerIndex")
+                        .HasColumnType("bigint")
+                        .HasColumnName("peer_index");
+
                     b.Property<string>("PeerPublicKey")
                         .HasColumnType("text")
                         .HasColumnName("peer_public_key");
@@ -205,6 +217,15 @@ namespace VpnControl.Data.Migrations
                     b.Property<string>("RequestHash")
                         .HasColumnType("text")
                         .HasColumnName("request_hash");
+
+                    b.Property<long?>("SenderIndex")
+                        .HasColumnType("bigint")
+                        .HasColumnName("sender_index");
+
+                    b.Property<string>("SessionTokenHash")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("session_token_hash");
 
                     b.Property<string>("Status")
                         .IsRequired()
@@ -224,6 +245,14 @@ namespace VpnControl.Data.Migrations
                     b.HasIndex("IdempotencyKey")
                         .IsUnique()
                         .HasFilter("idempotency_key IS NOT NULL");
+
+                    b.HasIndex("PeerIndex")
+                        .IsUnique()
+                        .HasFilter("peer_index IS NOT NULL");
+
+                    b.HasIndex("SenderIndex")
+                        .IsUnique()
+                        .HasFilter("sender_index IS NOT NULL");
 
                     b.HasIndex("NodeId", "LabSessionId")
                         .IsUnique()

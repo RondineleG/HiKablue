@@ -1,4 +1,6 @@
 using System.Net;
+using System.Security.Cryptography;
+using System.Text;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -43,7 +45,11 @@ public sealed class SessionServiceTests : IAsyncLifetime
         new ControlDbContext(options ?? _options),
         new NodeService(_registry),
         new ConfigurationBuilder().AddInMemoryCollection(
-            new Dictionary<string, string?> { ["VpnControl:IpPoolCidr"] = poolCidr }).Build(),
+            new Dictionary<string, string?>
+            {
+                ["VpnControl:IpPoolCidr"] = poolCidr,
+                ["VpnControl:SessionTokenSecret"] = "0123456789abcdef0123456789abcdef"
+            }).Build(),
         NullLogger<SessionService>.Instance);
 
     private void BeatNode(string nodeId = "node-a", bool healthy = true) =>
@@ -68,6 +74,32 @@ public sealed class SessionServiceTests : IAsyncLifetime
         Assert.Equal("ProvisionPeer", cmd.CommandType);
         Assert.Equal(1, cmd.Revision);
         Assert.Contains(view.SessionId.ToString(), cmd.Payload);
+        Assert.Contains("key_material", cmd.Payload);
+        Assert.NotNull(view.EgressKey);
+        Assert.NotNull(view.IngressKey);
+        Assert.NotNull(view.SenderIndex);
+        Assert.NotNull(view.PeerIndex);
+        Assert.NotNull(view.SessionToken);
+        var row = await db.Sessions.SingleAsync();
+        Assert.NotNull(row.SessionTokenHash);
+        Assert.NotEqual(view.SessionToken, row.SessionTokenHash);
+        Assert.Equal(32, row.EgressKey!.Length);
+        Assert.Equal(32, row.IngressKey!.Length);
+        Assert.NotEqual(row.EgressKey, row.IngressKey);
+    }
+
+    [Fact]
+    public async Task SessionsOnOneNodeGetDistinctMonotonicKeyEpochs()
+    {
+        BeatNode();
+        var first = await _service.CreateSessionAsync(new CreateSessionRequest(), "alice", null);
+        var second = await _service.CreateSessionAsync(new CreateSessionRequest(), "alice", null);
+        Assert.True(first.IsSuccess);
+        Assert.True(second.IsSuccess);
+        await using var db = NewDb();
+        var epochs = await db.Sessions.OrderBy(s => s.CreatedAt).Select(s => s.KeyEpoch).ToListAsync();
+        Assert.Equal(2, epochs.Distinct().Count());
+        Assert.True(epochs[1] > epochs[0]);
     }
 
     [Fact]
@@ -115,8 +147,39 @@ public sealed class SessionServiceTests : IAsyncLifetime
         var replay = await _service.CreateSessionAsync(new CreateSessionRequest(), "alice", "key-1");
         Assert.True(first.IsSuccess && replay.IsSuccess);
         Assert.Equal(first.Data!.SessionId, replay.Data!.SessionId);
+        Assert.Equal(first.Data.SessionToken, replay.Data!.SessionToken);
         await using var db = NewDb();
         Assert.Equal(1, await db.Sessions.CountAsync());
+    }
+
+    [Fact]
+    public async Task MigratedSessionReplayIssuesOwnerTokenAndStoresOnlyHash()
+    {
+        BeatNode();
+        var request = new CreateSessionRequest();
+        var first = await _service.CreateSessionAsync(request, "alice", "key-migrated");
+        Assert.True(first.IsSuccess);
+        var id = first.Data!.SessionId;
+        var originalToken = first.Data.SessionToken;
+
+        await using (var db = NewDb())
+        {
+            var row = await db.Sessions.SingleAsync();
+            row.SessionTokenHash = null; // shape produced by the pre-token migration
+            await db.SaveChangesAsync();
+        }
+
+        var replay = await _service.CreateSessionAsync(request, "alice", "key-migrated");
+        Assert.True(replay.IsSuccess);
+        Assert.Equal(originalToken, replay.Data!.SessionToken);
+        Assert.True((await _service.GetSessionAsync(id, "alice", false, replay.Data.SessionToken)).IsSuccess);
+
+        await using var check = NewDb();
+        Assert.NotNull(await check.Sessions.Select(s => s.SessionTokenHash).SingleAsync());
+        var keyColumns = await check.Database
+            .SqlQuery<int>($"SELECT count(*)::int AS \"Value\" FROM information_schema.columns WHERE table_name='sessions' AND column_name='session_token_key'")
+            .SingleAsync();
+        Assert.Equal(0, keyColumns);
     }
 
     [Fact]
@@ -137,7 +200,7 @@ public sealed class SessionServiceTests : IAsyncLifetime
         var created = await _service.CreateSessionAsync(new CreateSessionRequest(), "alice", null);
         var id = created.Data!.SessionId;
 
-        var revoked = await _service.RevokeSessionAsync(id, "alice", false);
+        var revoked = await _service.RevokeSessionAsync(id, "alice", false, created.Data!.SessionToken);
         Assert.True(revoked.IsSuccess);
         Assert.Equal("revoking", revoked.Data!.Status);
 
@@ -149,7 +212,7 @@ public sealed class SessionServiceTests : IAsyncLifetime
         Assert.Equal(2, cmd.Revision);
 
         // Second DELETE is idempotent.
-        var again = await _service.RevokeSessionAsync(id, "alice", false);
+        var again = await _service.RevokeSessionAsync(id, "alice", false, created.Data!.SessionToken);
         Assert.Equal("revoking", again.Data!.Status);
     }
 
@@ -160,9 +223,14 @@ public sealed class SessionServiceTests : IAsyncLifetime
         var created = await _service.CreateSessionAsync(new CreateSessionRequest(), "alice", null);
         var id = created.Data!.SessionId;
 
-        Assert.True((await _service.GetSessionAsync(id, "alice", false)).IsSuccess);
+        var token = created.Data!.SessionToken;
+        Assert.True((await _service.GetSessionAsync(id, "alice", false, token)).IsSuccess);
         Assert.Equal(EResultStatus.EntityNotFound,
-            (await _service.GetSessionAsync(id, "mallory", false)).Status);
+            (await _service.GetSessionAsync(id, "alice", false)).Status);
+        Assert.Equal(EResultStatus.EntityNotFound,
+            (await _service.GetSessionAsync(id, "alice", false, new string('0', 64))).Status);
+        Assert.Equal(EResultStatus.EntityNotFound,
+            (await _service.GetSessionAsync(id, "mallory", false, token)).Status);
         Assert.True((await _service.GetSessionAsync(id, "mallory", true)).IsSuccess);
     }
 
@@ -178,31 +246,30 @@ public sealed class SessionServiceTests : IAsyncLifetime
     public async Task NonAlignedCidrMasksToNetworkAndNeverLeaksOutside()
     {
         BeatNode();
-        // 10.99.0.2/30 masks to network 10.99.0.0 — usable are .1 and .2
-        // only; .3 (broadcast) and .4 must never be leased.
+        // 10.99.0.2/30 masks to network 10.99.0.0. .1 is the node
+        // gateway, so .2 is the only leasable client address; .3
+        // (broadcast) and .4 must never be leased.
         var service = NewService(poolCidr: "10.99.0.2/30");
         var r1 = await service.CreateSessionAsync(new CreateSessionRequest(), "alice", null);
+        Assert.True(r1.IsSuccess);
+        Assert.Equal("10.99.0.2", r1.Data!.VirtualIp);
         var r2 = await service.CreateSessionAsync(new CreateSessionRequest(), "alice", null);
-        var ips = new[] { r1.Data!.VirtualIp, r2.Data!.VirtualIp };
-        Assert.All(ips, ip => Assert.Matches("^10\\.99\\.0\\.[12]$", ip!));
-        var r3 = await service.CreateSessionAsync(new CreateSessionRequest(), "alice", null);
-        Assert.Equal(EResultStatus.Unavailable, r3.Status);
+        Assert.Equal(EResultStatus.Unavailable, r2.Status);
     }
 
     [Fact]
     public async Task TakenAddressIsSkippedAndNextCandidateReserved()
     {
         BeatNode();
-        // /30 = two usable (.1, .2). Whatever the seed leased must be seen
-        // as taken and skipped — the second session gets the other one.
+        // /30 leases only .2 because .1 is the node gateway. The second
+        // request must observe that lease as taken and report exhaustion.
         var small = NewService(poolCidr: "10.99.0.0/30");
         var seed = await small.CreateSessionAsync(new CreateSessionRequest(), "alice", null);
+        Assert.True(seed.IsSuccess);
+        Assert.Equal("10.99.0.2", seed.Data!.VirtualIp);
         var second = await NewService(poolCidr: "10.99.0.0/30")
             .CreateSessionAsync(new CreateSessionRequest(), "bob", null);
-        Assert.True(second.IsSuccess);
-        Assert.Matches("^10\\.99\\.0\\.[12]$", seed.Data!.VirtualIp!);
-        Assert.Matches("^10\\.99\\.0\\.[12]$", second.Data!.VirtualIp!);
-        Assert.NotEqual(seed.Data!.VirtualIp, second.Data!.VirtualIp);
+        Assert.Equal(EResultStatus.Unavailable, second.Status);
     }
 
     [Fact]
@@ -259,7 +326,7 @@ public sealed class SessionServiceTests : IAsyncLifetime
     public async Task RevokeUnknownSessionReturnsNotFound()
     {
         var result = await _service.RevokeSessionAsync(Guid.NewGuid(), "alice",
-            isAdmin: false, CancellationToken.None);
+            isAdmin: false, sessionToken: null, CancellationToken.None);
         Assert.False(result.IsSuccess);
         Assert.Equal(EResultStatus.EntityNotFound, result.Status);
     }
@@ -268,6 +335,9 @@ public sealed class SessionServiceTests : IAsyncLifetime
     public async Task RevokeTerminalSessionIsIdempotent()
     {
         var sessionId = Guid.NewGuid();
+        const string sessionToken = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+        var sessionTokenHash = Convert.ToHexString(
+            SHA256.HashData(Encoding.UTF8.GetBytes(sessionToken)));
         await using (var db = NewDb())
         {
             db.Nodes.Add(new NodeRow
@@ -278,6 +348,7 @@ public sealed class SessionServiceTests : IAsyncLifetime
             db.Sessions.Add(new SessionRow
             {
                 SessionId = sessionId, OwnerSubject = "alice",
+                SessionTokenHash = sessionTokenHash,
                 Status = SessionStatus.Revoked, NodeId = "node-a",
                 LabSessionId = 1, ExpiresAt = DateTimeOffset.UtcNow,
                 CreatedAt = DateTimeOffset.UtcNow,
@@ -286,7 +357,7 @@ public sealed class SessionServiceTests : IAsyncLifetime
             await db.SaveChangesAsync();
         }
         var result = await _service.RevokeSessionAsync(sessionId, "alice",
-            isAdmin: false, CancellationToken.None);
+            isAdmin: false, sessionToken, CancellationToken.None);
         Assert.True(result.IsSuccess);
         Assert.Equal("already terminal", result.Message);
     }

@@ -19,7 +19,6 @@ public sealed class OutboxDispatcherWorker(
     ILogger<OutboxDispatcherWorker> logger) : BackgroundService
 {
     private const int BatchSize = 32;
-    private const int MaxAttempts = 3;
     private static readonly TimeSpan CommandDeadline = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(250);
 
@@ -112,10 +111,10 @@ public sealed class OutboxDispatcherWorker(
                     SELECT 1 FROM outbox earlier
                     WHERE earlier.node_id = candidate.node_id
                       AND earlier.status IN ('pending', 'sent')
-                      AND (earlier.created_at, earlier.command_id) <
-                          (candidate.created_at, candidate.command_id)
+                      AND (earlier.revision, earlier.created_at, earlier.command_id) <
+                          (candidate.revision, candidate.created_at, candidate.command_id)
                   )
-                ORDER BY candidate.created_at, candidate.command_id
+                ORDER BY candidate.revision, candidate.created_at, candidate.command_id
                 LIMIT {BatchSize}
                 FOR UPDATE OF candidate SKIP LOCKED
                 """)
@@ -124,16 +123,10 @@ public sealed class OutboxDispatcherWorker(
         var claims = new List<DispatchClaim>(due.Count);
         foreach (var row in due)
         {
-            if (row.Attempts >= MaxAttempts)
-            {
-                row.Status = "failed";
-                row.NextRetryAt = null;
-                ControlMetrics.CommandFailed();
-                logger.LogWarning("outbox command {CommandId} exhausted delivery attempts for node {NodeId}",
-                    row.CommandId, row.NodeId);
-                continue;
-            }
-
+            // Specification §4: response timeouts leave commands pending
+            // for reconciliation. There is no attempt-count funeral here;
+            // deterministic payload/ACK failures are marked failed by their
+            // own validation paths instead.
             if (!streams.TryGet(row.NodeId, out var stream) || stream.Closed.IsCancellationRequested)
             {
                 row.Status = "pending";
@@ -203,6 +196,19 @@ public sealed class OutboxDispatcherWorker(
                             KeyEpoch = (ulong)peer.GetProperty("key_epoch").GetInt64()
                         }
                     };
+                    if (payload.TryGetProperty("key_material", out var km))
+                    {
+                        command.ProvisionPeer.KeyMaterial = new PeerKeyMaterial
+                        {
+                            KeyEpoch = (ulong)km.GetProperty("key_epoch").GetInt64(),
+                            EgressKey = ByteString.CopyFrom(
+                                Convert.FromBase64String(km.GetProperty("egress_key").GetString()!)),
+                            IngressKey = ByteString.CopyFrom(
+                                Convert.FromBase64String(km.GetProperty("ingress_key").GetString()!)),
+                            SenderIndex = km.GetProperty("sender_index").GetUInt32(),
+                            PeerIndex = km.GetProperty("peer_index").GetUInt32()
+                        };
+                    }
                     return command;
                 case "RevokePeer":
                     command.RevokePeer = new RevokePeer

@@ -36,12 +36,17 @@ public sealed class ControlDbContext(DbContextOptions<ControlDbContext> options)
             e.Property(s => s.IdempotencyKey).HasColumnName("idempotency_key");
             e.Property(s => s.RequestHash).HasColumnName("request_hash");
             e.Property(s => s.OwnerSubject).HasColumnName("owner_subject");
+            e.Property(s => s.SessionTokenHash).HasColumnName("session_token_hash").HasMaxLength(64);
             e.Property(s => s.PeerPublicKey).HasColumnName("peer_public_key");
             e.Property(s => s.Status).HasColumnName("status").HasConversion<string>();
             e.Property(s => s.VirtualIp).HasColumnName("virtual_ip");
             e.Property(s => s.NodeId).HasColumnName("node_id");
             e.Property(s => s.LabSessionId).HasColumnName("lab_session_id");
             e.Property(s => s.KeyEpoch).HasColumnName("key_epoch");
+            e.Property(s => s.EgressKey).HasColumnName("egress_key");
+            e.Property(s => s.IngressKey).HasColumnName("ingress_key");
+            e.Property(s => s.SenderIndex).HasColumnName("sender_index");
+            e.Property(s => s.PeerIndex).HasColumnName("peer_index");
             e.Property(s => s.ExpiresAt).HasColumnName("expires_at");
             e.Property(s => s.FailureReason).HasColumnName("failure_reason");
             e.Property(s => s.CreatedAt).HasColumnName("created_at");
@@ -55,6 +60,8 @@ public sealed class ControlDbContext(DbContextOptions<ControlDbContext> options)
             e.HasIndex(s => new { s.NodeId, s.LabSessionId })
                 .IsUnique()
                 .HasFilter("status IN ('Pending','Active','Revoking')");
+            e.HasIndex(s => s.SenderIndex).IsUnique().HasFilter("sender_index IS NOT NULL");
+            e.HasIndex(s => s.PeerIndex).IsUnique().HasFilter("peer_index IS NOT NULL");
             e.HasOne<NodeRow>()
                 .WithMany()
                 .HasForeignKey(s => s.NodeId)

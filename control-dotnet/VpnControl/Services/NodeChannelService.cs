@@ -185,6 +185,16 @@ public sealed class NodeChannelService(
         {
             return;
         }
+        // Confirmation is revision-specific as well as command/stream/backend
+        // specific. An APPLIED acknowledgement for an older or newer desired
+        // revision must not release a lease or activate a session for this row.
+        if (ack.Outcome == AckOutcome.Applied && ack.AppliedRevision != (ulong)row.Revision)
+        {
+            logger.LogWarning(
+                "ignoring applied ack for {CommandId} from node {NodeId}: revision {AckRevision} != {CommandRevision}",
+                ack.CommandId, nodeId, ack.AppliedRevision, row.Revision);
+            return;
+        }
         var tracked = db.Outbox.Local.FirstOrDefault(o => o.CommandId == commandId);
         if (tracked is not null)
         {

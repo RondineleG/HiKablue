@@ -16,7 +16,8 @@ then the memory.
 > **Lab boundary.** Everything still runs in an isolated, authorized lab
 > (`.agc/RULES.md` LAB-01). The CA under `tests/lab/pki/` is generated
 > locally by `gen-lab-pki.sh` and is *lab-only* — never promoted. Session
-> ownership uses an `X-Subject` header plus an admin token; real user
+> ownership pairs the lab `X-Subject` header with a per-session bootstrap
+> capability; an admin token remains available for operators. Real user
 > authentication is deferred to the user-accounts milestone.
 
 ## The contract comes first: `NodeChannel`
@@ -101,9 +102,14 @@ block.
 `POST /v1/sessions` with `Idempotency-Key` returns **202** plus a status
 URL — provisioning is async by design. Same key + same payload replays the
 original response; same key + different payload is a **409** conflict.
+The bootstrap response also returns `sessionToken`, a 256-bit capability
+derived from a service-held secret with HMAC. Only its SHA-256 digest is
+stored, yet replaying the idempotent create derives the same token again.
+Owner `GET`/`DELETE` must send it as `X-Session-Token`; `X-Subject` remains
+only the lab ownership label until real user authentication arrives.
 `DELETE` moves a session to `revoking` and enqueues `RevokePeer`. The normal
-release path waits for a matching `CommandAck` confirming removal. The reaper
-exception in the current code is described below. Session responses are `no-store`.
+release path waits for a matching `CommandAck` confirming removal. Session
+responses are `no-store`.
 
 ## The loop closes: `NodeChannel`
 
@@ -127,6 +133,8 @@ contract promised:
   `command_id` *and* fenced: an ack stamped for another `stream_epoch` or
   `backend_instance_id` is ignored. The ACK must also match a stored
   `sent` attempt; PostgreSQL locks that row while applying the outcome.
+  For `APPLIED`, `applied_revision` must also equal that row's desired
+  revision — otherwise the acknowledgement is stale and ignored.
   `APPLIED` marks the outbox row `acked`
   (and a `RevokePeer` ack deletes the lease and revokes the session);
   `FENCED_STREAM`/`FENCED_BACKEND` fail the row, close the stream and
@@ -143,26 +151,29 @@ contract promised:
   Writes to different nodes are independent. A write failure does not
   prove non-delivery: an unacknowledged attempt is retried after its
   deadline, with the same command ID, even without a reconnect. Without a
-  live stream it waits in `pending` at `next_retry_at`. After three
-  attempts without confirmation, the worker marks the command `failed`
-  without releasing any lease. The `outbox-delivery-indexes` migration
-  adds partial indexes for expired attempts and per-node ordering.
+  live stream it waits in `pending` at `next_retry_at`. Response timeouts
+  have no attempt-count funeral: the command remains eligible for
+  reconciliation until an explicit validation/ACK failure or a confirming
+  ACK. The `outbox-delivery-indexes` migration adds partial indexes for
+  expired attempts and per-node ordering.
 
   **Exercise:** Run `dotnet test control-dotnet/VpnControl.Tests --filter FullyQualifiedName~DispatcherDoesNotHoldLocksDuringWritesOrRollBackOtherNodes`
   with Docker running. Find the two test writers: the healthy stream
   must be able to ACK while the other write is still blocked.
-- **[`LeaseReaperWorker`](../../control-dotnet/VpnControl/Workers/LeaseReaperWorker.cs).** By default, it runs every 60 s and
-  moves expired sessions to `quarantined` if the node has been silent for
-  more than 300 s or has no last-seen timestamp. It deletes the lease without
-  a removal ACK, logs `FORCED_REAPER_RELEASE` and increments
-  `ipam_reaped_leases_total`. This **diverges from the [specification (§4)](../../vpn-debian-specification.md#4-session-lifecycle)**,
-  which reserves the IP until removal is confirmed, including when a node is
-  unreachable. [ADR-0001](../../.agc/adr/0001-ipam-and-session-persistence.md) records the proposed exception, not an
-  approved change to the specification. Silence alone does not prove the peer
-  is gone. Do not treat this behavior as revocation acceptance.
+- **[`LeaseReaperWorker`](../../control-dotnet/VpnControl/Workers/LeaseReaperWorker.cs).** In the milestone-3
+  implementation it ran every 60 s and moved expired sessions to
+  `quarantined` after node silence, deleting the lease without a removal
+  ACK (`FORCED_REAPER_RELEASE`). That behavior **diverged from the
+  [specification (§4)](../../vpn-debian-specification.md#4-session-lifecycle)** and was never revocation acceptance.
+  Milestone 4 supersedes it: the worker now moves expired pending/active
+  sessions directly to `revoking`, enqueues `RevokePeer` in the same
+  transaction, and leaves `ip_leases` untouched until the backend ACK.
+  There is no quorum-by-silence and no forced release.
 - **The Go side.** `pkg/orchestrator` dials with `credentials.NewTLS`
   (lab CA as the only root, node cert as client identity), keepalive
-  30 s/10 s and reconnect backoff. `Channel.Run` sends `NodeRegister`
+  30 s/10 s and reconnect backoff that doubles to a 10 s cap and resets to
+  its initial delay only after a stream survives a stability threshold —
+  never merely because `Dial` succeeded. `Channel.Run` sends `NodeRegister`
   first, heartbeats every 10 s on a goroutine (a `sendMu` serialises
   concurrent `Send` calls, which grpc-go forbids), and `evaluate` fences
   before dispatch: invalid or older `stream_epoch` → `FENCED_STREAM`,
@@ -250,7 +261,7 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
 | `.agc/adr/0001-ipam-and-session-persistence.md` | Schema + invariants: node-row lock, dispersed probing, reaper policy |
 | `control-dotnet/VpnControl/Data/` | `ControlDbContext` + rows: `nodes`, `sessions`, `ip_leases` (keyless EF row, real PK via migration), `outbox` |
 | `control-dotnet/VpnControl/Services/SessionService.cs` | The allocation loop above + `RevokeSessionAsync` (revoking + `RevokePeer` outbox, lease retained) |
-| `control-dotnet/VpnControl/Endpoints/V1/Sessions/` | `POST`/`GET`/`DELETE /v1/sessions` — `X-Subject`, `X-Admin-Token`, `Idempotency-Key`, 202 + `statusUrl`, `no-store` |
+| `control-dotnet/VpnControl/Endpoints/V1/Sessions/` | `POST`/`GET`/`DELETE /v1/sessions` — `X-Subject`, `X-Session-Token`, `X-Admin-Token`, `Idempotency-Key`, 202 + `statusUrl`, `no-store` |
 | `control-dotnet/VpnControl/Endpoints/HealthEndpoint.cs` | `/health/live` static, `/health/ready` = real `SELECT 1` round-trip |
 | `control-dotnet/VpnControl.Tests/SessionServiceTests.cs` | Testcontainers Postgres: last-/30 race, concurrent idempotency, CIDR masking, lease lifecycle |
 
@@ -261,6 +272,9 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   control plane reacts without parsing free text.
 - **`backend_instance_id`** — a fresh identifier the backend mints per
   data-plane start; a restart changes it and fences pending commands.
+- **bootstrap capability** — the one-time `sessionToken` returned by the
+  idempotent create/replay path; it authorizes owner `GET`/`DELETE` and is
+  never stored as plaintext.
 - **CA (Certificate Authority)** — the lab's throwaway ECDSA P-256 root
   that signs each node's certificate; `gen-lab-pki.sh` creates it.
 - **CIDR** — "Classless Inter-Domain Routing" notation (`10.42.0.0/22`):
@@ -278,6 +292,9 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   opens; commands flow back on the same connection (phase 3).
 - **`host(address)`** — PostgreSQL function returning the address part of
   an `inet` value with no `/32` suffix — what the probing query compares.
+- **HMAC** — a keyed message-authentication code; the service-held secret
+  plus the session ID derives the bootstrap token without storing a
+  token-derivation key beside the session row.
 - **Idempotency-Key** — client-supplied key making a `POST` replayable:
   same key + same payload → same answer; different payload → 409.
 - **`inet`** — PostgreSQL type for an IP address; its unique index is the
@@ -294,10 +311,24 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   dispatched, so a crash can't lose a `ProvisionPeer`/`RevokePeer`.
 - **SAN (Subject Alternative Name)** — the certificate extension (OID
   2.5.29.17) that carries the SPIFFE URI identifying the node.
+- **SHA-256** — the 256-bit hash used for token digests and snapshot
+  integrity; the stored digest proves possession without revealing the token.
 - **SPIFFE** — a workload-identity standard; here the URI
   `spiffe://lab.hikablue/node/<id>` naming each node.
 - **`stream_epoch`** — control-plane-issued id for one authenticated
   stream; a reconnect bumps it and fences the old stream's ACKs.
+- **`key_epoch`** — the monotonic generation number for one peer's key
+  material on a backend; Rust refuses to reuse it for different keys.
+- **egress / ingress key** — the 32-byte directional AEAD keys: engine to
+  client and client to engine. They are deliberately different.
+- **`sender_index` / `peer_index`** — the nonzero wire identifiers stamped
+  by the sender and expected by the receiver; they select encrypted epochs,
+  not database rows.
+- **`StagePeer` / `Activate` / `RevokePeer`** — the Rust control-socket
+  operations the agent applies: prepare key material, make it the transmit
+  epoch, then remove the peer.
+- **`SyncState`** — the control-plane reconciliation snapshot. It carries
+  peer references and integrity framing, never raw key material.
 - **Testcontainers** — the library tests use to boot a real PostgreSQL
   in Docker, so allocator races are tested against the real engine.
 
@@ -384,6 +415,115 @@ old epoch. Hint: use `SameMillisecondReconnectGetsANewEpochAndSurvivesOldDetach`
 check that the second epoch is larger and `TryGet` still returns it.
 Do not test this by changing the host clock.
 
+
+## Milestone 4 integration — keys, ACKs, and the lease that refuses to guess
+
+Milestone 3 already had the right lifecycle shape, but the provision command
+still lacked real key material and the expiration worker violated the
+specification in one important way: after a node stayed silent, it force-
+released the lease. Milestone 4 closes both gaps because the end-to-end
+test depends on them.
+
+`SessionService` now generates a fresh 32-byte egress key, a distinct
+32-byte ingress key and two distinct nonzero wire indexes in the same
+PostgreSQL transaction that creates the session, lease and outbox command.
+The node row is locked first, so `key_epoch` advances monotonically per
+node and two concurrent peers cannot share the epoch Rust tombstones. The
+migration `session-key-material` persists the keys and indexes; the unique
+indexes make wire-index reuse a database error rather than a data-plane
+ambiguity. `.1` in the pool is reserved as the node-side gateway and is
+never leased.
+
+The command payload now carries:
+
+```json
+"key_material": {
+  "key_epoch": 2,
+  "egress_key": "base64…",
+  "ingress_key": "base64…",
+  "sender_index": 713651965,
+  "peer_index": 22788512
+}
+```
+
+Only the shape is reproduced here — never real lab key bytes. The outbox
+worker converts those fields into protobuf `bytes` without changing their
+meaning: egress is engine-to-client, ingress is client-to-engine. The Go
+handler validates lengths, distinct keys, distinct nonzero indexes and the
+peer/key epoch match before touching the engine. It then performs
+`StagePeer` followed by `Activate`; only after both control-socket calls
+succeed does it send an applied ACK. That ACK is what moves the REST session
+from `pending` to `active`.
+
+Expiration now follows the specification instead of guessing:
+
+```csharp
+session.Status = SessionStatus.Revoking;
+session.FailureReason = "expired";
+db.Outbox.Add(new OutboxRow
+{
+    CommandId = Guid.NewGuid(),
+    NodeId = session.NodeId,
+    CommandType = "RevokePeer",
+    Revision = node.DesiredRevision,
+    CreatedAt = now,
+    Payload = System.Text.Json.JsonSerializer.Serialize(new
+    {
+        session_id = session.SessionId,
+        lab_session_id = session.LabSessionId,
+        reason = "expired"
+    })
+});
+```
+
+Line by line: the first line starts revocation but does not pretend the
+peer is gone. The second records why it started. The third asks the node
+to remove exactly that lab session. There is no `DELETE FROM ip_leases` in
+this worker: the reservation survives node unavailability. The lease is
+deleted only in the confirmed `RevokePeer` ACK path, after stream epoch,
+backend instance and revision fencing have matched the command.
+
+The agent also enforces expiration locally. If the control plane is offline
+when `expires_at` passes, the node still calls the engine's `RevokePeer`;
+control-plane convergence happens later through redelivery and
+`SyncState`. Deadlines are persisted in an owner-only `expiry.json` under a
+validated private agent state directory and reloaded before the channel
+starts. The first expiry check after restart can revoke a peer whose
+deadline passed while the agent was down. `ProvisionPeer` writes the
+deadline before `StagePeer`, which already enables incoming traffic. The
+agent retains the deadline even if it loses the engine's response. The
+agent holds the same mutex while applying peer changes and revoking expired
+peers, so the expiry loop cannot interleave its check and revocation with
+the provisioning of a new session that reuses the same lab ID.
+
+`SyncState` validates declared count, byte length and SHA-256
+before mutation, and the deletion guard prevents a non-forced empty or
+mass-deletion snapshot from wiping the backend.
+
+From the repository root, run `(cd agent-go && go test -race ./...)`
+to verify deadline persistence when the engine response is lost, peer ID
+reuse, snapshot validation, and startup with corrupt expiry state. These
+tests use local Unix sockets.
+
+Contract note: the specification table still calls the Go↔Rust methods
+`AddPeer`/`RemovePeer`/`SyncPeers` on `/run/vpn/engine.sock`. Milestone 4
+keeps the already delivered boundary instead — a separate control socket
+with `StagePeer`, `Activate`, `Retire`, `RevokePeer`, and `GetSessions` —
+because renaming it was not needed for the acceptance behavior. Backend
+restart reprovisioning is deliberately not claimed: snapshots carry key
+references, not raw keys, so a new backend cannot reconstruct old epochs
+without fresh explicit provisioning.
+
+### Observed control-plane result
+
+The normal laboratory run observed distinct leases (`10.80.1.66` and
+`10.80.1.150` in one recorded run), `pending` state until provisioning
+ACKs, then `active` for both clients. In the interruption run, killing the
+delayed proxy before the removal ACK left A in `revoking` with
+`ip_leases` count 1. Restoring the proxy let the outbox redeliver/reconcile
+the command; only then did the session become `revoked` and the lease count
+become 0. A was not reactivated.
+
 ## Revisions
 
 - `r0` — contracts (proto, AckErrorCode, fencing fields), lab CA, ADR-0001
@@ -403,3 +543,14 @@ Do not test this by changing the host clock.
   the same backend, and reject malformed deadlines and epochs. The deadline
   still requires synchronized clocks. The tests cover these building blocks,
   not cross-process provisioning or revocation through the Rust backend.
+- `r4` — end-to-end integration: control-plane-issued directional key material and wire indexes, spec-compliant expiration without forced lease release, exact agent validation, local expiration, and observed pending/active/revoking/revoked behavior in the two-client laboratory.
+- `r5` — review hardening: expiry deadlines persist in a private
+  `-state-dir` (`expiry.json`, fsync'd, owner-only) instead of beside the
+  engine socket; reconnect backoff resets only after a stream survives the
+  stability threshold; the bootstrap token derives from a service-held
+  secret (`session_token_key` column dropped) and owner-authenticated
+  idempotent replay backfills `session_token_hash` for migrated rows; lab
+  client keys arrive through protected `--tx-key-file`/`--rx-key-file`;
+  the laboratory gains run-scoped resource ownership and the
+  `--expire-restart` scenario proving local expiry across an agent
+  restart.

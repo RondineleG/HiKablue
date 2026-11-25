@@ -16,9 +16,9 @@ public interface ISessionService
     Task<RequestResult<SessionView>> CreateSessionAsync(CreateSessionRequest request, string subject,
         string? idempotencyKey, CancellationToken cancellationToken = default);
     Task<RequestResult<SessionView>> GetSessionAsync(Guid sessionId, string subject, bool isAdmin,
-        CancellationToken cancellationToken = default);
+        string? sessionToken = null, CancellationToken cancellationToken = default);
     Task<RequestResult<SessionView>> RevokeSessionAsync(Guid sessionId, string subject, bool isAdmin,
-        CancellationToken cancellationToken = default);
+        string? sessionToken = null, CancellationToken cancellationToken = default);
 }
 
 /// IPAM + session lifecycle on PostgreSQL (ADR-0001). Every write bundles
@@ -43,10 +43,73 @@ public sealed class SessionService(
 
     private static string StatusUrl(Guid id) => $"/v1/sessions/{id}";
 
-    private static SessionView ToView(SessionRow row) => new(
+    private static SessionView ToView(SessionRow row, string? sessionToken = null) => new(
         row.SessionId, row.Status.ToString().ToLowerInvariant(),
         row.VirtualIp?.ToString(), row.NodeId, row.LabSessionId,
-        row.ExpiresAt, row.FailureReason, StatusUrl(row.SessionId));
+        row.ExpiresAt, row.FailureReason, StatusUrl(row.SessionId),
+        row.EgressKey is null ? null : Convert.ToBase64String(row.EgressKey),
+        row.IngressKey is null ? null : Convert.ToBase64String(row.IngressKey),
+        row.SenderIndex, row.PeerIndex, sessionToken);
+
+    private static string HashSessionToken(string token) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
+
+    // The bootstrap token is derived from a service-held secret, never from a
+    // per-session secret stored beside the row. A database-only reader cannot
+    // reconstruct live owner capabilities; replay remains deterministic.
+    private bool TryDeriveSessionToken(Guid sessionId, out string token)
+    {
+        token = "";
+        var secret = config["VpnControl:SessionTokenSecret"];
+        if (string.IsNullOrWhiteSpace(secret) || secret.Length < 32)
+        {
+            return false;
+        }
+        using var hmac = new HMACSHA256(SHA256.HashData(Encoding.UTF8.GetBytes(secret)));
+        token = Convert.ToHexString(hmac.ComputeHash(
+            Encoding.UTF8.GetBytes($"hikablue-session-token:{sessionId}")));
+        return true;
+    }
+
+    // Idempotent replay is the owner-authenticated recovery path for rows
+    // migrated before session_token_hash existed: the same subject, key and
+    // payload may attach the derived token's hash and receive the capability.
+    private async Task<string?> IssueSessionTokenAsync(SessionRow row, CancellationToken ct)
+    {
+        if (!TryDeriveSessionToken(row.SessionId, out var token))
+        {
+            return null;
+        }
+        var hash = HashSessionToken(token);
+        if (row.SessionTokenHash != hash)
+        {
+            var tracked = await db.Sessions.FirstAsync(s => s.SessionId == row.SessionId, ct);
+            tracked.SessionTokenHash = hash;
+            tracked.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(ct);
+            row.SessionTokenHash = hash;
+        }
+        return token;
+    }
+
+    private static bool SessionTokenMatches(SessionRow row, string? token)
+    {
+        if (row.SessionTokenHash is null || string.IsNullOrWhiteSpace(token) ||
+            row.SessionTokenHash.Length != 64 || token.Length != 64)
+        {
+            return false;
+        }
+        try
+        {
+            return CryptographicOperations.FixedTimeEquals(
+                Convert.FromHexString(row.SessionTokenHash),
+                Convert.FromHexString(HashSessionToken(token.ToUpperInvariant())));
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+    }
 
     private static string HashRequest(string subject, CreateSessionRequest request)
     {
@@ -65,11 +128,16 @@ public sealed class SessionService(
                 .FirstOrDefaultAsync(s => s.IdempotencyKey == idempotencyKey, cancellationToken);
             if (replay is not null)
             {
-                return replay.RequestHash == hash
-                    ? RequestResult<SessionView>.Success(ToView(replay), "idempotent replay")
-                    : RequestResult<SessionView>.WithError(
+                if (replay.RequestHash != hash)
+                {
+                    return RequestResult<SessionView>.WithError(
                         "idempotency key was already used with a different payload",
                         EResultStatus.EntityAlreadyExists);
+                }
+                var replayToken = await IssueSessionTokenAsync(replay, cancellationToken);
+                return replayToken is null
+                    ? RequestResult<SessionView>.WithError("session token secret is not configured", EResultStatus.HasError)
+                    : RequestResult<SessionView>.Success(ToView(replay, replayToken), "idempotent replay");
             }
         }
 
@@ -89,6 +157,11 @@ public sealed class SessionService(
         }
 
         var sessionId = Guid.NewGuid();
+        if (!TryDeriveSessionToken(sessionId, out var bootstrapToken))
+        {
+            return RequestResult<SessionView>.WithError(
+                "session token secret is not configured", EResultStatus.HasError);
+        }
         SessionRow? created = null;
         string? exhaustedReason = null;
 
@@ -124,6 +197,14 @@ public sealed class SessionService(
                 }
 
                 var now = DateTimeOffset.UtcNow;
+                var (senderIndex, peerIndex) = await AllocateWireIndexesAsync(cancellationToken);
+                // key_epoch is unique per node stream while the node row lock
+                // makes this single-issuer. Rust tombstoning treats epochs as
+                // backend-unique, so two peers must never share epoch 1.
+                var keyEpoch = await db.Sessions
+                    .Where(s => s.NodeId == node.NodeId)
+                    .Select(s => (long?)s.KeyEpoch)
+                    .MaxAsync(cancellationToken) + 1 ?? 1;
                 var row = new SessionRow
                 {
                     SessionId = sessionId,
@@ -135,11 +216,16 @@ public sealed class SessionService(
                     VirtualIp = free,
                     NodeId = node.NodeId,
                     LabSessionId = labId,
-                    KeyEpoch = 1,
+                    KeyEpoch = keyEpoch,
+                    EgressKey = RandomNumberGenerator.GetBytes(32),
+                    IngressKey = RandomNumberGenerator.GetBytes(32),
+                    SenderIndex = senderIndex,
+                    PeerIndex = peerIndex,
                     ExpiresAt = now.AddSeconds(ttl),
                     CreatedAt = now,
                     UpdatedAt = now
                 };
+                row.SessionTokenHash = HashSessionToken(bootstrapToken);
                 var revision = await BumpRevisionAsync(node.NodeId, cancellationToken);
                 var command = new OutboxRow
                 {
@@ -155,6 +241,14 @@ public sealed class SessionService(
                             session_id = sessionId, lab_session_id = labId,
                             virtual_ip = free.ToString(), expires_at = row.ExpiresAt,
                             key_epoch = row.KeyEpoch, key_ref = request.PeerPublicKey
+                        },
+                        key_material = new
+                        {
+                            key_epoch = row.KeyEpoch,
+                            egress_key = row.EgressKey,
+                            ingress_key = row.IngressKey,
+                            sender_index = row.SenderIndex,
+                            peer_index = row.PeerIndex
                         }
                     })
                 };
@@ -190,11 +284,16 @@ public sealed class SessionService(
                 .FirstOrDefaultAsync(s => s.IdempotencyKey == idempotencyKey, cancellationToken);
             if (replay is not null)
             {
-                return replay.RequestHash == hash
-                    ? RequestResult<SessionView>.Success(ToView(replay), "idempotent replay")
-                    : RequestResult<SessionView>.WithError(
+                if (replay.RequestHash != hash)
+                {
+                    return RequestResult<SessionView>.WithError(
                         "idempotency key was already used with a different payload",
                         EResultStatus.EntityAlreadyExists);
+                }
+                var replayToken = await IssueSessionTokenAsync(replay, cancellationToken);
+                return replayToken is null
+                    ? RequestResult<SessionView>.WithError("session token secret is not configured", EResultStatus.HasError)
+                    : RequestResult<SessionView>.Success(ToView(replay, replayToken), "idempotent replay");
             }
         }
 
@@ -205,14 +304,15 @@ public sealed class SessionService(
                 EResultStatus.Unavailable);
         }
 
-        return RequestResult<SessionView>.Success(ToView(created), "session pending");
+        return RequestResult<SessionView>.Success(ToView(created, bootstrapToken), "session pending");
     }
 
     public async Task<RequestResult<SessionView>> GetSessionAsync(Guid sessionId, string subject, bool isAdmin,
-        CancellationToken cancellationToken = default)
+        string? sessionToken = null, CancellationToken cancellationToken = default)
     {
         var row = await db.Sessions.AsNoTracking().FirstOrDefaultAsync(s => s.SessionId == sessionId, cancellationToken);
-        if (row is null || (!isAdmin && row.OwnerSubject != subject))
+        if (row is null || (!isAdmin &&
+                (row.OwnerSubject != subject || !SessionTokenMatches(row, sessionToken))))
         {
             return RequestResult<SessionView>.WithError("session not found", EResultStatus.EntityNotFound);
         }
@@ -220,10 +320,11 @@ public sealed class SessionService(
     }
 
     public async Task<RequestResult<SessionView>> RevokeSessionAsync(Guid sessionId, string subject, bool isAdmin,
-        CancellationToken cancellationToken = default)
+        string? sessionToken = null, CancellationToken cancellationToken = default)
     {
         var row = await db.Sessions.FirstOrDefaultAsync(s => s.SessionId == sessionId, cancellationToken);
-        if (row is null || (!isAdmin && row.OwnerSubject != subject))
+        if (row is null || (!isAdmin &&
+                (row.OwnerSubject != subject || !SessionTokenMatches(row, sessionToken))))
         {
             return RequestResult<SessionView>.WithError("session not found", EResultStatus.EntityNotFound);
         }
@@ -272,6 +373,28 @@ public sealed class SessionService(
         return requested is null
             ? eligible.MaxBy(n => n.LastSeen)
             : eligible.FirstOrDefault(n => n.NodeId == requested);
+    }
+
+    private async Task<(uint Sender, uint Peer)> AllocateWireIndexesAsync(CancellationToken ct)
+    {
+        var used = (await db.Sessions.AsNoTracking()
+                .Where(s => s.SenderIndex != null || s.PeerIndex != null)
+                .Select(s => new { s.SenderIndex, s.PeerIndex })
+                .ToListAsync(ct))
+            .SelectMany(x => new[] { x.SenderIndex, x.PeerIndex })
+            .Where(x => x.HasValue)
+            .Select(x => x!.Value)
+            .ToHashSet();
+        for (var tries = 0; tries < 128; tries++)
+        {
+            var sender = (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue);
+            var peer = (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue);
+            if (sender != peer && !used.Contains(sender) && !used.Contains(peer))
+            {
+                return (sender, peer);
+            }
+        }
+        throw new InvalidOperationException("unable to allocate unique wire indexes");
     }
 
     private async Task EnsureNodeLockedAsync(string nodeId, Entities.Node node, CancellationToken ct)
@@ -323,7 +446,8 @@ public sealed class SessionService(
         uint network = (((uint)bytes[0] << 24) | ((uint)bytes[1] << 16) | ((uint)bytes[2] << 8) | bytes[3])
             & (0xFFFFFFFFu << hostBits);
         uint count = (1u << hostBits) - 2; // usable hosts, skip network + broadcast
-        for (uint i = 1; i <= count; i++)
+        // .1 is the node-side gateway/service address and is never leased.
+        for (uint i = 2; i <= count; i++)
         {
             uint addr = network + i;
             yield return new IPAddress(new byte[] { (byte)(addr >> 24), (byte)(addr >> 16), (byte)(addr >> 8), (byte)addr });

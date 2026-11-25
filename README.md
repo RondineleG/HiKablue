@@ -16,13 +16,13 @@ HiKablue follows one packet end to end: from a Linux client's TUN interface, thr
 │  client    │───────────▶│   vpn-control    │  sessions, IPs,
 │  vpn-cli   │            │    (C#/.NET)     │  revocation, state
 └─────┬──────┘            └────────▲─────────┘
-      │                          │ gRPC + mTLS (library; vpn-agent wiring pending)
+      │                          │ gRPC + mTLS NodeChannel
       │ UDP (test traffic)  ┌────┴──────┐
       │                     │ vpn-agent │
       ▼                     │   (Go)    │
 ┌────────────┐   Unix sock  └───────────┘
 │ vpn-engine │◀──────────────────┘
-│   (Rust)   │  GetMetrics (peer control pending)
+│   (Rust)   │  GetMetrics + peer control
 └─────┬──────┘
       │ TUN
       ▼
@@ -33,9 +33,9 @@ Tunneled traffic flows client → engine (UDP in the lab) — the agent stays on
 
 | Component | Role | Status |
 |---|---|---|
-| `engine-rust/` | IPv4 TUN ↔ UDP, hardened `GetMetrics` Unix socket, optional lab ChaCha20-Poly1305 with per-direction keys and replay protection | M4 phase 2 delivered; dynamic peer control pending |
-| `agent-go/` | Metrics-fetcher binary plus `pkg/orchestrator` (mTLS channel, register/heartbeat/ACK, fencing) | Library delivered; binary wiring and backend command handler deferred to M4 |
-| `control-dotnet/` | PostgreSQL/EF Core, IPAM, session API, SPIFFE mTLS `NodeChannel`, outbox and lease reaper; loopback-only lab REST/legacy heartbeat remains | M3 components delivered; gRPC lab integration pending |
+| `engine-rust/` | IPv4 TUN ↔ UDP, hardened `GetMetrics` Unix socket, multi-peer ChaCha20-Poly1305 sessions with per-direction keys, endpoint pinning and control socket lifecycle | M4 validated locally |
+| `agent-go/` | Metrics-fetcher binary, `vpn-agent -serve` orchestration loop and `pkg/orchestrator` (mTLS channel, register/heartbeat/ACK, fencing) | M4 validated locally |
+| `control-dotnet/` | PostgreSQL/EF Core, IPAM, session API, SPIFFE mTLS `NodeChannel`, outbox and lease reaper; loopback-only lab REST/legacy heartbeat remains | M4 session validation delivered locally |
 | `proto/` | gRPC `NodeChannel` definitions and generated Go/C# bindings | Delivered in M3 |
 
 The custom UDP transport exists **only for isolated lab exercises** with test traffic. The roadmap specifies a WireGuard backend before real traffic is carried.
@@ -50,7 +50,7 @@ Keep this table current: every milestone change set updates the status and links
 | 1 | **Telemetry** — metrics socket, Go fetcher, C# heartbeat registry | **Delivered** — [PR #6](https://github.com/RondineleG/HiKablue/pull/6); hardened in [PR #8](https://github.com/RondineleG/HiKablue/pull/8) (registry snapshots, heartbeat token auth, payload limits, node expiry, coverage-gate self-tests) |
 | 2 | Raw TUN ↔ UDP tunnel | **Delivered** in [PR #4](https://github.com/RondineleG/HiKablue/pull/4) — ping verified both ways on Debian 12/13 (delivered out of order, ahead of milestone 1) |
 | 3 | Control plane — PostgreSQL, IPAM, session states, outbox; gRPC `NodeChannel` over mTLS | **Components delivered** — contracts + lab CA + IPAM design in [PR #11](https://github.com/RondineleG/HiKablue/pull/11); EF Core persistence, IPAM and `/v1/sessions` in [PR #12](https://github.com/RondineleG/HiKablue/pull/12); `NodeChannel` with SPIFFE mTLS, outbox dispatcher, lease reaper and the Go `pkg/orchestrator` client in [PR #13](https://github.com/RondineleG/HiKablue/pull/13). Binary wiring, HTTP heartbeat retirement and cross-process gRPC acceptance remain deferred to M4 |
-| 4 | End-to-end session — encrypted Rust backend, CLI, peer operations, local expiration, reconciliation | **In progress** — Phase 2 data-plane crypto delivered in [PR #14](https://github.com/RondineleG/HiKablue/pull/14): ChaCha20-Poly1305 AEAD wire format (14B header + 16B tag), per-direction keys, 2048-packet replay window with atomic acceptance, nonce-exhaustion latch, symmetric inner-VIP ingress, lab `--key` mode |
+| 4 | End-to-end session — encrypted Rust backend, CLI, peer operations, local expiration, reconciliation | **Validation delivered locally** — Phase 2 data-plane crypto in [PR #14](https://github.com/RondineleG/HiKablue/pull/14); this change set wires `vpn-agent` to mTLS gRPC and the Rust control socket, provisions two concurrent clients, preserves `revoking` leases across channel loss, and passes both [session laboratory](tests/lab/session-e2e.md) scenarios |
 | 5 | Deployment and recovery — Debian install automation, restarts, stream loss, route rollback | Pending |
 | 6 | WireGuard — agent backend + client configuration, split tunneling | Pending |
 
@@ -62,7 +62,7 @@ One command runs the whole gate — commit conventions, diff safety, shellcheck,
 
 ```bash
 bash tests/checks.sh          # everything except privileged lab steps
-bash tests/checks.sh --lab    # full gate: TUN/UDP ping + telemetry E2E + resource safety
+bash tests/checks.sh --lab    # full gate: TUN/UDP ping + telemetry E2E + resource safety + session E2E
 ```
 
 The lab steps use `sudo` only where TUN creation and namespaces require it, run in `mktemp`-isolated directories, refuse to touch resources they did not create, and clean up after themselves.

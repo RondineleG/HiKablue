@@ -1,8 +1,8 @@
 <!-- chapter-id: ch04-data-plane-crypto -->
 # Chapter 4 — The Sealed Wire: AEAD, Replay, and the Unforgiving Window
 
-*The Journey of my VPN* · Chapter `ch04-data-plane-crypto` · Milestone 4,
-phase 2: Rust data-plane crypto
+*The Journey of my VPN* · Chapter `ch04-data-plane-crypto` · Milestone 4:
+Rust data-plane crypto and session validation
 
 Until now the tunnel spoke in cleartext: anyone between the two
 namespaces could read — and rewrite — every datagram. This chapter puts
@@ -11,11 +11,15 @@ separate "encrypted" from *secure*: one key per direction, a nonce that
 never repeats, and a replay window that only advances after
 authentication.
 
-> **Lab boundary.** Keys come from `--key <64-hex>`, a lab pre-shared
-> key passed on both ends. Real key delivery — `ProvisionPeer` and
-> `key_epoch` from milestone 3 — arrives in a later phase. Restarting an
-> engine with the same `--key` reuses key material and resets counter
-> and window: outside the lab that is a vulnerability, not a detail.
+> **Lab boundary.** The phase-2 crypto exercises use `--key <64-hex>`, a
+> lab pre-shared key passed on both ends. The end-to-end session laboratory
+> instead receives per-session directional keys through `ProvisionPeer` and
+> starts clients with `--tx-key-file`/`--rx-key-file` — hex keys in
+> `0600` files, so no key material appears in the process command line.
+> The inline `--tx-key`/`--rx-key` forms still exist, warn on use, and
+> remain lab bootstrap, not final client key delivery. Restarting an
+> engine with the same key reuses key material and resets counter and
+> window: outside the lab that is a vulnerability, not a detail.
 
 ## The wire format
 
@@ -325,6 +329,13 @@ fn derive_key(key: &[u8; 32], index: u32) -> Zeroizing<[u8; 32]> {
   reusing any of them.
 - **`--key <64-hex>`** — the lab PSK: 64 hex digits = 32 bytes, passed
   on both ends. Lab only.
+- **`backend_instance_id`** — random identifier minted by one running
+  engine instance; ACKs for another instance are fenced.
+- **Endpoint pinning** — associating a keyed peer with the first outer
+  address that authenticates valid traffic and dropping copies from other
+  endpoints before AEAD verification.
+- **`lab_session_id`** — the control-plane numeric session identifier used
+  as the session-table key; distinct from the one-shot wire indexes.
 - **Keepalive (0x02)** — a sealed datagram with no payload, sent when
   the tunnel is idle ≥ 25s to keep the NAT mapping open.
 - **MAC / tag** — the 16 Poly1305 authentication bytes at the end of
@@ -389,15 +400,93 @@ from the dead epoch and `rotations_total` reads 1. A repeated `Retire`
 succeeds as a no-op, and reusing epoch 1, index 33 or the same keys is
 refused by the tombstone.
 
+
+## Milestone 4 integration — two peers, one exit engine
+
+The rotation boundary from the earlier sections was single-peer. Milestone
+4 turns it into the data plane the control plane actually needs: several
+clients can share one exit engine, and removing one of them must not touch
+packets or endpoints belonging to another. The table key is now the numeric
+`lab_session_id`; the wire `peer_index` remains a global, one-shot lookup
+key:
+
+```rust
+rx: HashMap<u32, (u32, Arc<SessionState>)>,
+retired: Vec<Tombstone>,
+used_indexes: HashSet<u32>,
+```
+
+Line by line: `rx` maps the index stamped by a client to its owning lab
+session and epoch, so staged and retiring epochs still decrypt without a
+scan. `retired` preserves fingerprints of dead key material. `used_indexes`
+is separate because an index must never be reissued even after its epoch is
+gone. A repeated `StagePeer` or `RevokePeer` is idempotent; a conflicting
+index, epoch or key fingerprint is rejected.
+
+Endpoint pinning also moved into the table. The server drops a datagram
+whose resolved epoch belongs to a different learned endpoint *before*
+calling `open` — otherwise a cross-endpoint replay would burn the real
+packet's nonce in the replay window. After authentication, the inner source
+must be that peer's virtual IP. The forwarding policy is deliberately
+narrow for this milestone:
+
+- service traffic may originate behind the exit node, so the client does
+  not require the node VIP as inner source;
+- every packet accepted by a client must be addressed to that client's
+  assigned VIP;
+- a packet from one client VIP to another client VIP is dropped — no
+  client-to-client hairpin in milestone 4;
+- server egress selects the active epoch by destination client VIP, not by
+  a single learned endpoint.
+
+`GetSessions` now returns `backend_instance_id` plus one entry per peer
+(VIP, learned endpoint and epoch roles). The agent reads that instance id
+before opening `NodeChannel`; a restart of the engine produces a different
+backend identity, so ACKs for commands sent to the old data plane are
+fenced instead of being mistaken for confirmations.
+
+The clients in the laboratory do not use the derived lab `--key`: the
+control plane issues exact directional keys and the client engine receives
+them through `--tx-key-file`/`--rx-key-file` pointing at `0600` files
+inside the private run directory; the laboratory asserts that no key
+material leaks into `/proc/<pid>/cmdline`. The client direction is
+inverted — engine `ingress_key` is client transmit key, engine
+`sender_index` is the client's expected receive index. Key-file bootstrap
+is still lab-only key transport, not the final client provisioning
+design.
+
+### Observed end-to-end data-plane result
+
+`tests/lab/session-e2e.sh` and `tests/lab/session-e2e.sh --drop` passed on
+the Ubuntu development VM. Both clients received `hikablue-m4-ok` through
+the encrypted tunnel; the direct probe did not reach the service. During
+revocation of A, B's continuous requests had no failure. Final server
+metrics in the recorded normal run were `rx_pkts=105`, `tx_pkts=105`,
+`dropped_pkts=4`, `peers=1`; the drop run reported `rx_pkts=152`,
+`tx_pkts=151`, `dropped_pkts=5`, `peers=1`. The laboratory also provides
+`tests/lab/session-e2e.sh --expire-restart`, which kills and restarts the
+Go agent while the backend stays up and the control plane is unreachable:
+the restarted agent enforces A's persisted deadline locally while B keeps
+passing traffic. Counts vary with keepalives and
+probe timing; the stable result is the PASS line. Compilation, forwarding
+and HTTP connectivity are reported separately in
+`tests/lab/session-e2e.md`.
+
 ## Revisions
 
 - `r1` — 64-bit epoch, zeroizing keys, concurrent nonce ceiling and RFC vector.
+- `r5` — Review hardening (PR #21): client lab keys now arrive through
+  `--tx-key-file`/`--rx-key-file` (`0600` files; inline forms warn and
+  conflict), the laboratory registers and cleans only the resources it
+  created, and `--expire-restart` proves local expiry enforcement across
+  an agent restart.
 - `r3` — Verified on the dev VM: 108 Rust tests, local gate 12/12
   (privileged lab skipped); GitHub Actions blocked by billing.
 - `r0` — AEAD, replay window, nonce latch, symmetric ingress,
   `--key`/`--sender-index`/`--peer-index`/`--keepalive-secs`, split
   ingress metrics.
 - `r2` — Clarify frame validation and separate historical lab evidence from the local `r1` run.
+- `r4` — Multi-peer session table, per-peer endpoints, service forwarding policy, control-plane-issued exact keys, backend instance reporting, and the two passing end-to-end laboratory scenarios.
 - `r3` — Control socket (`--control-sock`, `SO_PEERCRED`), `SessionTable`
   multi-epoch rx, StagePeer/Activate/Retire/RevokePeer, per-epoch counters,
   proto `sender_index`/`peer_index`.

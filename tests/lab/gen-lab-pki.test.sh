@@ -51,8 +51,16 @@ s2=$(openssl x509 -in "$WORK/nodes/node-a/node.crt" -noout -serial | cut -d= -f2
 check "rotation produces a new serial" test "$s1" != "$s2"
 check "rotated cert still verifies" openssl verify -CAfile "$WORK/ca/ca.crt" "$WORK/nodes/node-a/node.crt"
 
+# server issuance carries the loopback server identity and serverAuth EKU
+"$SCRIPT" issue-server "$WORK" >/dev/null 2>&1
+check "server cert verifies against CA" openssl verify -CAfile "$WORK/ca/ca.crt" "$WORK/server/server.crt"
+check "server key is 0600" test "$(stat -c %a "$WORK/server/server.key")" = 600
+check "server SAN covers localhost" bash -c "openssl x509 -in '$WORK/server/server.crt' -noout -ext subjectAltName | grep -q 'DNS:localhost'"
+check "server certificate has serverAuth" bash -c "openssl x509 -in '$WORK/server/server.crt' -noout -ext extendedKeyUsage | grep -q 'TLS Web Server Authentication'"
+
 # error paths fail closed
 expect_fail "issue without CA fails" "$SCRIPT" issue "$WORK/missing" node-x
+expect_fail "issue-server without CA fails" "$SCRIPT" issue-server "$WORK/missing"
 expect_fail "invalid node-id rejected" "$SCRIPT" issue "$WORK" "BAD_ID!"
 expect_fail "unknown subcommand fails" "$SCRIPT" bogus "$WORK"
 

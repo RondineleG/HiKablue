@@ -33,6 +33,7 @@ public sealed class SessionHttpTests : IAsyncLifetime
                     ["VpnControl:HeartbeatToken"] = "tok",
                     ["VpnControl:AdminToken"] = AdminToken,
                     ["VpnControl:IpPoolCidr"] = "10.77.0.0/24",
+                    ["VpnControl:SessionTokenSecret"] = "0123456789abcdef0123456789abcdef",
                     ["VpnControl:ConnectionString"] = _pg.GetConnectionString()
                 })));
         _client = _factory.CreateClient();
@@ -49,7 +50,8 @@ public sealed class SessionHttpTests : IAsyncLifetime
     }
 
     private HttpRequestMessage Req(HttpMethod method, string url, string? subject = "alice",
-        object? body = null, string? idempotencyKey = null, bool admin = false)
+        object? body = null, string? idempotencyKey = null, bool admin = false,
+        string? sessionToken = null)
     {
         var request = new HttpRequestMessage(method, url);
         if (subject is not null)
@@ -63,6 +65,10 @@ public sealed class SessionHttpTests : IAsyncLifetime
         if (admin)
         {
             request.Headers.Add("X-Admin-Token", AdminToken);
+        }
+        if (sessionToken is not null)
+        {
+            request.Headers.Add("X-Session-Token", sessionToken);
         }
         if (body is not null)
         {
@@ -84,6 +90,7 @@ public sealed class SessionHttpTests : IAsyncLifetime
         Assert.Equal("pending", data.GetProperty("status").GetString());
         Assert.Equal("edge-1", data.GetProperty("nodeId").GetString());
         Assert.Matches("^/v1/sessions/", data.GetProperty("statusUrl").GetString()!);
+        Assert.Equal(64, data.GetProperty("sessionToken").GetString()!.Length);
     }
 
     [Fact]
@@ -99,11 +106,14 @@ public sealed class SessionHttpTests : IAsyncLifetime
     {
         var created = await _client.SendAsync(
             Req(HttpMethod.Post, "/v1/sessions", body: new { }));
-        var statusUrl = JsonDocument.Parse(await created.Content.ReadAsStringAsync())
-            .RootElement.GetProperty("data").GetProperty("statusUrl").GetString()!;
+        var data = JsonDocument.Parse(await created.Content.ReadAsStringAsync())
+            .RootElement.GetProperty("data");
+        var statusUrl = data.GetProperty("statusUrl").GetString()!;
+        var sessionToken = data.GetProperty("sessionToken").GetString()!;
 
         Assert.Equal(HttpStatusCode.NotFound,
-            (await _client.SendAsync(Req(HttpMethod.Get, statusUrl, subject: "mallory"))).StatusCode);
+            (await _client.SendAsync(Req(HttpMethod.Get, statusUrl, subject: "mallory",
+                sessionToken: sessionToken))).StatusCode);
         Assert.Equal(HttpStatusCode.OK,
             (await _client.SendAsync(Req(HttpMethod.Get, statusUrl, subject: null, admin: true))).StatusCode);
     }
@@ -113,10 +123,13 @@ public sealed class SessionHttpTests : IAsyncLifetime
     {
         var created = await _client.SendAsync(
             Req(HttpMethod.Post, "/v1/sessions", body: new { }));
-        var statusUrl = JsonDocument.Parse(await created.Content.ReadAsStringAsync())
-            .RootElement.GetProperty("data").GetProperty("statusUrl").GetString()!;
+        var data = JsonDocument.Parse(await created.Content.ReadAsStringAsync())
+            .RootElement.GetProperty("data");
+        var statusUrl = data.GetProperty("statusUrl").GetString()!;
+        var sessionToken = data.GetProperty("sessionToken").GetString()!;
 
-        var deleted = await _client.SendAsync(Req(HttpMethod.Delete, statusUrl));
+        var deleted = await _client.SendAsync(Req(HttpMethod.Delete, statusUrl,
+            sessionToken: sessionToken));
         Assert.Equal(HttpStatusCode.Accepted, deleted.StatusCode);
         Assert.Equal("revoking",
             JsonDocument.Parse(await deleted.Content.ReadAsStringAsync())
@@ -141,6 +154,8 @@ public sealed class SessionHttpTests : IAsyncLifetime
             .RootElement.GetProperty("data").GetProperty("statusUrl").GetString()!;
         Assert.Equal(HttpStatusCode.Unauthorized,
             (await _client.SendAsync(Req(HttpMethod.Get, statusUrl, subject: null))).StatusCode);
+        Assert.Equal(HttpStatusCode.Unauthorized,
+            (await _client.SendAsync(Req(HttpMethod.Get, statusUrl))).StatusCode);
         Assert.Equal(HttpStatusCode.Unauthorized,
             (await _client.SendAsync(Req(HttpMethod.Delete, statusUrl, subject: null))).StatusCode);
     }

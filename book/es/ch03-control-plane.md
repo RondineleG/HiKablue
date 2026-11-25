@@ -16,9 +16,10 @@ primeras fases: el contrato y su identidad, luego la memoria.
 > **Límite del laboratorio.** Todo sigue corriendo en un laboratorio
 > aislado y autorizado (`.agc/RULES.md` LAB-01). La CA en
 > `tests/lab/pki/` es generada localmente por `gen-lab-pki.sh` y es
-> *solo de laboratorio* — nunca promovida. La propiedad de sesiones usa un
-> encabezado `X-Subject` más un token de administrador; la autenticación
-> real de usuarios queda para el hito de cuentas de usuario.
+> *solo de laboratorio* — nunca promovida. La propiedad de sesiones combina el
+> encabezado de laboratorio `X-Subject` con una capability de bootstrap por
+> sesión; un token de administrador sigue disponible para operadores. La
+> autenticación real de usuarios queda para el hito de cuentas de usuario.
 
 ## Primero el contrato: `NodeChannel`
 
@@ -104,10 +105,15 @@ así un pool desalineado jamás puede alquilar direcciones fuera del bloque.
 `POST /v1/sessions` con `Idempotency-Key` devuelve **202** más una URL
 de estado — el aprovisionamiento es asíncrono por diseño. La misma clave
 con el mismo payload reproduce la respuesta original; la misma clave con
-payload distinto es un conflicto **409**. `DELETE` mueve la sesión a
-`revoking` y encola `RevokePeer`. La liberación normal espera un `CommandAck`
-que confirme la eliminación. La excepción del reaper en el código actual se
-describe abajo. Las respuestas de sesión llevan `no-store`.
+payload distinto es un conflicto **409**. La respuesta de bootstrap también
+devuelve `sessionToken`, una capability de 256 bits derivada con HMAC de un
+secreto mantenido por el servicio. Solo se guarda su resumen SHA-256, pero repetir
+el create idempotente deriva el mismo token. El `GET`/`DELETE` del dueño
+debe enviarlo como `X-Session-Token`; `X-Subject` sigue siendo solo la
+etiqueta de propiedad del laboratorio hasta la autenticación real de
+usuarios. `DELETE` mueve la sesión a `revoking` y encola `RevokePeer`. La
+liberación normal espera un `CommandAck` que confirme la eliminación. Las
+respuestas de sesión llevan `no-store`.
 
 ## El bucle se cierra: `NodeChannel`
 
@@ -132,6 +138,8 @@ contrato prometía:
   ack con otro `stream_epoch` o `backend_instance_id` se ignora.
   El ACK también debe coincidir con un intento `sent` guardado;
   PostgreSQL bloquea esa fila mientras aplica el resultado.
+  Para `APPLIED`, `applied_revision` también debe igualar la revisión
+  deseada de esa fila — si no, el ACK es viejo y se ignora.
   `APPLIED` marca la fila `acked` (y un ack de `RevokePeer` borra el lease
   y revoca la sesión); `FENCED_STREAM`/`FENCED_BACKEND` fallan la fila,
   cierran el stream y encolan un `SyncState` de resincronización;
@@ -149,25 +157,30 @@ contrato prometía:
   Una escritura fallida no prueba que no hubo entrega: un intento sin
   ACK se reintenta tras vencer su plazo, con el mismo ID, incluso sin
   reconexión. Sin stream activo, espera en `pending` hasta `next_retry_at`.
-  Tras tres intentos sin confirmación, el worker marca el comando
-  `failed` sin liberar ningún lease. La migración `outbox-delivery-indexes`
-  añade índices parciales para intentos vencidos y el orden por nodo.
+  Los timeouts de respuesta no tienen funeral por número de intentos: el
+  comando sigue elegible para reconciliación hasta un fallo explícito de
+  validación/ACK o un ACK confirmado. La migración
+  `outbox-delivery-indexes` añade índices parciales para intentos vencidos
+  y el orden por nodo.
 
   **Ejercicio:** Ejecuta `dotnet test control-dotnet/VpnControl.Tests --filter FullyQualifiedName~DispatcherDoesNotHoldLocksDuringWritesOrRollBackOtherNodes`
   con Docker activo. Localiza los dos escritores de prueba: el stream
   sano debe poder enviar su ACK mientras la otra escritura sigue bloqueada.
-- **[`LeaseReaperWorker`](../../control-dotnet/VpnControl/Workers/LeaseReaperWorker.cs).** Por defecto, se ejecuta cada 60 s y
-  marca como `quarantined` las sesiones vencidas si el nodo lleva más de 300 s
-  sin reportar o no tiene fecha del último contacto. Borra el lease sin ACK de
-  eliminación, registra `FORCED_REAPER_RELEASE` e incrementa
-  `ipam_reaped_leases_total`. Esto **contradice la [especificación (§4)](../../vpn-debian-specification.md#4-session-lifecycle)**,
-  que reserva la IP hasta confirmar la eliminación, incluso si el nodo no
-  responde. El [ADR-0001](../../.agc/adr/0001-ipam-and-session-persistence.md) recoge la excepción propuesta, no un cambio
-  aprobado en la especificación. El silencio no demuestra que el par se haya
-  eliminado. Este comportamiento no satisface el criterio de revocación.
+- **[`LeaseReaperWorker`](../../control-dotnet/VpnControl/Workers/LeaseReaperWorker.cs).** En la implementación
+  del milestone 3 se ejecutaba cada 60 s y marcaba como `quarantined` las
+  sesiones vencidas tras el silencio del nodo, borrando el lease sin ACK de
+  eliminación (`FORCED_REAPER_RELEASE`). Ese comportamiento **contradecía la
+  [especificación (§4)](../../vpn-debian-specification.md#4-session-lifecycle)** y nunca fue aceptación de revocación.
+  El milestone 4 lo reemplaza: el worker mueve las sesiones pending/active
+  vencidas directamente a `revoking`, encola `RevokePeer` en la misma
+  transacción y no toca `ip_leases` hasta el ACK del backend. No hay cuórum
+  por silencio ni liberación forzada.
 - **El lado Go.** `pkg/orchestrator` marca con `credentials.NewTLS` (la
   CA de laboratorio como única raíz, el cert del nodo como identidad de
-  cliente), keepalive 30 s/10 s y backoff de reconexión. `Channel.Run`
+  cliente), keepalive 30 s/10 s y backoff de reconexión que se duplica
+  hasta un tope de 10 s y vuelve al retardo inicial solo cuando un stream
+  supera el umbral de estabilidad — nunca solo porque `Dial` tuvo éxito.
+  `Channel.Run`
   envía `NodeRegister` primero, hace heartbeat cada 10 s en una goroutine
   (un `sendMu` serializa los `Send` concurrentes, que grpc-go prohíbe), y
   `evaluate` verifica antes de despachar: `stream_epoch` inválido o
@@ -260,7 +273,7 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
 | `.agc/adr/0001-ipam-and-session-persistence.md` | Esquema + invariantes: lock de la fila del nodo, sondeo disperso, política del reaper |
 | `control-dotnet/VpnControl/Data/` | `ControlDbContext` + filas: `nodes`, `sessions`, `ip_leases` (fila EF sin clave, PK real vía migración), `outbox` |
 | `control-dotnet/VpnControl/Services/SessionService.cs` | El bucle de asignación de arriba + `RevokeSessionAsync` (revoking + outbox `RevokePeer`, lease retenido) |
-| `control-dotnet/VpnControl/Endpoints/V1/Sessions/` | `POST`/`GET`/`DELETE /v1/sessions` — `X-Subject`, `X-Admin-Token`, `Idempotency-Key`, 202 + `statusUrl`, `no-store` |
+| `control-dotnet/VpnControl/Endpoints/V1/Sessions/` | `POST`/`GET`/`DELETE /v1/sessions` — `X-Subject`, `X-Session-Token`, `X-Admin-Token`, `Idempotency-Key`, 202 + `statusUrl`, `no-store` |
 | `control-dotnet/VpnControl/Endpoints/HealthEndpoint.cs` | `/health/live` estático, `/health/ready` = `SELECT 1` real |
 | `control-dotnet/VpnControl.Tests/SessionServiceTests.cs` | Testcontainers Postgres: carrera por la última /30, idempotencia concurrente, enmascaramiento CIDR, ciclo del lease |
 
@@ -273,6 +286,9 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
 - **`backend_instance_id`** — identificador fresco que el backend acuña
   por arranque del plano de datos; un reinicio lo cambia y valla los
   comandos pendientes.
+- **bootstrap capability** — el `sessionToken` único devuelto por el
+  create/replay idempotente; autoriza `GET`/`DELETE` del dueño y nunca se
+  almacena en claro.
 - **CA (Certificate Authority)** — la raíz ECDSA P-256 desechable del
   laboratorio que firma el certificado de cada nodo; la crea
   `gen-lab-pki.sh`.
@@ -296,6 +312,9 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
 - **`host(address)`** — función de PostgreSQL que devuelve la parte de
   dirección de un valor `inet` sin sufijo `/32` — lo que compara la
   consulta de sondeo.
+- **HMAC** — código de autenticación de mensaje con clave; el secreto del
+  servicio más el ID de sesión deriva el token de bootstrap sin guardar una
+  clave de derivación junto a la fila.
 - **Idempotency-Key** — clave del cliente que hace rejugable un `POST`:
   misma clave + mismo payload → misma respuesta; payload distinto →
   409.
@@ -316,11 +335,25 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   `ProvisionPeer`/`RevokePeer`.
 - **SAN (Subject Alternative Name)** — la extensión del certificado
   (OID 2.5.29.17) que lleva la URI SPIFFE que identifica al nodo.
+- **SHA-256** — el hash de 256 bits usado para los resúmenes de tokens y
+  la integridad del `SyncState`.
 - **SPIFFE** — estándar de identidad de workloads; aquí la URI
   `spiffe://lab.hikablue/node/<id>` que nombra a cada nodo.
 - **`stream_epoch`** — id emitido por el plano de control para un
   stream autenticado; una reconexión lo incrementa y valla los ACKs del
   stream viejo.
+- **`key_epoch`** — número monotónico de generación del material de clave
+  de un par en un backend; Rust rechaza reutilizarlo con claves distintas.
+- **Clave egress / ingress** — claves AEAD direccionales de 32 bytes:
+  motor→cliente y cliente→motor. Son deliberadamente distintas.
+- **`sender_index` / `peer_index`** — identificadores wire no nulos que el
+  emisor estampa y el receptor espera; seleccionan épocas cifradas, no filas
+  de base de datos.
+- **`StagePeer` / `Activate` / `RevokePeer`** — operaciones del socket de
+  control Rust que aplica el agente: preparar material, activarlo para
+  transmitir y eliminar el par.
+- **`SyncState`** — snapshot de reconciliación del plano de control. Lleva
+  referencias de pares y marco de integridad, nunca claves crudas.
 - **Testcontainers** — la librería con la que los tests arrancan un
   PostgreSQL real en Docker, para probar las carreras del asignador
   contra el motor real.
@@ -412,6 +445,101 @@ el epoch antiguo. Pista: usar
 `SameMillisecondReconnectGetsANewEpochAndSurvivesOldDetach`; comprobar que el
 segundo epoch es mayor y `TryGet` aún lo devuelve. No cambiar el reloj del host.
 
+## Integración del milestone 4 — claves, ACKs y un lease que no adivina
+
+El milestone 3 ya tenía la forma correcta del ciclo, pero `ProvisionPeer`
+aún no llevaba claves reales y el worker de expiración violaba la
+especificación: liberaba el lease a la fuerza cuando el nodo guardaba
+silencio. El milestone 4 cierra ambas brechas porque la prueba extremo a
+extremo depende de ellas.
+
+`SessionService` genera una clave egress de 32 bytes, una clave ingress
+distinta y dos índices wire distintos en la misma transacción PostgreSQL
+que crea sesión, lease y comando outbox. El bloqueo de la fila del nodo
+hace que `key_epoch` avance de forma monotónica por nodo; dos pares no
+pueden compartir la época que Rust protege con tombstones. La migración
+`session-key-material` persiste claves e índices y sus índices únicos
+convierten la reutilización en error de base de datos. `.1` queda
+reservada como gateway del nodo y nunca se alquila.
+
+El payload lleva `key_material` con `key_epoch`, las dos claves en base64,
+`sender_index` y `peer_index`. El dispatcher las convierte a `bytes` de
+protobuf sin cambiar la dirección: egress es motor→cliente e ingress es
+cliente→motor. El handler Go valida longitudes, claves distintas, índices
+no nulos y coincidencia de época antes de tocar el motor. Después ejecuta
+`StagePeer` y `Activate`; solo cuando ambas llamadas al socket terminan
+envía el ACK aplicado que mueve la sesión REST de `pending` a `active`.
+
+La expiración ahora sigue la especificación:
+
+```csharp
+session.Status = SessionStatus.Revoking;
+session.FailureReason = "expired";
+db.Outbox.Add(new OutboxRow
+{
+    CommandId = Guid.NewGuid(),
+    NodeId = session.NodeId,
+    CommandType = "RevokePeer",
+    Revision = node.DesiredRevision,
+    CreatedAt = now,
+    Payload = System.Text.Json.JsonSerializer.Serialize(new
+    {
+        session_id = session.SessionId,
+        lab_session_id = session.LabSessionId,
+        reason = "expired"
+    })
+});
+```
+
+La primera línea inicia la revocación sin fingir que el par ya desapareció.
+La segunda registra la razón. La tercera pide al nodo remover exactamente
+esa sesión. No hay `DELETE FROM ip_leases` en este worker: la reserva
+sobrevive a la indisponibilidad del nodo. El lease se borra únicamente en
+la ruta del ACK confirmado de `RevokePeer`, después de validar stream
+epoch, backend instance y revisión.
+
+El agente también aplica expiración localmente. Si el control plane está
+fuera cuando vence `expires_at`, el nodo revoca en el motor; la convergencia
+llega después por reenvío y `SyncState`. Los vencimientos se persisten en
+un `expiry.json` solo del propietario dentro de un directorio de estado
+privado del agente y se recargan antes de abrir el canal. La primera
+comprobación tras el reinicio puede revocar un peer cuyo plazo venció
+mientras el agente estaba caído. `ProvisionPeer` guarda el plazo antes de
+`StagePeer`, que ya habilita el tráfico entrante. El agente conserva el
+plazo aunque se pierda la respuesta del motor. El agente usa el mismo mutex
+para aplicar cambios y revocar peers vencidos. Así, el bucle de expiración
+puede comprobar y revocar sin que se intercale el aprovisionamiento de otra
+sesión que reutilice el mismo ID de laboratorio.
+
+El snapshot valida cuenta
+declarada, longitud y SHA-256 antes de mutar, y la guardia de borrado impide
+que un snapshot vacío o masivo no forzado limpie el backend.
+
+Desde la raíz del repositorio, ejecuta `(cd agent-go && go test -race ./...)`
+para verificar la persistencia del plazo si se pierde la respuesta del
+motor, la reutilización del ID de un peer, la validación de snapshots y el
+arranque con un estado de expiración dañado. Estas pruebas usan sockets
+Unix locales.
+
+Nota de contrato: la tabla de la especificación todavía nombra los
+métodos Go↔Rust `AddPeer`/`RemovePeer`/`SyncPeers` en
+`/run/vpn/engine.sock`. El milestone 4 conserva la frontera ya entregada
+—un socket de control separado con `StagePeer`, `Activate`, `Retire`,
+`RevokePeer` y `GetSessions`— porque renombrarla no era necesario para el
+comportamiento de aceptación. La reprovisión tras reiniciar el backend no
+se reivindica: los snapshots llevan referencias, no claves crudas, así un
+backend nuevo no puede reconstruir épocas viejas sin aprovisionamiento
+explícito y fresco.
+
+### Resultado observado del plano de control
+
+La corrida normal observó leases distintas, estado `pending` hasta los ACK
+y después `active` en ambos clientes. En la corrida de interrupción, cerrar
+el proxy antes del ACK dejó A en `revoking` con una entrada en `ip_leases`.
+Al restaurar el proxy, la outbox reenvió/reconcilió el comando; solo
+entonces la sesión quedó `revoked` y el lease llegó a cero. A no se
+reactivó.
+
 ## Revisiones
 
 - `r0` — contratos (proto, AckErrorCode, campos de fencing), CA de
@@ -433,3 +561,15 @@ segundo epoch es mayor y `TryGet` aún lo devuelve. No cambiar el reloj del host
   canales del mismo backend y rechaza plazos y epochs malformados. El plazo
   sigue exigiendo relojes sincronizados. Las pruebas cubren estos componentes,
   no el aprovisionamiento entre procesos ni la revocación vía el backend Rust.
+- `r4` — integración extremo a extremo: claves direccionales, expiración conforme a la especificación y ciclo observado en el laboratorio.
+- `r5` — endurecimiento de revisión: los plazos de expiración persisten en
+  un `-state-dir` privado (`expiry.json`, fsync, solo del propietario) en
+  lugar de junto al socket del motor; el backoff de reconexión se
+  reinicia solo cuando un stream supera el umbral de estabilidad; el
+  token de bootstrap se deriva de un secreto del servicio (columna
+  `session_token_key` eliminada) y el replay idempotente autenticado del
+  dueño rellena `session_token_hash` en filas migradas; las claves de
+  cliente del laboratorio llegan por `--tx-key-file`/`--rx-key-file`
+  protegidos; el laboratorio gana ownership de recursos por ejecución y
+  el escenario `--expire-restart` que prueba la expiración local a través
+  de un reinicio del agente.
