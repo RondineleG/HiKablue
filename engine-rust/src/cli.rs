@@ -1,6 +1,7 @@
 //! Command-line interface and configuration for `vpn-engine`.
 
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand};
@@ -98,11 +99,15 @@ pub struct CommonArgs {
     /// peer-credential check. Requires --control-sock.
     #[arg(long)]
     pub control_uid: Option<u32>,
-    /// 32-byte ChaCha20-Poly1305 session key as 64 hex chars. Lab-only
-    /// pre-shared key: real key delivery arrives via the control plane in a
-    /// later phase. Without it the engine speaks the M2 plaintext format.
-    #[arg(long)]
+    /// 32-byte ChaCha20-Poly1305 session key as 64 hex chars. Legacy lab
+    /// option: the value is visible in the process command line; prefer
+    /// --key-file. Without either, the engine speaks the M2 plaintext format.
+    #[arg(long, conflicts_with = "key_file")]
     pub key: Option<String>,
+    /// Read --key from a private regular file (mode 0600 or stricter).
+    /// The file path, not the key, appears in the process command line.
+    #[arg(long)]
+    pub key_file: Option<std::path::PathBuf>,
     /// Session index stamped on outbound packets; also selects this
     /// side's derived direction key. Defaults to 1.
     #[arg(long, default_value_t = 1)]
@@ -112,13 +117,21 @@ pub struct CommonArgs {
     /// the two direction keys.
     #[arg(long, default_value_t = 0)]
     pub peer_index: u32,
-    /// Exact 32-byte transmit key as hex for lab client bootstrap. Mutually
-    /// exclusive with --key; unlike --key this is not HKDF-derived.
-    #[arg(long)]
+    /// Exact 32-byte transmit key as hex for lab client bootstrap. Legacy
+    /// option: visible in the process command line; prefer --tx-key-file.
+    /// Mutually exclusive with --key; unlike --key it is not HKDF-derived.
+    #[arg(long, conflicts_with = "tx_key_file")]
     pub tx_key: Option<String>,
-    /// Exact 32-byte receive key as hex for lab client bootstrap.
+    /// Read the exact transmit key from a private regular file.
     #[arg(long)]
+    pub tx_key_file: Option<std::path::PathBuf>,
+    /// Exact 32-byte receive key as hex for lab client bootstrap. Legacy
+    /// option: visible in the process command line; prefer --rx-key-file.
+    #[arg(long, conflicts_with = "rx_key_file")]
     pub rx_key: Option<String>,
+    /// Read the exact receive key from a private regular file.
+    #[arg(long)]
+    pub rx_key_file: Option<std::path::PathBuf>,
     /// Idle seconds before a KEEPALIVE datagram is sent (encrypted mode
     /// only). Defaults to 25.
     #[arg(long, default_value_t = 25)]
@@ -152,6 +165,31 @@ pub fn parse_key_hex(s: &str) -> Result<Zeroizing<[u8; 32]>, String> {
         };
     }
     Ok(key)
+}
+
+/// Reads a hex key from a regular file whose permissions deny group/other
+/// access. Error text includes the flag/path only — never file contents.
+pub fn parse_key_file(path: &Path, flag: &str) -> Result<Zeroizing<[u8; 32]>, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("{flag}: cannot stat {}: {err}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{flag}: {} is not a regular file", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "{flag}: {} must not be readable by group/other",
+                path.display()
+            ));
+        }
+    }
+    let raw = std::fs::read(path)
+        .map_err(|err| format!("{flag}: cannot read {}: {err}", path.display()))?;
+    let text = String::from_utf8(raw)
+        .map_err(|_| format!("{flag}: {} is not UTF-8 hex", path.display()))?;
+    parse_key_hex(&text).map_err(|err| format!("{flag}: {err}"))
 }
 
 /// An IPv4 address with prefix length, written `A.B.C.D/N`.
@@ -225,6 +263,40 @@ mod tests {
         unicode.push('é'); // 2 bytes: brings the byte length to 64
         assert_eq!(unicode.len(), 64);
         assert!(parse_key_hex(&unicode).is_err());
+    }
+
+    #[test]
+    fn parse_key_file_reads_private_hex_file() {
+        let dir =
+            std::env::temp_dir().join(format!("vpn-engine-key-test-{}-good", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key.hex");
+        std::fs::write(&path, format!("{}\n", "ab".repeat(32))).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let key = parse_key_file(&path, "--tx-key-file").unwrap();
+        assert_eq!(key[0], 0xab);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_key_file_rejects_group_or_other_access() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "vpn-engine-key-test-{}-bad-mode",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key.hex");
+        std::fs::write(&path, "ab".repeat(32)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let err = parse_key_file(&path, "--tx-key-file").unwrap_err();
+        assert!(err.contains("must not be readable"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
