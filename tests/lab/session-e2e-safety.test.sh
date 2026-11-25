@@ -64,14 +64,23 @@ p1=$!
     lab_cleanup_scope
 ) &
 p2=$!
+release_scope_workers() {
+    touch "$go_one" "$go_two" 2>/dev/null || true
+    wait "$p1" 2>/dev/null || true
+    wait "$p2" 2>/dev/null || true
+}
 for _ in $(seq 200); do
     [ -e "$ready_one" ] && [ -e "$ready_two" ] && break
     sleep 0.02
 done
-[ -e "$ready_one" ] && [ -e "$ready_two" ] || { echo "FAIL: concurrent scopes did not start" >&2; exit 1; }
+[ -e "$ready_one" ] && [ -e "$ready_two" ] || { release_scope_workers; echo "FAIL: concurrent scopes did not start" >&2; exit 1; }
 touch "$go_one"
 wait "$p1"
-lab_netns_exists "$ns_two" || { echo "FAIL: first scope removed concurrent namespace" >&2; exit 1; }
+if ! lab_netns_exists "$ns_two"; then
+    release_scope_workers
+    echo "FAIL: first scope removed concurrent namespace" >&2
+    exit 1
+fi
 touch "$go_two"
 wait "$p2"
 ! lab_netns_exists "$ns_one" || { echo "FAIL: concurrent namespace one leaked" >&2; exit 1; }
