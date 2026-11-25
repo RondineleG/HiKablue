@@ -488,15 +488,22 @@ when `expires_at` passes, the node still calls the engine's `RevokePeer`;
 control-plane convergence happens later through redelivery and
 `SyncState`. Deadlines are persisted in an owner-only `expiry.json` under a
 validated private agent state directory and reloaded before the channel
-starts, so a deadline that passed while only the agent was down is enforced
-immediately after restart. `ProvisionPeer` writes the deadline before
-`StagePeer`, which already enables ingress. The agent can enforce expiry
-even if the engine applies a command and its response is lost. The agent holds the same mutex while applying
-peer changes and checking and revoking expired peers, so a reused lab
-session ID cannot inherit an in-flight revocation from the expiry loop.
+starts. The first expiry check after restart can revoke a peer whose
+deadline passed while the agent was down. `ProvisionPeer` writes the
+deadline before `StagePeer`, which already enables incoming traffic. The
+agent retains the deadline even if it loses the engine's response. The
+agent holds the same mutex while applying peer changes and revoking expired
+peers, so the expiry loop cannot interleave its check and revocation with
+the provisioning of a new session that reuses the same lab ID.
+
 `SyncState` validates declared count, byte length and SHA-256
 before mutation, and the deletion guard prevents a non-forced empty or
 mass-deletion snapshot from wiping the backend.
+
+From the repository root, run `(cd agent-go && go test -race ./...)`
+to verify deadline persistence when the engine response is lost, peer ID
+reuse, snapshot validation, and startup with corrupt expiry state. These
+tests use local Unix sockets.
 
 Contract note: the specification table still calls the Go↔Rust methods
 `AddPeer`/`RemovePeer`/`SyncPeers` on `/run/vpn/engine.sock`. Milestone 4
