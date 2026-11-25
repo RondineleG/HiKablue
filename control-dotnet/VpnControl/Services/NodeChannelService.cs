@@ -105,19 +105,28 @@ public sealed class NodeChannelService(
     public async Task OnRegisterAsync(string nodeId, NodeRegister register,
         CancellationToken ct, string? streamEpoch = null)
     {
-        var count = await db.Nodes.CountAsync(ct);
-        var exists = await db.Nodes.AnyAsync(n => n.NodeId == nodeId, ct);
-        if (!exists && count >= MaxNodes)
+        var now = DateTimeOffset.UtcNow;
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+        // Serialize registration with session creation on the same node-row
+        // lock used by SessionService. The lock is held until commit, so a
+        // concurrent create cannot slip between the backend-generation check,
+        // old-generation command invalidation, and reset snapshot enqueue.
+        var nodeRow = await db.Nodes
+            .FromSql($"SELECT * FROM nodes WHERE node_id = {nodeId} FOR UPDATE")
+            .FirstOrDefaultAsync(ct);
+        var exists = nodeRow is not null;
+        if (!exists)
         {
-            throw new RpcException(new Status(StatusCode.ResourceExhausted,
-                "node registry is at capacity"));
+            var count = await db.Nodes.CountAsync(ct);
+            if (count >= MaxNodes)
+            {
+                throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                    "node registry is at capacity"));
+            }
         }
 
-        var now = DateTimeOffset.UtcNow;
-        var previousBackendInstanceId = exists
-            ? await db.Nodes.Where(n => n.NodeId == nodeId)
-                .Select(n => n.BackendInstanceId).FirstAsync(ct)
-            : null;
+        var previousBackendInstanceId = nodeRow?.BackendInstanceId;
         await db.Database.ExecuteSqlAsync($"""
             INSERT INTO nodes (node_id, backend_instance_id, registered_at, last_seen_at, engine_healthy, desired_revision)
             VALUES ({nodeId}, {register.BackendInstanceId}, {now}, {now}, {true}, 0)
@@ -126,8 +135,6 @@ public sealed class NodeChannelService(
                 last_seen_at = EXCLUDED.last_seen_at,
                 engine_healthy = EXCLUDED.engine_healthy
             """, ct);
-
-        nodeRegistry.Record(new Models.Heartbeat(nodeId, true));
 
         var backendRestarted = previousBackendInstanceId is not null &&
             !string.Equals(previousBackendInstanceId, register.BackendInstanceId, StringComparison.Ordinal);
@@ -140,15 +147,12 @@ public sealed class NodeChannelService(
                 .ToListAsync(ct)
             : [];
 
-        // Commands marked sent on a previous stream may have been lost with
-        // it (at-least-once). Requeue them only when the backend identity is
-        // unchanged. After a backend restart all pre-registration attempts belong to a dead
-        // data-plane generation: replaying a Provision/Revoke/SyncState command
-        // before the reset snapshot could reinstall old keys or contradict state
-        // that the fresh backend no longer owns. They become terminal because no
-        // reset-safe interpretation of those commands exists.
         if (backendRestarted)
         {
+            // Every pre-registration attempt belongs to the dead data-plane
+            // generation. The node lock above prevents a concurrent session
+            // creation from entering this set, so no fresh-session command is
+            // discarded with it.
             await db.Outbox
                 .Where(o => o.NodeId == nodeId && (o.Status == "sent" || o.Status == "pending"))
                 .ExecuteUpdateAsync(o => o.SetProperty(r => r.Status, "failed")
@@ -156,6 +160,9 @@ public sealed class NodeChannelService(
         }
         else
         {
+            // Same generation: sent rows from a dead stream are at-least-once
+            // attempts and may be retried. This also requeues a pending reset
+            // snapshot, but does not duplicate it.
             await db.Outbox
                 .Where(o => o.NodeId == nodeId && o.Status == "sent" &&
                     (streamEpoch == null || o.StreamEpoch != streamEpoch))
@@ -163,9 +170,17 @@ public sealed class NodeChannelService(
                     .SetProperty(r => r.NextRetryAt, now), ct);
         }
 
-        await EnqueueSyncStateAsync(nodeId, ct,
-            restartedSessionIds.Count == 0 ? null : restartedSessionIds,
-            restartedSessionIds.Count == 0 ? null : restartedSessionIds);
+        var resetPending = await BackendResetState.HasPendingBackendResetAsync(db, nodeId, ct);
+        if (backendRestarted || !resetPending)
+        {
+            await EnqueueSyncStateCoreAsync(nodeId, ct,
+                restartedSessionIds.Count == 0 ? null : restartedSessionIds,
+                restartedSessionIds.Count == 0 ? null : restartedSessionIds);
+        }
+
+        await db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+        nodeRegistry.Record(new Models.Heartbeat(nodeId, true));
     }
 
     public async Task OnHeartbeatAsync(string nodeId, NodeHeartbeat heartbeat,
