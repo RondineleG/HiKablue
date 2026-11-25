@@ -47,21 +47,20 @@ ns_two="hkc${TAG}2"
 ready_one="$TMP/one.ready"
 ready_two="$TMP/two.ready"
 go_one="$TMP/one.go"
-done_one="$TMP/one.done"
+go_two="$TMP/two.go"
 (
     lab_scope_init
     lab_netns_add "$ns_one"
     touch "$ready_one"
     while [ ! -e "$go_one" ]; do sleep 0.02; done
     lab_cleanup_scope
-    touch "$done_one"
 ) &
 p1=$!
 (
     lab_scope_init
     lab_netns_add "$ns_two"
     touch "$ready_two"
-    while [ ! -e "$done_one" ]; do sleep 0.02; done
+    while [ ! -e "$go_two" ]; do sleep 0.02; done
     lab_cleanup_scope
 ) &
 p2=$!
@@ -73,6 +72,7 @@ done
 touch "$go_one"
 wait "$p1"
 lab_netns_exists "$ns_two" || { echo "FAIL: first scope removed concurrent namespace" >&2; exit 1; }
+touch "$go_two"
 wait "$p2"
 ! lab_netns_exists "$ns_one" || { echo "FAIL: concurrent namespace one leaked" >&2; exit 1; }
 ! lab_netns_exists "$ns_two" || { echo "FAIL: concurrent namespace two leaked" >&2; exit 1; }
