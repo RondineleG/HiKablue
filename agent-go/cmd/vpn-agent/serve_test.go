@@ -249,6 +249,9 @@ func TestReconnectDelayResetsOnlyAfterStableStream(t *testing.T) {
 
 func TestServeRejectsCorruptExpiryState(t *testing.T) {
 	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	ca, cert, key := writeTestPKI(t, dir)
 	if err := os.WriteFile(filepath.Join(dir, "expiry.json"), []byte("{"), 0o600); err != nil {
 		t.Fatal(err)

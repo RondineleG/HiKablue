@@ -1,4 +1,3 @@
-using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 
 #nullable disable
@@ -6,8 +5,6 @@ using Microsoft.EntityFrameworkCore.Migrations;
 namespace VpnControl.Data.Migrations
 {
     /// <inheritdoc />
-    [DbContext(typeof(ControlDbContext))]
-    [Migration("20261125001000_session-token-key-removal")]
     public partial class SessionTokenKeyRemoval : Migration
     {
         /// <inheritdoc />

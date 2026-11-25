@@ -94,7 +94,9 @@ pass=$((pass + 1))
 # 5. Process ownership: a privileged process started by this scope is killed;
 # a stale/reused PID without the run marker is left alone.
 lab_scope_init
-lab_as_root sh -c "echo \$\$ >'$TMP/sleep.pid'; exec sleep 60" &
+lab_as_root env PIDFILE="$TMP/sleep.pid" python3 -c \
+    'import os, time; open(os.environ["PIDFILE"], "w").write(str(os.getpid())); time.sleep(60)' \
+    "$TMP" &
 for _ in $(seq 50); do [ -s "$TMP/sleep.pid" ] && break; sleep 0.02; done
 sleep_pid=$(cat "$TMP/sleep.pid")
 lab_register_root_pid "$sleep_pid" "$TMP"
