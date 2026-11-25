@@ -142,23 +142,25 @@ public sealed class NodeChannelService(
 
         // Commands marked sent on a previous stream may have been lost with
         // it (at-least-once). Requeue them only when the backend identity is
-        // unchanged. After a backend restart they belong to a dead data-plane
-        // generation: replaying a Provision/Revoke/SyncState command before the
-        // reset snapshot could reinstall or contradict state that the fresh
-        // backend no longer owns. They become terminal because no fenced ACK
-        // for that generation can ever arrive.
-        var lostAttempts = db.Outbox
-            .Where(o => o.NodeId == nodeId && o.Status == "sent" &&
-                (streamEpoch == null || o.StreamEpoch != streamEpoch));
+        // unchanged. After a backend restart all pre-registration attempts belong to a dead
+        // data-plane generation: replaying a Provision/Revoke/SyncState command
+        // before the reset snapshot could reinstall old keys or contradict state
+        // that the fresh backend no longer owns. They become terminal because no
+        // reset-safe interpretation of those commands exists.
         if (backendRestarted)
         {
-            await lostAttempts.ExecuteUpdateAsync(o => o.SetProperty(r => r.Status, "failed")
-                .SetProperty(r => r.NextRetryAt, (DateTimeOffset?)null), ct);
+            await db.Outbox
+                .Where(o => o.NodeId == nodeId && (o.Status == "sent" || o.Status == "pending"))
+                .ExecuteUpdateAsync(o => o.SetProperty(r => r.Status, "failed")
+                    .SetProperty(r => r.NextRetryAt, (DateTimeOffset?)null), ct);
         }
         else
         {
-            await lostAttempts.ExecuteUpdateAsync(o => o.SetProperty(r => r.Status, "pending")
-                .SetProperty(r => r.NextRetryAt, now), ct);
+            await db.Outbox
+                .Where(o => o.NodeId == nodeId && o.Status == "sent" &&
+                    (streamEpoch == null || o.StreamEpoch != streamEpoch))
+                .ExecuteUpdateAsync(o => o.SetProperty(r => r.Status, "pending")
+                    .SetProperty(r => r.NextRetryAt, now), ct);
         }
 
         await EnqueueSyncStateAsync(nodeId, ct,
