@@ -142,8 +142,11 @@ contract promised:
   `FENCED_STREAM`/`FENCED_BACKEND` fail the row, close the stream and
   enqueue a `SyncState` resync; `REVISION_REGRESSION` and
   `INVALID_PAYLOAD` fail the row. On the first attempt, a deadline
-  rejection fails the row and a retryable error returns it to `pending`
-  with a 250 ms `next_retry_at`. On redelivery, those responses may refer
+  rejection fails an ordinary command and a retryable error returns it to
+  `pending` with a 250 ms `next_retry_at`. A backend-reset `SyncState` is
+  the exception: the rejection proves that attempt was not applied, so the
+  reset returns to `pending` rather than reopening provisioning before
+  confirmation. On redelivery, those responses may refer
   to an older attempt: the ACK does not include an attempt number. The
   row stays `sent` until `APPLIED` or recovery at the current deadline.
 - **`OutboxDispatcherWorker`.** A short `FOR UPDATE SKIP LOCKED`

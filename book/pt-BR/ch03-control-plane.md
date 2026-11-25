@@ -148,9 +148,12 @@ prometia:
   e revoga a sessão); `FENCED_STREAM`/`FENCED_BACKEND` falham a linha,
   fecham o stream e enfileiram um `SyncState` de ressincronização;
   `REVISION_REGRESSION` e `INVALID_PAYLOAD` marcam a linha como falha.
-  Na primeira tentativa, uma rejeição por prazo marca a linha como
-  falha e um erro recuperável volta a `pending` com `next_retry_at`
-  de 250 ms. No reenvio, essas respostas podem ser de uma tentativa
+  Na primeira tentativa, uma rejeição por prazo marca como falha um comando
+  comum e um erro recuperável volta a `pending` com `next_retry_at` de
+  250 ms. Um `SyncState` de reset do backend é a exceção: a rejeição prova
+  que aquela tentativa não foi aplicada, então o reset volta a `pending`
+  em vez de reabrir o provisionamento antes da confirmação. No reenvio,
+  essas respostas podem ser de uma tentativa
   anterior: o ACK não inclui o número da tentativa. A linha continua
   `sent` até um `APPLIED` ou a recuperação no prazo atual.
 - **`OutboxDispatcherWorker`.** Uma transação curta com

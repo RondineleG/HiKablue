@@ -145,9 +145,12 @@ contrato prometía:
   y revoca la sesión); `FENCED_STREAM`/`FENCED_BACKEND` fallan la fila,
   cierran el stream y encolan un `SyncState` de resincronización;
   `REVISION_REGRESSION` e `INVALID_PAYLOAD` marcan la fila como fallida.
-  En el primer intento, un rechazo por plazo marca la fila como fallida
-  y un error recuperable la devuelve a `pending` con un `next_retry_at`
-  de 250 ms. En un reenvío, esas respuestas pueden ser de un intento
+  En el primer intento, un rechazo por plazo marca como fallida un comando
+  ordinario y un error recuperable la devuelve a `pending` con un
+  `next_retry_at` de 250 ms. Un `SyncState` de reset de backend es la
+  excepción: el rechazo prueba que ese intento no se aplicó, así el reset
+  vuelve a `pending` en vez de reabrir el aprovisionamiento antes de la
+  confirmación. En un reenvío, esas respuestas pueden ser de un intento
   anterior: el ACK no indica el número de intento. La fila sigue
   `sent` hasta un `APPLIED` o la recuperación al vencer el plazo actual.
 - **`OutboxDispatcherWorker`.** Una transacción corta con
