@@ -101,6 +101,12 @@ for _ in $(seq 50); do [ -s "$TMP/sleep.pid" ] && break; sleep 0.02; done
 sleep_pid=$(cat "$TMP/sleep.pid")
 lab_register_root_pid "$sleep_pid" "$TMP"
 lab_cleanup_scope
+for _ in $(seq 100); do
+    if ! { [ -r "/proc/$sleep_pid/cmdline" ] && tr '\0' ' ' <"/proc/$sleep_pid/cmdline" | grep -q sleep; }; then
+        break
+    fi
+    sleep 0.01
+done
 if [ -r "/proc/$sleep_pid/cmdline" ] && tr '\0' ' ' <"/proc/$sleep_pid/cmdline" | grep -q sleep; then
     echo "FAIL: owned privileged process survived cleanup" >&2
     exit 1
