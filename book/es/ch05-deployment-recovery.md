@@ -239,7 +239,7 @@ Observado en la VM Ubuntu de desarrollo durante este milestone:
 |---|---|
 | `tests/deploy/install-rollback.test.sh` | PASS — reinstall idempotente, configuración preservada, upgrade v1→v2 y rollback correctos |
 | build real + instalación staging | PASS — la release contenía artefactos Rust, Go y .NET publicado, e instaló en raíz temporal |
-| units systemd empaquetadas en este host Ubuntu | PASS — engine/agent activos, sockets modo `0660` del grupo del agente, `GetMetrics`/`GetSessions` correctos como agente; no sustituye la validación aún pendiente en una VM Debian limpia |
+| units systemd empaquetadas en una VM Debian 12 limpia | PASS — engine/agent activos bajo systemd, sockets modo `0660` del grupo del agente, `GetMetrics`/`GetSessions` correctos como agente |
 | `tests/lab/session-e2e.sh --engine-restart` | PASS — el agente salió al cambiar el backend; el registro fresco reconcilió estado vacío; sesiones viejas quedaron `failed`; leases liberados; claves viejas fallaron; nueva sesión pasó HTTP |
 | reversión de ruta | PASS — `SIGKILL` eliminó `tun0` y la ruta conectada `10.80.1.0/24` |
 | métricas finales registradas | `rx_pkts=5`, `tx_pkts=5`, `dropped_pkts=2`, `peers=1` |
