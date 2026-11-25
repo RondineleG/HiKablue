@@ -1,0 +1,26 @@
+[Unit]
+Description=HiKablue isolated-lab VPN engine
+Documentation=https://github.com/RondineleG/HiKablue
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hikablue-engine
+Group=hikablue-engine
+EnvironmentFile=-/etc/hikablue/engine.env
+ExecStart=/opt/hikablue/current/bin/hikablue-engine-service
+Restart=on-failure
+RestartSec=1s
+RuntimeDirectory=hikablue-engine
+RuntimeDirectoryMode=0755
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+LimitNOFILE=4096
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

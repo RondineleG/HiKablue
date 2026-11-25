@@ -526,10 +526,12 @@ métodos Go↔Rust `AddPeer`/`RemovePeer`/`SyncPeers` en
 `/run/vpn/engine.sock`. El milestone 4 conserva la frontera ya entregada
 —un socket de control separado con `StagePeer`, `Activate`, `Retire`,
 `RevokePeer` y `GetSessions`— porque renombrarla no era necesario para el
-comportamiento de aceptación. La reprovisión tras reiniciar el backend no
-se reivindica: los snapshots llevan referencias, no claves crudas, así un
-backend nuevo no puede reconstruir épocas viejas sin aprovisionamiento
-explícito y fresco.
+comportamiento de aceptación. La reprovisión de la misma sesión tras
+reiniciar el backend no se reivindica: los snapshots llevan referencias,
+no claves crudas, así un backend nuevo no puede reconstruir épocas viejas.
+El milestone 5 invalida las sesiones anteriores al reinicio tras una
+reconciliación de estado vacío confirmada y exige una sesión API nueva con
+claves frescas.
 
 ### Resultado observado del plano de control
 
@@ -573,3 +575,4 @@ reactivó.
   protegidos; el laboratorio gana ownership de recursos por ejecución y
   el escenario `--expire-restart` que prueba la expiración local a través
   de un reinicio del agente.
+- `r6` — semántica del reinicio del backend refinada en el milestone 5: las sesiones viejas quedan fuera del primer snapshot del backend nuevo, pasan a `failed` solo tras aplicación confirmada y exigen una nueva sesión API.

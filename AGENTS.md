@@ -39,5 +39,14 @@ Name branches `feat/<slug>` for additive work and `fix/<slug>` for bug fixes. Us
   C# control plane issues epoch-1 directional key material, keeps leases
   reserved through `revoking`, and releases them only on fenced removal
   ACKs. `tests/checks.sh --lab` includes the isolated two-client HTTP
-  laboratory in normal-revocation and gRPC-interruption modes. Do not
-  advance milestones 5–6.
+  laboratory in normal-revocation, gRPC-interruption, local-expiry, and
+  backend-restart recovery modes.
+- **Milestone 5 (deployment and recovery) implemented in the lab.**
+  Debian release construction, idempotent installation, binary upgrade and
+  rollback live under `deploy/debian/` with an offline acceptance test.
+  The exit-engine restart path changes `backend_instance_id`, causes the
+  agent to exit for supervised restart, invalidates pre-restart sessions
+  only after confirmed empty-state reconciliation, releases leases, and
+  requires a fresh session. Transient client TUN interfaces and their
+  connected routes are proven to disappear after `SIGKILL`. Do not advance
+  milestone 6.

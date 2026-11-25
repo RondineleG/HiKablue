@@ -148,14 +148,24 @@ are preserved rather than renumbered:
   retiring the HTTP heartbeat and the cross-process gRPC lab remain
   explicitly deferred to milestone 4; the full milestone-3 demonstration
   is not yet an observed end-to-end result.
-- **4 · End-to-end session — in progress.** Phase 2 crypto shipped in
-  [PR #14](https://github.com/RondineleG/HiKablue/pull/14): AEAD framing,
-  directional keys, atomic replay acceptance, nonce-exhaustion latch and
-  symmetric inner-VIP checks in lab `--key` mode. CLI, dynamic peers,
-  restart-safe key lifecycle, local expiration and reconciliation remain.
-- **5–6 — pending.** Deployment/recovery and WireGuard follow the
-  end-to-end session work. Full tunneling and the HTTP check still depend
-  on the deferred forwarding/NAT work above.
+- **4 · End-to-end session — delivered and validated locally.** The merged
+  milestone-4 correction restored the full `tests/checks.sh --lab` gate:
+  two-client HTTP connectivity, revocation without interrupting the other
+  client, reconciliation after gRPC loss, and local expiry across an agent
+  restart all passed in the isolated laboratory.
+- **5 · Deployment and recovery — implemented locally.** Debian release
+  construction, idempotent installation, binary upgrade and rollback are
+  covered offline. Backend restart recovery is covered end to end: the
+  agent exits when the engine returns a fresh `backend_instance_id`, the
+  control plane invalidates pre-restart sessions only after confirmed
+  empty-state reconciliation, leases are released, stale keys cannot pass
+  traffic, and a fresh session restores HTTP connectivity. Client TUN and
+  connected-route rollback after `SIGKILL` are observed. Automatic rekey of
+  the same session, full-tunnel rollback, PostgreSQL backup/rollback, real
+  secret provisioning, and production-network validation remain explicit
+  deferrals.
+- **6 — pending.** WireGuard follows deployment/recovery. Full tunneling
+  and the HTTP check still depend on the deferred forwarding/NAT work above.
 
 ### First implementation session
 

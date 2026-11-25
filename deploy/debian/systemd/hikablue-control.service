@@ -1,0 +1,22 @@
+[Unit]
+Description=HiKablue control plane
+Documentation=https://github.com/RondineleG/HiKablue
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hikablue-control
+Group=hikablue-control
+EnvironmentFile=-/etc/hikablue/control.env
+ExecStart=/opt/hikablue/current/bin/hikablue-control-service
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=8192
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

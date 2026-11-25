@@ -510,9 +510,11 @@ Contract note: the specification table still calls the Go↔Rust methods
 keeps the already delivered boundary instead — a separate control socket
 with `StagePeer`, `Activate`, `Retire`, `RevokePeer`, and `GetSessions` —
 because renaming it was not needed for the acceptance behavior. Backend
-restart reprovisioning is deliberately not claimed: snapshots carry key
-references, not raw keys, so a new backend cannot reconstruct old epochs
-without fresh explicit provisioning.
+restart reprovisioning of the same session is deliberately not claimed:
+snapshots carry key references, not raw keys, so a new backend cannot
+reconstruct old epochs. Milestone 5 instead invalidates pre-restart
+sessions after confirmed empty-state reconciliation and requires a fresh
+API session with fresh keys.
 
 ### Observed control-plane result
 
@@ -554,3 +556,4 @@ become 0. A was not reactivated.
   the laboratory gains run-scoped resource ownership and the
   `--expire-restart` scenario proving local expiry across an agent
   restart.
+- `r6` — backend restart semantics refined in milestone 5: old sessions are excluded from the first fresh-backend snapshot, become `failed` only after confirmed application, and require a fresh API session.

@@ -1,0 +1,14 @@
+#!/bin/sh
+# hikablue-control-service — start the ASP.NET control plane.
+set -eu
+
+if command -v dotnet >/dev/null 2>&1; then
+    dotnet_bin=$(command -v dotnet)
+elif [ -x /usr/share/dotnet/dotnet ]; then
+    dotnet_bin=/usr/share/dotnet/dotnet
+else
+    echo "dotnet runtime not found" >&2
+    exit 1
+fi
+
+exec "$dotnet_bin" /opt/hikablue/current/control/VpnControl.dll

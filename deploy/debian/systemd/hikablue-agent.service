@@ -1,0 +1,25 @@
+[Unit]
+Description=HiKablue node orchestration agent
+Documentation=https://github.com/RondineleG/HiKablue
+After=hikablue-engine.service network-online.target
+Requires=hikablue-engine.service
+PartOf=hikablue-engine.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hikablue-agent
+Group=hikablue-agent
+EnvironmentFile=-/etc/hikablue/agent.env
+ExecStart=/opt/hikablue/current/bin/hikablue-agent-service
+Restart=always
+RestartSec=1s
+LimitNOFILE=4096
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/hikablue/agent-state
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -520,9 +520,11 @@ Go↔Rust `AddPeer`/`RemovePeer`/`SyncPeers` em `/run/vpn/engine.sock`. O
 Marco 4 preserva a fronteira já entregue — um socket de controle separado
 com `StagePeer`, `Activate`, `Retire`, `RevokePeer` e `GetSessions` —
 porque renomeá-la não era necessário para o comportamento de aceite. O
-reprovisionamento após reinício do backend não é reivindicado: snapshots
-levam referências de chave, não chaves cruas, então um backend novo não
-consegue reconstruir épocas antigas sem provisionamento explícito e novo.
+reprovisionamento da mesma sessão após reinício do backend não é
+reivindicado: snapshots levam referências de chave, não chaves cruas,
+então um backend novo não consegue reconstruir épocas antigas. O Marco 5
+invalida as sessões anteriores ao reinício depois da reconciliação
+confirmada de estado vazio e exige uma nova sessão de API com chaves novas.
 
 ### Resultado observado do plano de controle
 
@@ -564,3 +566,4 @@ a sessão ficou `revoked` e o lease chegou a zero. A não foi reativada.
   `--tx-key-file`/`--rx-key-file` protegidos; o laboratório ganha
   ownership de recursos por execução e o cenário `--expire-restart` que
   prova a expiração local através de um reinício do agente.
+- `r6` — semântica do reinício do backend refinada no Marco 5: sessões antigas ficam fora do primeiro snapshot do backend novo, viram `failed` só após aplicação confirmada e exigem nova sessão de API.
