@@ -257,6 +257,9 @@ corpo exato `hikablue-m4-ok` através da sessão posterior ao reinício.
   rollback de arquivos atômicos.
 - **`SIGKILL`** — sinal Unix que não pode ser capturado; testa se a limpeza
   depende de desligamento cuidadoso ou de ownership do kernel.
+- **`--tun-name`** — flag do engine que seleciona o nome da interface TUN.
+- **`--mtu`** — flag do engine que seleciona a MTU da interface do túnel.
+- **`--metrics-group`** — flag do engine que escolhe o grupo local autorizado a ler telemetria.
 - **`GetSessions`** — operação de controle do engine que informa o ID do backend e referências vivas de peers/chaves.
 - **`SO_PEERCRED`** — checagem de credenciais de socket Unix usada para identificar o processo local par.
 - **`SyncState`** — comando snapshot do plano de controle com o conjunto desejado de peers e metadados de validação.

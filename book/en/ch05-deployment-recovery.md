@@ -266,6 +266,9 @@ post-restart session.
   and rollback atomic at the filesystem level.
 - **`SIGKILL`** — uncatchable Unix termination signal; a good test of whether
   cleanup depends on careful shutdown or kernel ownership.
+- **`--tun-name`** — engine flag selecting the TUN interface name.
+- **`--mtu`** — engine flag selecting the tunnel interface maximum transmission unit.
+- **`--metrics-group`** — engine flag choosing the local group allowed to read telemetry.
 - **`GetSessions`** — engine control operation that reports the backend ID and live peer/key references.
 - **`SO_PEERCRED`** — Unix-socket credential check used to identify the local peer process.
 - **`SyncState`** — control-plane snapshot command carrying the desired peer set plus validation metadata.
