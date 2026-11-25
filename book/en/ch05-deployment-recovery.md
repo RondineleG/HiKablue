@@ -243,6 +243,7 @@ Observed on the Ubuntu development VM during this milestone implementation:
 |---|---|
 | `tests/deploy/install-rollback.test.sh` | PASS — reinstall idempotent, config preserved, v1→v2 upgrade and rollback correct |
 | real release build + staged install | PASS — release tree contained the Rust, Go, and published .NET artifacts and installed into a temporary root |
+| packaged systemd units on this Ubuntu host | PASS — engine/agent active, mode-0660 agent-group sockets, successful agent `GetMetrics`/`GetSessions`; this is not the still-missing clean Debian VM validation |
 | `tests/lab/session-e2e.sh --engine-restart` | PASS — agent exited on backend ID change; fresh registration reconciled empty state; pre-restart sessions became `failed`; leases released; old keys failed; fresh session passed HTTP |
 | route rollback in that scenario | PASS — `SIGKILL` removed client `tun0` and the connected `10.80.1.0/24` route |
 | final server metrics in the recorded restart run | `rx_pkts=5`, `tx_pkts=5`, `dropped_pkts=2`, `peers=1` |
