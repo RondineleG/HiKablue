@@ -47,32 +47,41 @@ ns_two="hkc${TAG}2"
 ready_one="$TMP/one.ready"
 ready_two="$TMP/two.ready"
 go_one="$TMP/one.go"
-done_one="$TMP/one.done"
+go_two="$TMP/two.go"
 (
     lab_scope_init
     lab_netns_add "$ns_one"
     touch "$ready_one"
     while [ ! -e "$go_one" ]; do sleep 0.02; done
     lab_cleanup_scope
-    touch "$done_one"
 ) &
 p1=$!
 (
     lab_scope_init
     lab_netns_add "$ns_two"
     touch "$ready_two"
-    while [ ! -e "$done_one" ]; do sleep 0.02; done
+    while [ ! -e "$go_two" ]; do sleep 0.02; done
     lab_cleanup_scope
 ) &
 p2=$!
+release_scope_workers() {
+    touch "$go_one" "$go_two" 2>/dev/null || true
+    wait "$p1" 2>/dev/null || true
+    wait "$p2" 2>/dev/null || true
+}
 for _ in $(seq 200); do
     [ -e "$ready_one" ] && [ -e "$ready_two" ] && break
     sleep 0.02
 done
-[ -e "$ready_one" ] && [ -e "$ready_two" ] || { echo "FAIL: concurrent scopes did not start" >&2; exit 1; }
+[ -e "$ready_one" ] && [ -e "$ready_two" ] || { release_scope_workers; echo "FAIL: concurrent scopes did not start" >&2; exit 1; }
 touch "$go_one"
 wait "$p1"
-lab_netns_exists "$ns_two" || { echo "FAIL: first scope removed concurrent namespace" >&2; exit 1; }
+if ! lab_netns_exists "$ns_two"; then
+    release_scope_workers
+    echo "FAIL: first scope removed concurrent namespace" >&2
+    exit 1
+fi
+touch "$go_two"
 wait "$p2"
 ! lab_netns_exists "$ns_one" || { echo "FAIL: concurrent namespace one leaked" >&2; exit 1; }
 ! lab_netns_exists "$ns_two" || { echo "FAIL: concurrent namespace two leaked" >&2; exit 1; }
@@ -94,11 +103,19 @@ pass=$((pass + 1))
 # 5. Process ownership: a privileged process started by this scope is killed;
 # a stale/reused PID without the run marker is left alone.
 lab_scope_init
-lab_as_root sh -c "echo \$\$ >'$TMP/sleep.pid'; exec sleep 60" &
+lab_as_root env PIDFILE="$TMP/sleep.pid" python3 -c \
+    'import os, time; open(os.environ["PIDFILE"], "w").write(str(os.getpid())); time.sleep(60)' \
+    "$TMP" &
 for _ in $(seq 50); do [ -s "$TMP/sleep.pid" ] && break; sleep 0.02; done
 sleep_pid=$(cat "$TMP/sleep.pid")
 lab_register_root_pid "$sleep_pid" "$TMP"
 lab_cleanup_scope
+for _ in $(seq 100); do
+    if ! { [ -r "/proc/$sleep_pid/cmdline" ] && tr '\0' ' ' <"/proc/$sleep_pid/cmdline" | grep -q sleep; }; then
+        break
+    fi
+    sleep 0.01
+done
 if [ -r "/proc/$sleep_pid/cmdline" ] && tr '\0' ' ' <"/proc/$sleep_pid/cmdline" | grep -q sleep; then
     echo "FAIL: owned privileged process survived cleanup" >&2
     exit 1

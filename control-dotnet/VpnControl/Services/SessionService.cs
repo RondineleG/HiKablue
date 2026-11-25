@@ -85,6 +85,7 @@ public sealed class SessionService(
         {
             var tracked = await db.Sessions.FirstAsync(s => s.SessionId == row.SessionId, ct);
             tracked.SessionTokenHash = hash;
+            db.Entry(tracked).Property(s => s.SessionTokenHash).IsModified = true;
             tracked.UpdatedAt = DateTimeOffset.UtcNow;
             await db.SaveChangesAsync(ct);
             row.SessionTokenHash = hash;
