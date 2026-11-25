@@ -44,7 +44,7 @@ The required floor is 90% line/statement coverage per component. All three compo
 
 ## Milestone 4 two-client laboratory
 
-All three scenarios passed end to end at the validated SHA. In each scenario, both clients first received distinct virtual IPs and the expected HTTP body `hikablue-m4-ok` through the tunnel; the direct path to the service was confirmed inaccessible before tunnel setup.
+All three scenarios passed end to end at the validated SHA. In each scenario, both clients first received distinct virtual IPs and the expected HTTP body `hikablue-m4-ok` through the tunnel. The pre-tunnel direct-path probe covered client A; client B's direct path was not separately probed.
 
 | Scenario | Result | Observed acceptance behavior |
 |---|---|---|
@@ -68,4 +68,4 @@ The initial VM lacked `/usr/lib/postgresql/*/bin/initdb`. PostgreSQL was install
 
 ## Remaining unvalidated scope
 
-No Milestone 4 gate check remained skipped or failing at the validated SHA. This report does not validate Milestones 5–6, production routing, deployment automation, non-lab traffic, or external network reachability.
+No Milestone 4 gate check remained skipped or failing at the validated SHA. Client B's pre-tunnel direct-path isolation was not separately probed. This report does not validate Milestones 5–6, production routing, deployment automation, non-lab traffic, or external network reachability.
