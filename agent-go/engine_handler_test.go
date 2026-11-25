@@ -621,3 +621,97 @@ func TestControlCallResponseValidation(t *testing.T) {
 		t.Fatal("malformed result accepted")
 	}
 }
+
+func TestPeerOperationsKeepExpiryOnSocketFailure(t *testing.T) {
+	path, ops := controlServerWithHook(t, ControlSessions{}, func(string) bool { return false })
+	h := NewEngineHandler(path, "unused")
+	h.ExpiryStatePath = filepath.Join(t.TempDir(), "expiry.json")
+	peer := testProvision(7, 1)
+	peer.Peer.ExpiresAt = timestamppb.New(time.Now().Add(-time.Second))
+	ctx := context.Background()
+
+	if err := h.ProvisionPeer(ctx, peer); err == nil || !strings.Contains(err.Error(), "stage peer 7") {
+		t.Fatalf("expected staging error, got %v", err)
+	}
+	if err := h.RevokePeer(ctx, &edgev1.RevokePeer{LabSessionId: 7}); err == nil || !strings.Contains(err.Error(), "revoke peer 7") {
+		t.Fatalf("expected revocation error, got %v", err)
+	}
+	h.ExpireDuePeers(ctx)
+	if got := ops(); len(got) != 3 || got[2].Op != "RevokePeer" {
+		t.Fatalf("expiry should retry the failed removal, got %+v", got)
+	}
+	restarted := NewEngineHandler(path, "unused")
+	restarted.ExpiryStatePath = h.ExpiryStatePath
+	if err := restarted.LoadExpiryState(); err != nil {
+		t.Fatal(err)
+	}
+	if got := restarted.expires[7]; !got.Equal(peer.Peer.ExpiresAt.AsTime()) {
+		t.Fatalf("deadline lost after socket failure: %v", got)
+	}
+}
+
+func TestSyncStateRejectsMalformedSnapshotWithoutContactingEngine(t *testing.T) {
+	peer := testPeer(7, 1)
+	_, badCount := snapshotBytes(t, peer)
+	badCount.DeclaredPeerCount++
+	_, invalidPeer := snapshotBytes(t, &edgev1.Peer{})
+	raw := []byte{0xff}
+	digest := sha256.Sum256(raw)
+	path, ops := controlServer(t, ControlSessions{})
+	h := NewEngineHandler(path, "unused")
+	for _, tc := range []struct {
+		snapshot *edgev1.PeerSnapshot
+		want     string
+	}{
+		{badCount, "declared_peer_count"},
+		{invalidPeer, "invalid snapshot peer"},
+		{&edgev1.PeerSnapshot{SerializedLength: 1, PeerList: raw, Sha256Digest: digest[:]}, "decode snapshot"},
+	} {
+		if err := h.SyncState(context.Background(), &edgev1.SyncState{Snapshot: tc.snapshot, Force: true}); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("expected %q, got %v", tc.want, err)
+		}
+	}
+	if got := ops(); len(got) != 0 {
+		t.Fatalf("invalid snapshots should be rejected locally, got %+v", got)
+	}
+}
+
+func TestSyncStateReportsEngineAndPersistenceFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		peers []*edgev1.Peer
+		drop  string
+		want  string
+	}{
+		{name: "read backend", drop: "GetSessions", want: "read control frame length"},
+		{name: "save desired deadline", peers: []*edgev1.Peer{testPeer(7, 1)}, want: "persist snapshot peer 7 expiration"},
+		{name: "remove extra peer", drop: "RevokePeer", want: "remove extra peer 7"},
+		{name: "save extra peer removal", want: "persist extra peer 7 expiration removal"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			drop := tc.drop
+			path, _ := controlServerWithHook(t, ControlSessions{
+				Peers: []ControlPeer{{LabSessionID: 7}},
+			}, func(op string) bool { return op != drop })
+			h := NewEngineHandler(path, "unused")
+			h.ExpiryStatePath = filepath.Join(t.TempDir(), "missing", "expiry.json")
+			_, snap := snapshotBytes(t, tc.peers...)
+			err := h.SyncState(context.Background(), &edgev1.SyncState{Snapshot: snap, Force: true})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestPrepareExpiryStateDirRejectsEmptyAndFilePaths(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range []string{"", path} {
+		if _, err := PrepareExpiryStateDir(invalid); err == nil {
+			t.Errorf("invalid state directory accepted: %q", invalid)
+		}
+	}
+}
