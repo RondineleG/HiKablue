@@ -221,7 +221,7 @@ Observed on the Ubuntu development VM during this milestone implementation:
 | real release build + staged install | PASS — release tree contained the Rust, Go, and published .NET artifacts and installed into a temporary root |
 | `tests/lab/session-e2e.sh --engine-restart` | PASS — agent exited on backend ID change; fresh registration reconciled empty state; pre-restart sessions became `failed`; leases released; old keys failed; fresh session passed HTTP |
 | route rollback in that scenario | PASS — `SIGKILL` removed client `tun0` and the connected `10.80.1.0/24` route |
-| final server metrics in the recorded restart run | `rx_pkts=5`, `tx_pkts=5`, `dropped_pkts=3`, `peers=1` |
+| final server metrics in the recorded restart run | `rx_pkts=5`, `tx_pkts=5`, `dropped_pkts=2`, `peers=1` |
 
 Compilation, packet forwarding, and application connectivity are separate:
 the release build compiled, packets were dropped/forwarded by the engine,

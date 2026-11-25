@@ -215,7 +215,7 @@ marco:
 | build real + instalação em staging | PASS — a release continha artefatos Rust, Go e .NET publicado e instalou numa raiz temporária |
 | `tests/lab/session-e2e.sh --engine-restart` | PASS — o agente saiu ao trocar o backend; o registro novo reconciliou estado vazio; sessões antigas ficaram `failed`; leases foram liberados; chaves antigas falharam; nova sessão passou HTTP |
 | reversão de rota | PASS — `SIGKILL` removeu `tun0` e a rota conectada `10.80.1.0/24` |
-| métricas finais registradas | `rx_pkts=5`, `tx_pkts=5`, `dropped_pkts=3`, `peers=1` |
+| métricas finais registradas | `rx_pkts=5`, `tx_pkts=5`, `dropped_pkts=2`, `peers=1` |
 
 Compilação, forwarding e conectividade são eventos separados: a release
 compilou, o engine descartou/encaminhou pacotes e a verificação HTTP foi o

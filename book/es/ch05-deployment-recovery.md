@@ -217,7 +217,7 @@ Observado en la VM Ubuntu de desarrollo durante este milestone:
 | build real + instalación staging | PASS — la release contenía artefactos Rust, Go y .NET publicado, e instaló en raíz temporal |
 | `tests/lab/session-e2e.sh --engine-restart` | PASS — el agente salió al cambiar el backend; el registro fresco reconcilió estado vacío; sesiones viejas quedaron `failed`; leases liberados; claves viejas fallaron; nueva sesión pasó HTTP |
 | reversión de ruta | PASS — `SIGKILL` eliminó `tun0` y la ruta conectada `10.80.1.0/24` |
-| métricas finales registradas | `rx_pkts=5`, `tx_pkts=5`, `dropped_pkts=3`, `peers=1` |
+| métricas finales registradas | `rx_pkts=5`, `tx_pkts=5`, `dropped_pkts=2`, `peers=1` |
 
 Compilación, forwarding y conectividad son eventos separados: la release
 compiló, el motor descartó/reenvió paquetes y la comprobación HTTP fue el
