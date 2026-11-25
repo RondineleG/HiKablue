@@ -498,10 +498,22 @@ O agente também aplica expiração localmente. Se o plano de controle estiver
 fora quando `expires_at` passar, o nó revoga no engine; a convergência
 chega depois por reenvio e `SyncState`. Os prazos são persistidos em um
 `expiry.json` somente do dono dentro de um diretório de estado privado do
-agente e recarregados antes da abertura do canal; um prazo vencido enquanto
-apenas o agente estava fora é aplicado imediatamente na reinicialização.
+agente e recarregados antes da abertura do canal. A primeira verificação
+após a reinicialização pode revogar um peer cujo prazo venceu enquanto o
+agente estava fora. `ProvisionPeer` grava o prazo antes de `StagePeer`, que
+já habilita a recepção de tráfego. O agente conserva o prazo mesmo se perder
+a resposta do engine. O agente usa o mesmo mutex para aplicar mudanças e
+revogar peers expirados. Assim, o loop de expiração pode verificar e revogar
+sem que outra sessão seja provisionada com o mesmo ID de laboratório
+entre essas duas operações.
+
 O snapshot valida contagem declarada, comprimento e SHA-256 antes de mutar, e a guarda de remoção impede
 que um snapshot vazio ou massivo sem force limpe o backend.
+
+Na raiz do repositório, execute `(cd agent-go && go test -race ./...)`
+para verificar a persistência do prazo se a resposta do engine se perder,
+a reutilização do ID de um peer, a validação de snapshots e a inicialização
+com estado de expiração corrompido. Esses testes usam sockets Unix locais.
 
 Nota de contrato: a tabela da especificação ainda nomeia os métodos
 Go↔Rust `AddPeer`/`RemovePeer`/`SyncPeers` em `/run/vpn/engine.sock`. O

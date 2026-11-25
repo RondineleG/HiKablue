@@ -26,6 +26,7 @@ type EngineHandler struct {
 	MetricsSock     string
 	ExpiryStatePath string
 
+	// mu serializes peer operations with deadline updates, including local expiry.
 	mu      sync.Mutex
 	expires map[uint32]time.Time
 }
@@ -128,11 +129,11 @@ func persistExpiryFile(path string, peers map[uint32]time.Time) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	file, err := os.CreateTemp(filepath.Dir(path), ".expiry-*.tmp")
 	if err != nil {
 		return fmt.Errorf("write expiry state: %w", err)
 	}
+	tmp := file.Name()
 	if _, err := file.Write(raw); err != nil {
 		_ = file.Close()
 		_ = os.Remove(tmp)
@@ -147,21 +148,24 @@ func persistExpiryFile(path string, peers map[uint32]time.Time) error {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("close expiry state: %w", err)
 	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("open expiry state directory: %w", err)
+	}
+	defer dir.Close()
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("replace expiry state: %w", err)
 	}
-	_ = os.Chmod(path, 0o600)
-	if dir, err := os.Open(filepath.Dir(path)); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("sync expiry state directory: %w", err)
 	}
 	return nil
 }
 
+// rememberExpiry and forgetExpiry require mu to be held.
 func (h *EngineHandler) rememberExpiry(lab uint32, expires time.Time) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	next := make(map[uint32]time.Time, len(h.expires)+1)
 	for id, deadline := range h.expires {
 		next[id] = deadline
@@ -175,8 +179,6 @@ func (h *EngineHandler) rememberExpiry(lab uint32, expires time.Time) error {
 }
 
 func (h *EngineHandler) forgetExpiry(lab uint32) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	next := make(map[uint32]time.Time, len(h.expires))
 	for id, deadline := range h.expires {
 		if id != lab {
@@ -249,19 +251,19 @@ func (h *EngineHandler) ProvisionPeer(ctx context.Context, p *edgev1.ProvisionPe
 		"egress_key":     hex.EncodeToString(km.EgressKey),
 		"ingress_key":    hex.EncodeToString(km.IngressKey),
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// StagePeer already enables ingress. Persist first and keep the
+	// deadline even if a socket response is lost after applying a command.
+	if err := h.rememberExpiry(lab, p.Peer.ExpiresAt.AsTime()); err != nil {
+		return fmt.Errorf("persist peer %d expiration: %w", lab, err)
+	}
 	if err := h.Control.Call(ctx, "StagePeer", stage, nil); err != nil {
 		return fmt.Errorf("stage peer %d: %w", lab, err)
 	}
 	activate := map[string]any{"lab_session_id": lab, "key_epoch": km.KeyEpoch}
 	if err := h.Control.Call(ctx, "Activate", activate, nil); err != nil {
 		return fmt.Errorf("activate peer %d epoch %d: %w", lab, km.KeyEpoch, err)
-	}
-	if err := h.rememberExpiry(lab, p.Peer.ExpiresAt.AsTime()); err != nil {
-		// A peer that cannot persist its deadline must not remain active
-		// without a local expiry path. Best-effort revoke is the safest
-		// compensation; the command still fails so dispatch can retry.
-		_ = h.Control.Call(ctx, "RevokePeer", map[string]any{"lab_session_id": lab}, nil)
-		return fmt.Errorf("persist peer %d expiration: %w", lab, err)
 	}
 	return nil
 }
@@ -270,6 +272,8 @@ func (h *EngineHandler) RevokePeer(ctx context.Context, p *edgev1.RevokePeer) er
 	if p == nil || p.LabSessionId == 0 {
 		return fmt.Errorf("revoke requires nonzero lab_session_id")
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	payload := map[string]any{"lab_session_id": p.LabSessionId}
 	if err := h.Control.Call(ctx, "RevokePeer", payload, nil); err != nil {
 		return fmt.Errorf("revoke peer %d: %w", p.LabSessionId, err)
@@ -315,6 +319,8 @@ func (h *EngineHandler) SyncState(ctx context.Context, p *edgev1.SyncState) erro
 		desired[peer.LabSessionId] = true
 	}
 
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	current, err := h.Control.Sessions(ctx)
 	if err != nil {
 		return err
@@ -379,15 +385,13 @@ func (h *EngineHandler) EngineHealthy() bool {
 // guarantees the data plane stops passing traffic at the deadline.
 func (h *EngineHandler) ExpireDuePeers(ctx context.Context) {
 	h.mu.Lock()
-	due := make([]uint32, 0)
+	defer h.mu.Unlock()
+
 	now := time.Now()
 	for lab, expires := range h.expires {
-		if !now.Before(expires) {
-			due = append(due, lab)
+		if now.Before(expires) {
+			continue
 		}
-	}
-	h.mu.Unlock()
-	for _, lab := range due {
 		if err := h.Control.Call(ctx, "RevokePeer", map[string]any{"lab_session_id": lab}, nil); err == nil {
 			_ = h.forgetExpiry(lab)
 		}

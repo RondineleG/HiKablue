@@ -502,11 +502,24 @@ El agente también aplica expiración localmente. Si el control plane está
 fuera cuando vence `expires_at`, el nodo revoca en el motor; la convergencia
 llega después por reenvío y `SyncState`. Los vencimientos se persisten en
 un `expiry.json` solo del propietario dentro de un directorio de estado
-privado del agente y se recargan antes de abrir el canal; un vencimiento
-cumplido mientras solo el agente estaba caído se aplica inmediatamente al
-reiniciar. El snapshot valida cuenta
+privado del agente y se recargan antes de abrir el canal. La primera
+comprobación tras el reinicio puede revocar un peer cuyo plazo venció
+mientras el agente estaba caído. `ProvisionPeer` guarda el plazo antes de
+`StagePeer`, que ya habilita el tráfico entrante. El agente conserva el
+plazo aunque se pierda la respuesta del motor. El agente usa el mismo mutex
+para aplicar cambios y revocar peers vencidos. Así, el bucle de expiración
+puede comprobar y revocar sin que se intercale el aprovisionamiento de otra
+sesión que reutilice el mismo ID de laboratorio.
+
+El snapshot valida cuenta
 declarada, longitud y SHA-256 antes de mutar, y la guardia de borrado impide
 que un snapshot vacío o masivo no forzado limpie el backend.
+
+Desde la raíz del repositorio, ejecuta `(cd agent-go && go test -race ./...)`
+para verificar la persistencia del plazo si se pierde la respuesta del
+motor, la reutilización del ID de un peer, la validación de snapshots y el
+arranque con un estado de expiración dañado. Estas pruebas usan sockets
+Unix locales.
 
 Nota de contrato: la tabla de la especificación todavía nombra los
 métodos Go↔Rust `AddPeer`/`RemovePeer`/`SyncPeers` en

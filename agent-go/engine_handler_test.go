@@ -26,6 +26,11 @@ type recordedOp struct {
 
 func controlServer(t *testing.T, sessions ControlSessions) (string, func() []recordedOp) {
 	t.Helper()
+	return controlServerWithHook(t, sessions, nil)
+}
+
+func controlServerWithHook(t *testing.T, sessions ControlSessions, respond func(string) bool) (string, func() []recordedOp) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "control.sock")
 	l, err := net.Listen("unix", path)
 	if err != nil {
@@ -61,6 +66,9 @@ func controlServer(t *testing.T, sessions ControlSessions) (string, func() []rec
 				mu.Lock()
 				ops = append(ops, recordedOp{Op: req.Op, Payload: payload})
 				mu.Unlock()
+				if respond != nil && !respond(req.Op) {
+					return
+				}
 				result := map[string]any{}
 				if req.Op == "GetSessions" {
 					out, _ := json.Marshal(sessions)
@@ -306,7 +314,10 @@ func TestPrepareExpiryStateDirValidatesPrivateWritableDirectory(t *testing.T) {
 		t.Fatalf("state dir mode %v", info.Mode().Perm())
 	}
 	shared := filepath.Join(t.TempDir(), "shared")
-	if err := os.Mkdir(shared, 0o755); err != nil {
+	if err := os.Mkdir(shared, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := PrepareExpiryStateDir(shared); err == nil {
@@ -341,7 +352,10 @@ func TestExpiryStateValidationAndPersistenceFailures(t *testing.T) {
 	if err := disabled.LoadExpiryState(); err != nil {
 		t.Fatal(err)
 	}
-	if err := disabled.rememberExpiry(7, time.Now()); err != nil {
+	disabled.mu.Lock()
+	err := disabled.rememberExpiry(7, time.Now())
+	disabled.mu.Unlock()
+	if err != nil {
 		t.Fatal(err)
 	}
 
@@ -373,11 +387,14 @@ func TestExpiryStateValidationAndPersistenceFailures(t *testing.T) {
 }
 
 func TestProvisionAndRevokeReportExpiryPersistenceFailures(t *testing.T) {
-	path, _ := controlServer(t, ControlSessions{})
+	path, ops := controlServer(t, ControlSessions{})
 	h := NewEngineHandler(path, "missing")
 	h.ExpiryStatePath = filepath.Join(t.TempDir(), "missing", "expiry.json")
 	if err := h.ProvisionPeer(context.Background(), testProvision(8, 1)); err == nil {
 		t.Fatal("provision with unwritable expiry state accepted")
+	}
+	if got := ops(); len(got) != 0 {
+		t.Fatalf("failed write must leave the engine untouched, got %+v", got)
 	}
 
 	h.ExpiryStatePath = filepath.Join(t.TempDir(), "expiry.json")
@@ -393,6 +410,59 @@ func TestProvisionAndRevokeReportExpiryPersistenceFailures(t *testing.T) {
 	h.mu.Unlock()
 	if !stillTracked {
 		t.Fatal("failed expiry-state delete dropped the in-memory deadline")
+	}
+}
+
+func TestProvisionPersistsDeadlineBeforeStaging(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "expiry.json")
+	provision := testProvision(8, 1)
+	deadline := provision.Peer.ExpiresAt.AsTime()
+	path, _ := controlServerWithHook(t, ControlSessions{}, func(op string) bool {
+		if op != "StagePeer" && op != "Activate" {
+			return true
+		}
+		restarted := NewEngineHandler("unused", "unused")
+		restarted.ExpiryStatePath = statePath
+		if err := restarted.LoadExpiryState(); err != nil {
+			t.Error(err)
+		} else if got := restarted.expires[8]; !got.Equal(deadline) {
+			t.Errorf("deadline at %s = %v, want %v", op, got, deadline)
+		}
+		return op != "Activate" // The engine may have applied Activate before disconnecting.
+	})
+	h := NewEngineHandler(path, "unused")
+	h.ExpiryStatePath = statePath
+	if err := h.ProvisionPeer(context.Background(), provision); err == nil {
+		t.Fatal("lost activation response accepted")
+	}
+	if got := h.expires[8]; !got.Equal(deadline) {
+		t.Fatalf("deadline after lost response = %v, want %v", got, deadline)
+	}
+}
+
+func TestExpirySerializesRevocationWithPeerReplacement(t *testing.T) {
+	h := NewEngineHandler("unused", "unused")
+	path, ops := controlServerWithHook(t, ControlSessions{}, func(op string) bool {
+		if op == "RevokePeer" && h.mu.TryLock() {
+			h.mu.Unlock()
+			t.Error("peer operations can interleave with the expiration revoke")
+		}
+		return true
+	})
+	h.Control.SocketPath = path
+	h.expires[8] = time.Now().Add(-time.Second)
+	h.ExpireDuePeers(context.Background())
+
+	replacement := testProvision(8, 2)
+	if err := h.ProvisionPeer(context.Background(), replacement); err != nil {
+		t.Fatal(err)
+	}
+	h.ExpireDuePeers(context.Background())
+	if got := ops(); len(got) != 3 || got[0].Op != "RevokePeer" || got[2].Op != "Activate" {
+		t.Fatalf("replacement should stay active after expiry: %+v", got)
+	}
+	if got := h.expires[8]; !got.Equal(replacement.Peer.ExpiresAt.AsTime()) {
+		t.Fatalf("replacement deadline was lost: %v", got)
 	}
 }
 
@@ -549,5 +619,99 @@ func TestControlCallResponseValidation(t *testing.T) {
 	var sessions ControlSessions
 	if err := c.Call(ctx, "GetSessions", nil, &sessions); err == nil {
 		t.Fatal("malformed result accepted")
+	}
+}
+
+func TestPeerOperationsKeepExpiryOnSocketFailure(t *testing.T) {
+	path, ops := controlServerWithHook(t, ControlSessions{}, func(string) bool { return false })
+	h := NewEngineHandler(path, "unused")
+	h.ExpiryStatePath = filepath.Join(t.TempDir(), "expiry.json")
+	peer := testProvision(7, 1)
+	peer.Peer.ExpiresAt = timestamppb.New(time.Now().Add(-time.Second))
+	ctx := context.Background()
+
+	if err := h.ProvisionPeer(ctx, peer); err == nil || !strings.Contains(err.Error(), "stage peer 7") {
+		t.Fatalf("expected staging error, got %v", err)
+	}
+	if err := h.RevokePeer(ctx, &edgev1.RevokePeer{LabSessionId: 7}); err == nil || !strings.Contains(err.Error(), "revoke peer 7") {
+		t.Fatalf("expected revocation error, got %v", err)
+	}
+	h.ExpireDuePeers(ctx)
+	if got := ops(); len(got) != 3 || got[2].Op != "RevokePeer" {
+		t.Fatalf("expiry should retry the failed removal, got %+v", got)
+	}
+	restarted := NewEngineHandler(path, "unused")
+	restarted.ExpiryStatePath = h.ExpiryStatePath
+	if err := restarted.LoadExpiryState(); err != nil {
+		t.Fatal(err)
+	}
+	if got := restarted.expires[7]; !got.Equal(peer.Peer.ExpiresAt.AsTime()) {
+		t.Fatalf("deadline lost after socket failure: %v", got)
+	}
+}
+
+func TestSyncStateRejectsMalformedSnapshotWithoutContactingEngine(t *testing.T) {
+	peer := testPeer(7, 1)
+	_, badCount := snapshotBytes(t, peer)
+	badCount.DeclaredPeerCount++
+	_, invalidPeer := snapshotBytes(t, &edgev1.Peer{})
+	raw := []byte{0xff}
+	digest := sha256.Sum256(raw)
+	path, ops := controlServer(t, ControlSessions{})
+	h := NewEngineHandler(path, "unused")
+	for _, tc := range []struct {
+		snapshot *edgev1.PeerSnapshot
+		want     string
+	}{
+		{badCount, "declared_peer_count"},
+		{invalidPeer, "invalid snapshot peer"},
+		{&edgev1.PeerSnapshot{SerializedLength: 1, PeerList: raw, Sha256Digest: digest[:]}, "decode snapshot"},
+	} {
+		if err := h.SyncState(context.Background(), &edgev1.SyncState{Snapshot: tc.snapshot, Force: true}); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("expected %q, got %v", tc.want, err)
+		}
+	}
+	if got := ops(); len(got) != 0 {
+		t.Fatalf("invalid snapshots should be rejected locally, got %+v", got)
+	}
+}
+
+func TestSyncStateReportsEngineAndPersistenceFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		peers []*edgev1.Peer
+		drop  string
+		want  string
+	}{
+		{name: "read backend", drop: "GetSessions", want: "read control frame length"},
+		{name: "save desired deadline", peers: []*edgev1.Peer{testPeer(7, 1)}, want: "persist snapshot peer 7 expiration"},
+		{name: "remove extra peer", drop: "RevokePeer", want: "remove extra peer 7"},
+		{name: "save extra peer removal", want: "persist extra peer 7 expiration removal"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			drop := tc.drop
+			path, _ := controlServerWithHook(t, ControlSessions{
+				Peers: []ControlPeer{{LabSessionID: 7}},
+			}, func(op string) bool { return op != drop })
+			h := NewEngineHandler(path, "unused")
+			h.ExpiryStatePath = filepath.Join(t.TempDir(), "missing", "expiry.json")
+			_, snap := snapshotBytes(t, tc.peers...)
+			err := h.SyncState(context.Background(), &edgev1.SyncState{Snapshot: snap, Force: true})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestPrepareExpiryStateDirRejectsEmptyAndFilePaths(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range []string{"", path} {
+		if _, err := PrepareExpiryStateDir(invalid); err == nil {
+			t.Errorf("invalid state directory accepted: %q", invalid)
+		}
 	}
 }
