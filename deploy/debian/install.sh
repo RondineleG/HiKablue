@@ -36,7 +36,7 @@ for required in \
     bin/vpn-engine bin/vpn-agent bin/hikablue-engine-service \
     bin/hikablue-agent-service bin/hikablue-control-service \
     systemd/hikablue-engine.service systemd/hikablue-agent.service \
-    systemd/hikablue-control.service config/engine.env.sample \
+    systemd/hikablue-control.service control/VpnControl.dll config/engine.env.sample \
     config/agent.env.sample config/control.env.sample; do
     [ -e "$release/$required" ] || { echo "release is missing $required" >&2; exit 1; }
 done
@@ -80,6 +80,7 @@ else
     cp -a "$release/." "$tmp/"
     chmod 0755 "$tmp/bin/"*
     mv -- "$tmp" "$target"
+    if [ "$real_system" -eq 1 ]; then chown -R root:root "$target"; fi
     echo "installed release $version"
 fi
 
@@ -100,7 +101,7 @@ if [ "$real_system" -eq 1 ] && [ "$skip_users" -eq 0 ]; then
     done
     install -d -m 0755 /var/lib/hikablue
     install -d -m 0700 -o hikablue-agent -g hikablue-agent /var/lib/hikablue/agent-state
-    install -d -m 0750 /etc/hikablue/pki
+    install -d -m 0755 /etc/hikablue/pki
 fi
 
 old_target=""

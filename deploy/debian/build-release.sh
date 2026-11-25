@@ -37,8 +37,10 @@ if [ -e "$out" ]; then
         echo "output already exists: $out (use --force to rebuild it)" >&2
         exit 1
     fi
+    [ -f "$out/VERSION" ] || { echo "refusing to remove non-release directory: $out" >&2; exit 1; }
     rm -rf -- "$out"
 fi
+case "$out" in /*) ;; *) out="$PWD/$out" ;; esac
 mkdir -p "$out/bin" "$out/control" "$out/systemd" "$out/config"
 
 echo "== build rust engine"
