@@ -108,8 +108,8 @@ fora do bloco.
 de status — o provisionamento é assíncrono por design. Mesma chave com
 mesmo payload reproduz a resposta original; mesma chave com payload
 diferente é conflito **409**. A resposta de bootstrap também retorna
-`sessionToken`, uma capability de 256 bits derivada com HMAC do material
-secreto independente da sessão. Apenas o resumo SHA-256 dela é persistido, mas repetir
+`sessionToken`, uma capability de 256 bits derivada com HMAC de um segredo
+mantido pelo serviço. Apenas o resumo SHA-256 dela é persistido, mas repetir
 o create idempotente deriva o mesmo token. O `GET`/`DELETE` do dono precisa
 enviá-la como `X-Session-Token`; `X-Subject` continua apenas o rótulo de
 propriedade do laboratório até a autenticação real de usuários. `DELETE`
@@ -283,6 +283,9 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
 - **`backend_instance_id`** — identificador novo que o backend cunha a
   cada subida do plano de dados; um restart o muda e cerca os comandos
   pendentes.
+- **bootstrap capability** — o `sessionToken` único retornado pelo
+  create/replay idempotente; autoriza `GET`/`DELETE` do dono e nunca é
+  armazenado em claro.
 - **CA (Certificate Authority)** — a raiz ECDSA P-256 descartável do
   laboratório que assina o certificado de cada nó; criada pelo
   `gen-lab-pki.sh`.
@@ -305,6 +308,9 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
 - **`host(address)`** — função do PostgreSQL que retorna a parte de
   endereço de um valor `inet` sem sufixo `/32` — o que a consulta de
   sondagem compara.
+- **HMAC** — código de autenticação de mensagem com chave; o segredo do
+  serviço mais o ID da sessão deriva o token de bootstrap sem armazenar uma
+  chave de derivação junto à linha.
 - **Idempotency-Key** — chave fornecida pelo cliente que torna um
   `POST` rejogável: mesma chave + mesmo payload → mesma resposta;
   payload diferente → 409.
@@ -325,6 +331,8 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   `ProvisionPeer`/`RevokePeer`.
 - **SAN (Subject Alternative Name)** — a extensão do certificado (OID
   2.5.29.17) que carrega a URI SPIFFE identificando o nó.
+- **SHA-256** — o hash de 256 bits usado nos resumos de tokens e na
+  integridade do `SyncState`.
 - **SPIFFE** — padrão de identidade de workloads; aqui a URI
   `spiffe://lab.hikablue/node/<id>` nomeando cada nó.
 - **`stream_epoch`** — id emitido pelo plano de controle para um stream
@@ -486,10 +494,10 @@ revisão.
 O agente também aplica expiração localmente. Se o plano de controle estiver
 fora quando `expires_at` passar, o nó revoga no engine; a convergência
 chega depois por reenvio e `SyncState`. Os prazos são persistidos em um
-sidecar `<control socket>.expiry.json` somente do dono e recarregados antes
-da abertura do canal; um prazo vencido enquanto apenas o agente estava fora
-é aplicado imediatamente na reinicialização. O snapshot valida contagem
-declarada, comprimento e SHA-256 antes de mutar, e a guarda de remoção impede
+`expiry.json` somente do dono dentro de um diretório de estado privado do
+agente e recarregados antes da abertura do canal; um prazo vencido enquanto
+apenas o agente estava fora é aplicado imediatamente na reinicialização.
+O snapshot valida contagem declarada, comprimento e SHA-256 antes de mutar, e a guarda de remoção impede
 que um snapshot vazio ou massivo sem force limpe o backend.
 
 Nota de contrato: a tabela da especificação ainda nomeia os métodos

@@ -103,7 +103,7 @@ block.
 URL — provisioning is async by design. Same key + same payload replays the
 original response; same key + different payload is a **409** conflict.
 The bootstrap response also returns `sessionToken`, a 256-bit capability
-derived from an independent session secret with HMAC. Only its SHA-256 digest is
+derived from a service-held secret with HMAC. Only its SHA-256 digest is
 stored, yet replaying the idempotent create derives the same token again.
 Owner `GET`/`DELETE` must send it as `X-Session-Token`; `X-Subject` remains
 only the lab ownership label until real user authentication arrives.
@@ -270,6 +270,9 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   control plane reacts without parsing free text.
 - **`backend_instance_id`** — a fresh identifier the backend mints per
   data-plane start; a restart changes it and fences pending commands.
+- **bootstrap capability** — the one-time `sessionToken` returned by the
+  idempotent create/replay path; it authorizes owner `GET`/`DELETE` and is
+  never stored as plaintext.
 - **CA (Certificate Authority)** — the lab's throwaway ECDSA P-256 root
   that signs each node's certificate; `gen-lab-pki.sh` creates it.
 - **CIDR** — "Classless Inter-Domain Routing" notation (`10.42.0.0/22`):
@@ -287,6 +290,9 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   opens; commands flow back on the same connection (phase 3).
 - **`host(address)`** — PostgreSQL function returning the address part of
   an `inet` value with no `/32` suffix — what the probing query compares.
+- **HMAC** — a keyed message-authentication code; the service-held secret
+  plus the session ID derives the bootstrap token without storing a
+  token-derivation key beside the session row.
 - **Idempotency-Key** — client-supplied key making a `POST` replayable:
   same key + same payload → same answer; different payload → 409.
 - **`inet`** — PostgreSQL type for an IP address; its unique index is the
@@ -303,6 +309,8 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   dispatched, so a crash can't lose a `ProvisionPeer`/`RevokePeer`.
 - **SAN (Subject Alternative Name)** — the certificate extension (OID
   2.5.29.17) that carries the SPIFFE URI identifying the node.
+- **SHA-256** — the 256-bit hash used for token digests and snapshot
+  integrity; the stored digest proves possession without revealing the token.
 - **SPIFFE** — a workload-identity standard; here the URI
   `spiffe://lab.hikablue/node/<id>` naming each node.
 - **`stream_epoch`** — control-plane-issued id for one authenticated
@@ -476,9 +484,10 @@ backend instance and revision fencing have matched the command.
 The agent also enforces expiration locally. If the control plane is offline
 when `expires_at` passes, the node still calls the engine's `RevokePeer`;
 control-plane convergence happens later through redelivery and
-`SyncState`. Deadlines are persisted in an owner-only `<control socket>.expiry.json`
-sidecar and reloaded before the channel starts, so a deadline that passed
-while only the agent was down is enforced immediately after restart.
+`SyncState`. Deadlines are persisted in an owner-only `expiry.json` under a
+validated private agent state directory and reloaded before the channel
+starts, so a deadline that passed while only the agent was down is enforced
+immediately after restart.
 `SyncState` validates declared count, byte length and SHA-256
 before mutation, and the deletion guard prevents a non-forced empty or
 mass-deletion snapshot from wiping the backend.

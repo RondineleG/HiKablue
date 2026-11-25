@@ -26,11 +26,17 @@ POST /v1/sessions
 
 The two client namespaces run `vpn-engine client`. For milestone 4 their
 first epoch is bootstrapped with the exact keys returned by the lab session
-API (`--tx-key`, `--rx-key`, and complementary wire indexes). Status polling
-and revocation present the bootstrap `sessionToken` as `X-Session-Token`;
-the script preserves the create response separately for that purpose. The client
-direction is the inverse of the exit engine direction. This is lab-only
-bootstrap, not the later user-facing client provisioning flow.
+API, but the material never appears on a process command line: the script
+writes each key to a `0600` file inside the private run directory and passes
+`--tx-key-file`/`--rx-key-file` (the inline `--tx-key`/`--rx-key` forms still
+exist for compatibility, warn on use, and are documented as unsafe for real
+deployments). After each client starts, the script reads
+`/proc/<pid>/cmdline` and fails if any key material leaked into the argument
+list. Status polling and revocation present the bootstrap `sessionToken` as
+`X-Session-Token`; the script preserves the create response separately for
+that purpose. The client direction is the inverse of the exit engine
+direction. This is lab-only bootstrap, not the later user-facing client
+provisioning flow.
 
 The service namespace runs `python3 -m http.server` bound to
 `10.80.1.100:8080` behind the exit node. The control plane leases only
@@ -39,6 +45,37 @@ Client-to-client hairpinning is
 intentionally denied in the milestone-4 policy; forwarded service answers
 may keep the service source address.
 
+## Run-scoped resource ownership
+
+Every run generates a random `RUN_TAG`; all namespaces
+(`hkm4e<tag>`, `hkm4a<tag>`, `hkm4b<tag>`, `hkm4s<tag>`) and veth/bridge
+interface names carry it, so concurrent runs never collide and a stale
+pre-run object is detected rather than adopted. Control-plane, proxy, and
+PostgreSQL ports are allocated dynamically at run time, so no fixed port is
+required to be free.
+
+Privileged resources are tracked in a per-run ownership registry
+(`tests/lab/lab-resources.sh`):
+
+- `lab_netns_add` refuses to create a namespace that already exists and
+  registers each namespace it successfully creates;
+- `lab_root_veth_add` registers both ends of each veth pair it creates;
+- `lab_register_root_pid` records privileged background processes together
+  with the run directory as an ownership marker;
+- `lab_cleanup_scope` kills only registered PIDs whose `/proc` cmdline still
+  carries the run-directory marker (protecting against PID reuse), deletes
+  only registered links, and removes only registered namespaces — never
+  anything a previous run or another user left behind.
+
+Unprivileged children (agent, control plane, proxy, monitor loop) are killed
+only while they remain children of the run's own shell (`kill_user_pid`),
+so a reused PID can never turn cleanup into a foreign-process kill. Cleanup
+is idempotent and also runs on partial-failure paths.
+
+`tests/lab/session-e2e-safety.test.sh` exercises the registry offline:
+partial-failure cleanup, preexisting-resource refusal, PID-reuse safety, and
+concurrent-scope isolation. The quality gate runs it under `sudo`.
+
 ## Prerequisites
 
 Run on a Linux host with:
@@ -46,15 +83,16 @@ Run on a Linux host with:
 - Rust (`cargo`), Go 1.18.x, .NET 10, Python 3, `jq`, `curl`, `openssl`,
   `xxd`, `iproute2`, and PostgreSQL server binaries;
 - passwordless `sudo` for network namespaces and TUN creation;
-- `/dev/net/tun`;
-- no listener on TCP ports 7443, 7444, or 55432;
-- no pre-existing `hkm4exit`, `hkm4ca`, `hkm4cb`, or `hkm4svc` namespace.
+- `/dev/net/tun`.
 
-The script starts a temporary PostgreSQL cluster inside its own `mktemp`
-directory with a random SCRAM password that never leaves the environment of
-the run. It does not require Docker. It creates a lab-only CA, a node
-client certificate, and a loopback server certificate. All keys are test
-material and are deleted with the run directory.
+Ports and namespace/interface names are allocated per run; nothing needs to
+be reserved in advance. The script starts a temporary PostgreSQL cluster
+inside its own `mktemp` directory with a random SCRAM password that never
+leaves the environment of the run. It does not require Docker. It creates a
+lab-only CA, a node client certificate, and a loopback server certificate.
+All keys are test material and are deleted with the run directory. The admin
+token, heartbeat token, `VpnControl__SessionTokenSecret`, and database
+password are random per run and never enter logs.
 
 ## Commands
 
@@ -67,7 +105,11 @@ tests/lab/session-e2e.sh
 # independent gRPC interruption/reconciliation acceptance
 tests/lab/session-e2e.sh --drop
 
-# repository quality gate, including the privileged labs
+# local expiry enforced across an agent restart (control plane unreachable)
+tests/lab/session-e2e.sh --expire-restart
+
+# repository quality gate, including the privileged labs and the
+# ownership-registry safety test
 tests/checks.sh --lab
 ```
 
@@ -78,6 +120,26 @@ The drop run closes a deliberately delayed TCP proxy while revocation is in
 flight, checks that A remains `revoking` with its lease reserved, restores
 the proxy, and waits for redelivery/reconciliation to finish removal before
 the lease is released.
+
+The expire-restart run gives session A a short TTL, then — after proving
+both tunnels carry HTTP — drops the gRPC proxy, kills the agent process,
+and restarts it (`-state-dir` preserved) while the Rust engine keeps
+running and the control plane stays unreachable. The restarted agent
+rehydrates the persisted expiry deadline and removes A locally when it
+passes; the script proves A lost service access without any control plane
+and that B kept working throughout. Restoring the proxy then lets the
+fenced removal ACK release A's lease — the script asserts the lease stayed
+reserved while removal was unconfirmed and that the expired session is
+never resurrected during reconciliation.
+
+## Evidence ordering
+
+`OBSERVED:` lines are emitted only after the assertion they describe. The
+scenarios distinguish four distinct events: command dispatched (`sent` in
+the outbox), command applied by the agent, node `CommandAck` received, and
+lease released. Losing the gRPC channel is never reported as data-plane
+loss, and infrastructure failures abort the run instead of counting as
+functional success.
 
 ## Observed milestone-4 results
 
@@ -90,10 +152,11 @@ Observed on the Ubuntu development VM used for this change:
 | HTTP connectivity | both clients received exactly `hikablue-m4-ok` through the tunnel; the direct-path probe failed before tunnel setup |
 | Normal revocation | `session-e2e (normal): PASS` — A lost access, B had no failed continuous responses, and A's lease count changed from 1 to 0 only after the node ACK |
 | gRPC interruption | `session-e2e (drop): PASS` — A stayed `revoking` with lease count 1 while the channel was down; restoring the channel completed removal, marked the session `revoked`, released the lease, and A still had no access |
+| Agent restart expiry | `session-e2e (expire-restart): PASS` — the restarted agent expired A from its persisted deadline with no control plane, B had zero failed responses, the reconnect reconciled A to `revoked` without resurrecting it, and the lease was released only after the fenced removal ACK |
+| Key material hygiene | every client engine command line was verified free of key material; keys live only in `0600` files under the private run directory |
 
 Exact counters vary because keepalives and continuous probe timing vary;
 the acceptance output lines are the stable result.
-
 
 ## Contract notes and explicit deferrals
 
@@ -105,22 +168,26 @@ the acceptance output lines are the stable result.
   `RevokePeer`, and `GetSessions`, while the metrics socket remains
   read-only. That naming/socket divergence is documented here rather than
   silently redesigned during the acceptance work.
-- The exact client keys appear as command-line arguments only because the
-  clients are disposable lab engines in namespaces. This is not the final
-  client key-delivery design and must not be copied to production use.
+- Client keys are delivered through protected files, never arguments. The
+  inline `--tx-key`/`--rx-key` flags remain only for compatibility, emit a
+  warning when used, and must not be copied to production use — this is not
+  the final client key-delivery design.
 - Backend restart reprovisioning is outside this laboratory. Snapshots
   intentionally carry peer/key references, not raw keys, so a new backend
   instance cannot reconstruct old epochs from `SyncState`; explicit fresh
   provisioning remains a later architecture step.
-- Local expiration is enforced by the running agent and its expiration
-  deadlines are rehydrated from valid snapshots after restart. The test
-  does not kill the agent itself; it validates control-plane channel loss,
-  which is the milestone-4 acceptance scenario.
+- The expire-restart scenario restarts only the Go agent while the Rust
+  backend keeps running; full recovery after a backend restart remains out
+  of scope by design.
+- The agent persists expiry deadlines in `expiry.json` (`0600`, fsync'd
+  write + rename + directory fsync) inside a private `-state-dir` (default
+  `/run/vpn/agent-state`, validated `0700` and writable before the channel
+  starts). Deadlines already past at startup are enforced immediately.
 
 ## Cleanup and failure artifacts
 
-The script removes only namespaces, processes, PostgreSQL data, sockets,
-keys, and temporary files that it created in its run directory. On failure
+The script removes only namespaces, links, processes, PostgreSQL data,
+sockets, keys, and temporary files that its own run registered. On failure
 it copies the run directory to a unique `/tmp/hk-m4-session-failed-*`
 path before cleanup so `control.log`, `agent.log`, engine logs, PostgreSQL
 logs, and session JSON can be inspected. Delete that directory manually

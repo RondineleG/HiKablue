@@ -106,8 +106,8 @@ así un pool desalineado jamás puede alquilar direcciones fuera del bloque.
 de estado — el aprovisionamiento es asíncrono por diseño. La misma clave
 con el mismo payload reproduce la respuesta original; la misma clave con
 payload distinto es un conflicto **409**. La respuesta de bootstrap también
-devuelve `sessionToken`, una capability de 256 bits derivada con HMAC del
-secreto independiente de sesión. Solo se guarda su resumen SHA-256, pero repetir
+devuelve `sessionToken`, una capability de 256 bits derivada con HMAC de un
+secreto mantenido por el servicio. Solo se guarda su resumen SHA-256, pero repetir
 el create idempotente deriva el mismo token. El `GET`/`DELETE` del dueño
 debe enviarlo como `X-Session-Token`; `X-Subject` sigue siendo solo la
 etiqueta de propiedad del laboratorio hasta la autenticación real de
@@ -283,6 +283,9 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
 - **`backend_instance_id`** — identificador fresco que el backend acuña
   por arranque del plano de datos; un reinicio lo cambia y valla los
   comandos pendientes.
+- **bootstrap capability** — el `sessionToken` único devuelto por el
+  create/replay idempotente; autoriza `GET`/`DELETE` del dueño y nunca se
+  almacena en claro.
 - **CA (Certificate Authority)** — la raíz ECDSA P-256 desechable del
   laboratorio que firma el certificado de cada nodo; la crea
   `gen-lab-pki.sh`.
@@ -306,6 +309,9 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
 - **`host(address)`** — función de PostgreSQL que devuelve la parte de
   dirección de un valor `inet` sin sufijo `/32` — lo que compara la
   consulta de sondeo.
+- **HMAC** — código de autenticación de mensaje con clave; el secreto del
+  servicio más el ID de sesión deriva el token de bootstrap sin guardar una
+  clave de derivación junto a la fila.
 - **Idempotency-Key** — clave del cliente que hace rejugable un `POST`:
   misma clave + mismo payload → misma respuesta; payload distinto →
   409.
@@ -326,6 +332,8 @@ var free = candidates.FirstOrDefault(a => !taken.Contains(a.ToString()));
   `ProvisionPeer`/`RevokePeer`.
 - **SAN (Subject Alternative Name)** — la extensión del certificado
   (OID 2.5.29.17) que lleva la URI SPIFFE que identifica al nodo.
+- **SHA-256** — el hash de 256 bits usado para los resúmenes de tokens y
+  la integridad del `SyncState`.
 - **SPIFFE** — estándar de identidad de workloads; aquí la URI
   `spiffe://lab.hikablue/node/<id>` que nombra a cada nodo.
 - **`stream_epoch`** — id emitido por el plano de control para un
@@ -490,9 +498,10 @@ epoch, backend instance y revisión.
 El agente también aplica expiración localmente. Si el control plane está
 fuera cuando vence `expires_at`, el nodo revoca en el motor; la convergencia
 llega después por reenvío y `SyncState`. Los vencimientos se persisten en
-un sidecar `<control socket>.expiry.json` solo del propietario y se recargan
-antes de abrir el canal; un vencimiento cumplido mientras solo el agente
-estaba caído se aplica inmediatamente al reiniciar. El snapshot valida cuenta
+un `expiry.json` solo del propietario dentro de un directorio de estado
+privado del agente y se recargan antes de abrir el canal; un vencimiento
+cumplido mientras solo el agente estaba caído se aplica inmediatamente al
+reiniciar. El snapshot valida cuenta
 declarada, longitud y SHA-256 antes de mutar, y la guardia de borrado impide
 que un snapshot vacío o masivo no forzado limpie el backend.
 
