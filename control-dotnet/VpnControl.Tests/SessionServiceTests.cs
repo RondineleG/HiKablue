@@ -45,7 +45,11 @@ public sealed class SessionServiceTests : IAsyncLifetime
         new ControlDbContext(options ?? _options),
         new NodeService(_registry),
         new ConfigurationBuilder().AddInMemoryCollection(
-            new Dictionary<string, string?> { ["VpnControl:IpPoolCidr"] = poolCidr }).Build(),
+            new Dictionary<string, string?>
+            {
+                ["VpnControl:IpPoolCidr"] = poolCidr,
+                ["VpnControl:SessionTokenSecret"] = "0123456789abcdef0123456789abcdef"
+            }).Build(),
         NullLogger<SessionService>.Instance);
 
     private void BeatNode(string nodeId = "node-a", bool healthy = true) =>
@@ -146,6 +150,36 @@ public sealed class SessionServiceTests : IAsyncLifetime
         Assert.Equal(first.Data.SessionToken, replay.Data!.SessionToken);
         await using var db = NewDb();
         Assert.Equal(1, await db.Sessions.CountAsync());
+    }
+
+    [Fact]
+    public async Task MigratedSessionReplayIssuesOwnerTokenAndStoresOnlyHash()
+    {
+        BeatNode();
+        var request = new CreateSessionRequest();
+        var first = await _service.CreateSessionAsync(request, "alice", "key-migrated");
+        Assert.True(first.IsSuccess);
+        var id = first.Data!.SessionId;
+        var originalToken = first.Data.SessionToken;
+
+        await using (var db = NewDb())
+        {
+            var row = await db.Sessions.SingleAsync();
+            row.SessionTokenHash = null; // shape produced by the pre-token migration
+            await db.SaveChangesAsync();
+        }
+
+        var replay = await _service.CreateSessionAsync(request, "alice", "key-migrated");
+        Assert.True(replay.IsSuccess);
+        Assert.Equal(originalToken, replay.Data!.SessionToken);
+        Assert.True((await _service.GetSessionAsync(id, "alice", false, replay.Data.SessionToken)).IsSuccess);
+
+        await using var check = NewDb();
+        Assert.NotNull(await check.Sessions.Select(s => s.SessionTokenHash).SingleAsync());
+        var keyColumns = await check.Database
+            .SqlQuery<int>($"SELECT count(*)::int AS \"Value\" FROM information_schema.columns WHERE table_name='sessions' AND column_name='session_token_key'")
+            .SingleAsync();
+        Assert.Equal(0, keyColumns);
     }
 
     [Fact]

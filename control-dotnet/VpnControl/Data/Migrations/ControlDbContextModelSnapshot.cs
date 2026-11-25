@@ -227,10 +227,6 @@ namespace VpnControl.Data.Migrations
                         .HasColumnType("character varying(64)")
                         .HasColumnName("session_token_hash");
 
-                    b.Property<byte[]>("SessionTokenKey")
-                        .HasColumnType("bytea")
-                        .HasColumnName("session_token_key");
-
                     b.Property<string>("Status")
                         .IsRequired()
                         .HasColumnType("text")

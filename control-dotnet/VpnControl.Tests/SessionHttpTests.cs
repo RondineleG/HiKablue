@@ -33,6 +33,7 @@ public sealed class SessionHttpTests : IAsyncLifetime
                     ["VpnControl:HeartbeatToken"] = "tok",
                     ["VpnControl:AdminToken"] = AdminToken,
                     ["VpnControl:IpPoolCidr"] = "10.77.0.0/24",
+                    ["VpnControl:SessionTokenSecret"] = "0123456789abcdef0123456789abcdef",
                     ["VpnControl:ConnectionString"] = _pg.GetConnectionString()
                 })));
         _client = _factory.CreateClient();

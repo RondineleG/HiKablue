@@ -29,9 +29,6 @@ public sealed class SessionRow
     // SHA-256 hex of the one-time session bearer token returned at
     // provisioning. The plaintext token is never persisted.
     public string? SessionTokenHash { get; set; }
-    // Independent secret used only to derive the session access token; it is
-    // never mixed with the traffic encryption keys.
-    public byte[]? SessionTokenKey { get; set; }
     // Client key material reference, opaque to the control plane but
     // persisted so the ProvisionPeer command can carry it to the backend.
     public string? PeerPublicKey { get; set; }

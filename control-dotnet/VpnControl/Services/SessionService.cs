@@ -54,18 +54,42 @@ public sealed class SessionService(
     private static string HashSessionToken(string token) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
 
-    // The bootstrap token is derived from an independent session secret rather
-    // than stored plaintext or mixed with traffic keys. Replaying the
-    // idempotent create therefore returns the same capability.
-    private static string DeriveSessionToken(SessionRow row)
+    // The bootstrap token is derived from a service-held secret, never from a
+    // per-session secret stored beside the row. A database-only reader cannot
+    // reconstruct live owner capabilities; replay remains deterministic.
+    private bool TryDeriveSessionToken(Guid sessionId, out string token)
     {
-        if (row.SessionTokenKey is null)
+        token = "";
+        var secret = config["VpnControl:SessionTokenSecret"];
+        if (string.IsNullOrWhiteSpace(secret) || secret.Length < 32)
         {
-            return "";
+            return false;
         }
-        using var hmac = new HMACSHA256(row.SessionTokenKey);
-        return Convert.ToHexString(hmac.ComputeHash(
-            Encoding.UTF8.GetBytes($"hikablue-session-token:{row.SessionId}")));
+        using var hmac = new HMACSHA256(SHA256.HashData(Encoding.UTF8.GetBytes(secret)));
+        token = Convert.ToHexString(hmac.ComputeHash(
+            Encoding.UTF8.GetBytes($"hikablue-session-token:{sessionId}")));
+        return true;
+    }
+
+    // Idempotent replay is the owner-authenticated recovery path for rows
+    // migrated before session_token_hash existed: the same subject, key and
+    // payload may attach the derived token's hash and receive the capability.
+    private async Task<string?> IssueSessionTokenAsync(SessionRow row, CancellationToken ct)
+    {
+        if (!TryDeriveSessionToken(row.SessionId, out var token))
+        {
+            return null;
+        }
+        var hash = HashSessionToken(token);
+        if (row.SessionTokenHash != hash)
+        {
+            var tracked = await db.Sessions.FirstAsync(s => s.SessionId == row.SessionId, ct);
+            tracked.SessionTokenHash = hash;
+            tracked.UpdatedAt = DateTimeOffset.UtcNow;
+            await db.SaveChangesAsync(ct);
+            row.SessionTokenHash = hash;
+        }
+        return token;
     }
 
     private static bool SessionTokenMatches(SessionRow row, string? token)
@@ -104,11 +128,16 @@ public sealed class SessionService(
                 .FirstOrDefaultAsync(s => s.IdempotencyKey == idempotencyKey, cancellationToken);
             if (replay is not null)
             {
-                return replay.RequestHash == hash
-                    ? RequestResult<SessionView>.Success(ToView(replay, DeriveSessionToken(replay)), "idempotent replay")
-                    : RequestResult<SessionView>.WithError(
+                if (replay.RequestHash != hash)
+                {
+                    return RequestResult<SessionView>.WithError(
                         "idempotency key was already used with a different payload",
                         EResultStatus.EntityAlreadyExists);
+                }
+                var replayToken = await IssueSessionTokenAsync(replay, cancellationToken);
+                return replayToken is null
+                    ? RequestResult<SessionView>.WithError("session token secret is not configured", EResultStatus.HasError)
+                    : RequestResult<SessionView>.Success(ToView(replay, replayToken), "idempotent replay");
             }
         }
 
@@ -128,6 +157,11 @@ public sealed class SessionService(
         }
 
         var sessionId = Guid.NewGuid();
+        if (!TryDeriveSessionToken(sessionId, out var bootstrapToken))
+        {
+            return RequestResult<SessionView>.WithError(
+                "session token secret is not configured", EResultStatus.HasError);
+        }
         SessionRow? created = null;
         string? exhaustedReason = null;
 
@@ -185,14 +219,13 @@ public sealed class SessionService(
                     KeyEpoch = keyEpoch,
                     EgressKey = RandomNumberGenerator.GetBytes(32),
                     IngressKey = RandomNumberGenerator.GetBytes(32),
-                    SessionTokenKey = RandomNumberGenerator.GetBytes(32),
                     SenderIndex = senderIndex,
                     PeerIndex = peerIndex,
                     ExpiresAt = now.AddSeconds(ttl),
                     CreatedAt = now,
                     UpdatedAt = now
                 };
-                row.SessionTokenHash = HashSessionToken(DeriveSessionToken(row));
+                row.SessionTokenHash = HashSessionToken(bootstrapToken);
                 var revision = await BumpRevisionAsync(node.NodeId, cancellationToken);
                 var command = new OutboxRow
                 {
@@ -251,11 +284,16 @@ public sealed class SessionService(
                 .FirstOrDefaultAsync(s => s.IdempotencyKey == idempotencyKey, cancellationToken);
             if (replay is not null)
             {
-                return replay.RequestHash == hash
-                    ? RequestResult<SessionView>.Success(ToView(replay, DeriveSessionToken(replay)), "idempotent replay")
-                    : RequestResult<SessionView>.WithError(
+                if (replay.RequestHash != hash)
+                {
+                    return RequestResult<SessionView>.WithError(
                         "idempotency key was already used with a different payload",
                         EResultStatus.EntityAlreadyExists);
+                }
+                var replayToken = await IssueSessionTokenAsync(replay, cancellationToken);
+                return replayToken is null
+                    ? RequestResult<SessionView>.WithError("session token secret is not configured", EResultStatus.HasError)
+                    : RequestResult<SessionView>.Success(ToView(replay, replayToken), "idempotent replay");
             }
         }
 
@@ -266,7 +304,7 @@ public sealed class SessionService(
                 EResultStatus.Unavailable);
         }
 
-        return RequestResult<SessionView>.Success(ToView(created, DeriveSessionToken(created)), "session pending");
+        return RequestResult<SessionView>.Success(ToView(created, bootstrapToken), "session pending");
     }
 
     public async Task<RequestResult<SessionView>> GetSessionAsync(Guid sessionId, string subject, bool isAdmin,
