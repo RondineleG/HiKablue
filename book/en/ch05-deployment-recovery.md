@@ -179,6 +179,11 @@ Line by line:
 - in the surrounding code, the lease row is deleted in the same ACK side
   effect. Before that confirmation, the lease remains reserved.
 
+A session already in `revoking` follows the other terminal branch: it becomes
+`revoked`, because removal was already desired and the confirmed empty backend
+is the removal confirmation the dead backend can never send. Its lease is
+released in the same ACK side effect.
+
 This is the important honesty boundary: `sent` is not application, and a
 process restart is not cleanup confirmation. The control plane uses the
 fresh backend's applied empty-state reconciliation as the confirmation that

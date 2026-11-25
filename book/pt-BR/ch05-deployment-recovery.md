@@ -176,6 +176,10 @@ Linha por linha:
 - no código ao redor, o lease é removido no mesmo efeito do ACK. Antes dessa
   confirmação, ele continua reservado.
 
+Uma sessão já `revoking` segue o outro ramo terminal: vira `revoked`, porque
+a remoção já era desejada e o backend vazio confirmado é a confirmação que o
+backend morto nunca poderá enviar. Seu lease é liberado no mesmo efeito do ACK.
+
 Esta é a fronteira de honestidade: `sent` não é aplicação, e reinício não é
 confirmação de limpeza. O plano de controle usa a reconciliação vazia
 aplicada pelo backend novo como confirmação de que o estado antigo sumiu.
