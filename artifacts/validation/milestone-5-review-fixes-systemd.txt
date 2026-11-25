@@ -1,0 +1,64 @@
+Warning: Permanently added '[127.0.0.1]:10022' (ED25519) to the list of known hosts.
++ cd /tmp
++ rm -rf hk-debian-release hk-debian-pki
++ tar xzf hk-debian-release.tar.gz
++ tar xzf hk-debian-pki.tar.gz
++ sudo bash /tmp/hk-debian-install.sh --release /tmp/hk-debian-release
+installed release 4aa44d137717
+current release: 4aa44d137717
+services installed but not started: hikablue-engine.service hikablue-agent.service hikablue-control.service
++ sudo tee /etc/hikablue/engine.env
++ sudo tee /etc/hikablue/agent.env
++ sudo cp /tmp/hk-debian-pki/ca/ca.crt /etc/hikablue/pki/ca.crt
++ sudo cp /tmp/hk-debian-pki/nodes/node-a/node.crt /etc/hikablue/pki/node.crt
++ sudo cp /tmp/hk-debian-pki/nodes/node-a/node.key /etc/hikablue/pki/node.key
++ sudo chown root:root /etc/hikablue/pki/ca.crt /etc/hikablue/pki/node.crt
++ sudo chown hikablue-agent:hikablue-agent /etc/hikablue/pki/node.key
++ sudo chmod 0644 /etc/hikablue/pki/ca.crt /etc/hikablue/pki/node.crt
++ sudo chmod 0600 /etc/hikablue/pki/node.key
++ sudo systemctl start hikablue-engine.service
++ sleep 2
++ sudo systemctl start hikablue-agent.service
++ sleep 3
+debian=Debian GNU/Linux 12 (bookworm)
+++ . /etc/os-release
++++ PRETTY_NAME='Debian GNU/Linux 12 (bookworm)'
++++ NAME='Debian GNU/Linux'
++++ VERSION_ID=12
++++ VERSION='12 (bookworm)'
++++ VERSION_CODENAME=bookworm
++++ ID=debian
++++ HOME_URL=https://www.debian.org/
++++ SUPPORT_URL=https://www.debian.org/support
++++ BUG_REPORT_URL=https://bugs.debian.org/
+++ echo 'Debian GNU/Linux 12 (bookworm)'
++ printf 'debian=%s\n' 'Debian GNU/Linux 12 (bookworm)'
+++ uname -r
+kernel=6.1.0-56-cloud-amd64
++ printf 'kernel=%s\n' 6.1.0-56-cloud-amd64
+++ cat /opt/hikablue/current/VERSION
++ printf 'release=%s\n' 4aa44d137717
+release=4aa44d137717
+++ systemctl is-active hikablue-engine.service
++ printf 'engine=%s\n' active
+++ systemctl is-active hikablue-agent.service
+engine=active
+agent=active
++ printf 'agent=%s\n' active
++ stat -c '%a %U %G %n' /run/hikablue-engine/control.sock /run/hikablue-engine/engine.sock
+660 hikablue-engine hikablue-agent /run/hikablue-engine/control.sock
+660 hikablue-engine hikablue-agent /run/hikablue-engine/engine.sock
++ sudo -u hikablue-agent python3 /tmp/hk-debian-socket-query.py
+GetMetrics:ok:{"dropped_pkts": 13, "epochs": [], "invalid_inner_dst_total": 0, "invalid_inner_src_total": 0, "peers": 0, "rotations_total": 0, "rx_bytes": 0, "rx_pkts": 0, "rx_unknown_sender_index_total": 0, "tx_bytes": 0, "tx_pkts": 0, "uptime_secs": 5}
+GetSessions:ok:{"backend_instance_id": "5d7e9cc16021a2ab27a76f15916a9832", "epochs": [], "lab_session_id": null, "peers": [], "revocations": 0}
+JOURNAL_ENGINE
+Nov 25 23:20:53 hkdebian systemd[1]: Started hikablue-engine.service - HiKablue isolated-lab VPN engine.
+Nov 25 23:20:53 hkdebian hikablue-engine-service[639]: vpn-engine server: 10.232.0.1/24 mtu=1400 bind=127.0.0.1:51998
+JOURNAL_AGENT
+Nov 25 23:20:55 hkdebian hikablue-agent-service[655]: vpn-agent: NodeChannel ended: orchestrator: open NodeChannel: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp 127.0.0.1:1: connect: connection refused"
+Nov 25 23:20:56 hkdebian hikablue-agent-service[655]: vpn-agent: NodeChannel ended: orchestrator: open NodeChannel: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp 127.0.0.1:1: connect: connection refused"
+Nov 25 23:20:57 hkdebian hikablue-agent-service[655]: vpn-agent: NodeChannel ended: orchestrator: open NodeChannel: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp 127.0.0.1:1: connect: connection refused"
+Nov 25 23:20:59 hkdebian hikablue-agent-service[655]: vpn-agent: NodeChannel ended: orchestrator: open NodeChannel: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp 127.0.0.1:1: connect: connection refused"
+Nov 25 23:21:03 hkdebian hikablue-agent-service[655]: vpn-agent: NodeChannel ended: orchestrator: open NodeChannel: rpc error: code = Unavailable desc = connection error: desc = "transport: Error while dialing: dial tcp 127.0.0.1:1: connect: connection refused"
+TUN
+3: hksys0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1400 qdisc fq_codel state UNKNOWN mode DEFAULT group default qlen 500
