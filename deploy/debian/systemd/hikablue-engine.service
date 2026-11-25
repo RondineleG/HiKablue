@@ -8,6 +8,7 @@ Wants=network-online.target
 Type=simple
 User=hikablue-engine
 Group=hikablue-engine
+SupplementaryGroups=hikablue-agent
 EnvironmentFile=-/etc/hikablue/engine.env
 ExecStart=/opt/hikablue/current/bin/hikablue-engine-service
 Restart=on-failure
