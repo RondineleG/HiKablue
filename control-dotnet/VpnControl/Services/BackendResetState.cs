@@ -12,7 +12,7 @@ public static class BackendResetState
         {
             using var doc = JsonDocument.Parse(payload);
             return doc.RootElement.TryGetProperty("backend_reset_session_ids", out var ids) &&
-                ids.ValueKind == JsonValueKind.Array && ids.GetArrayLength() > 0;
+                ids.ValueKind == JsonValueKind.Array;
         }
         catch (JsonException)
         {

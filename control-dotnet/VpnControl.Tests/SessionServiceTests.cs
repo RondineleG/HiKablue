@@ -303,13 +303,12 @@ public sealed class SessionServiceTests : IAsyncLifetime
     {
         BeatNode();
         var resetCommandId = Guid.NewGuid();
-        var resetSessionId = Guid.NewGuid();
         await using (var db = NewDb())
         {
             db.Outbox.Add(new OutboxRow
             {
                 CommandId = resetCommandId, NodeId = "node-a", CommandType = "SyncState",
-                Payload = $"{{\"backend_reset_session_ids\":[\"{resetSessionId}\"]}}",
+                Payload = "{\"backend_reset_session_ids\":[]}",
                 Revision = 1, CreatedAt = DateTimeOffset.UtcNow, Status = "pending"
             });
             await db.SaveChangesAsync();

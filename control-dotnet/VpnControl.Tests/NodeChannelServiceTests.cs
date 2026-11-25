@@ -178,6 +178,21 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task BackendResetDeadlineRejectionRetriesInsteadOfReopeningProvisioning()
+    {
+        var row = await SeedCommandAsync("edge-1", "SyncState",
+            """{"backend_reset_session_ids":[]}""");
+        await _service.OnCommandAckAsync("edge-1", Stream(),
+            Ack(row, AckOutcome.Rejected, AckErrorCode.AckErrorDeadlineExceeded),
+            CancellationToken.None);
+        await using var db = NewDb();
+        var outbox = await db.Outbox.SingleAsync();
+        Assert.Equal("pending", outbox.Status);
+        Assert.NotNull(outbox.NextRetryAt);
+        Assert.True(await BackendResetState.HasPendingBackendResetAsync(db, "edge-1", CancellationToken.None));
+    }
+
+    [Fact]
     public async Task RevokePeerAckReleasesTheLeaseAndClosesTheSession()
     {
         var sessionId = Guid.NewGuid();
@@ -527,6 +542,25 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
         Assert.Equal(SessionStatus.Revoked, revoking.Status);
         Assert.Equal(0, await verify.IpLeases.CountAsync(l => l.SessionId == sessionId));
         Assert.Equal(0, await verify.IpLeases.CountAsync(l => l.SessionId == revokingSessionId));
+    }
+
+    [Fact]
+    public async Task BackendRestartWithoutSessionsStillMarksResetUntilAck()
+    {
+        await _service.OnRegisterAsync("edge-1",
+            new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b1" },
+            CancellationToken.None, "e1");
+        await NewService().OnRegisterAsync("edge-1",
+            new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b2" },
+            CancellationToken.None, "e2");
+        await using var db = NewDb();
+        var reset = await db.Outbox.OrderByDescending(o => o.Revision)
+            .FirstAsync(o => o.CommandType == "SyncState");
+        using var payload = System.Text.Json.JsonDocument.Parse(reset.Payload);
+        var ids = payload.RootElement.GetProperty("backend_reset_session_ids");
+        Assert.Equal(System.Text.Json.JsonValueKind.Array, ids.ValueKind);
+        Assert.Empty(ids.EnumerateArray());
+        Assert.True(await BackendResetState.HasPendingBackendResetAsync(db, "edge-1", CancellationToken.None));
     }
 
     [Fact]

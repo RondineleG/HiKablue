@@ -173,9 +173,8 @@ public sealed class NodeChannelService(
         var resetPending = await BackendResetState.HasPendingBackendResetAsync(db, nodeId, ct);
         if (backendRestarted || !resetPending)
         {
-            await EnqueueSyncStateCoreAsync(nodeId, ct,
-                restartedSessionIds.Count == 0 ? null : restartedSessionIds,
-                restartedSessionIds.Count == 0 ? null : restartedSessionIds);
+            var resetSessionIds = backendRestarted ? restartedSessionIds : null;
+            await EnqueueSyncStateCoreAsync(nodeId, ct, resetSessionIds, resetSessionIds);
         }
 
         await db.SaveChangesAsync(ct);
@@ -271,6 +270,17 @@ public sealed class NodeChannelService(
                 // The wire ACK does not identify the attempt. A deadline
                 // rejection may refer to an older send on this stream.
                 return;
+            case AckOutcome.Rejected when ack.ErrorCode == AckErrorCode.AckErrorDeadlineExceeded &&
+                BackendResetState.IsPendingResetPayload(row.Payload):
+            case AckOutcome.Error when ack.ErrorCode == AckErrorCode.AckErrorDeadlineExceeded &&
+                BackendResetState.IsPendingResetPayload(row.Payload):
+                // A first-attempt deadline rejection proves this attempt was
+                // not applied. A backend reset must not become terminal before
+                // confirmation: retrying it keeps the node blocked instead of
+                // reopening provisioning with old leases still intact.
+                row.Status = "pending";
+                row.NextRetryAt = now.AddMilliseconds(250);
+                break;
             case AckOutcome.Rejected:
             case AckOutcome.Error when ack.ErrorCode
                 is AckErrorCode.AckErrorDeadlineExceeded
