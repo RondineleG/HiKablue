@@ -142,6 +142,10 @@ if [ "$run_lab" -eq 1 ]; then
         tests/lab/session-e2e.sh
     run_step "lab integration: milestone 4 sessions gRPC reconciliation" \
         tests/lab/session-e2e.sh --drop
+    run_step "lab integration: milestone 4 local expiry across agent restart" \
+        tests/lab/session-e2e.sh --expire-restart
+    run_step "lab integration: session resource ownership regressions (sudo)" \
+        sudo tests/lab/session-e2e-safety.test.sh
 else
     record_skip "lab integration: ip netns ping + telemetry demo" \
         "privileged — run 'tests/checks.sh --lab' in the authorized lab"
