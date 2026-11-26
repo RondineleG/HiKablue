@@ -243,7 +243,7 @@ Observado en la VM Ubuntu de desarrollo durante este milestone:
 |---|---|
 | `tests/deploy/install-rollback.test.sh` | PASS — reinstall idempotente, configuración preservada, upgrade v1→v2 y rollback correctos |
 | build real + instalación staging | PASS — la release contenía artefactos Rust, Go y .NET publicado, e instaló en raíz temporal |
-| units systemd empaquetadas en una VM Debian 12 limpia | PASS — engine/agent activos bajo systemd, sockets modo `0660` del grupo del agente, `GetMetrics`/`GetSessions` correctos como agente |
+| units systemd empaquetadas en una VM Debian 12 limpia | PASS — control/engine/agent activos bajo systemd; sesión REST con PostgreSQL llegó a `active`; `GetSessions` del agente vio el peer; revocación vació el motor y liberó el lease |
 | `tests/lab/session-e2e.sh --engine-restart` | PASS — el agente salió al cambiar el backend; el registro fresco reconcilió estado vacío; sesiones viejas quedaron `failed`; leases liberados; claves viejas fallaron; nueva sesión pasó HTTP |
 | reversión de ruta | PASS — `SIGKILL` eliminó `tun0` y la ruta conectada `10.80.1.0/24` |
 | métricas finales registradas | `rx_pkts=5`, `tx_pkts=5`, `dropped_pkts=2`, `peers=1` |
@@ -330,4 +330,5 @@ transiciones fueron observadas.
 - `r0` — implementación del milestone 5: automatización repetible de release/instalación/upgrade/rollback Debian, detección supervisada del reinicio del backend, invalidación/finalización confirmada de sesiones anteriores al reinicio, recuperación con sesión fresca y reversión observada de TUN/ruta transitorios en el laboratorio aislado.
 - `r1` — endurecimiento de revisión: socket de control con grupo propietario sin privilegios y autorización UID preservada; registro atómico del reset de backend; reutilización del reset entre reconexiones antes del ACK; exclusión del nodo del aprovisionamiento hasta ese ACK.
 - `r2` — endurecimiento de instalación: permisos legibles por los servicios normalizados en release/directorios incluso con una umask restrictiva.
+- `r3` — endurecimiento de validación: la evidencia Debian systemd limpia ahora cubre arranque del control plane, aprovisionamiento REST→engine y revocación.
 

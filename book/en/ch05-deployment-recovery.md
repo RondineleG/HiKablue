@@ -247,7 +247,7 @@ Observed on the Ubuntu development VM during this milestone implementation:
 |---|---|
 | `tests/deploy/install-rollback.test.sh` | PASS — reinstall idempotent, config preserved, v1→v2 upgrade and rollback correct |
 | real release build + staged install | PASS — release tree contained the Rust, Go, and published .NET artifacts and installed into a temporary root |
-| packaged systemd units in a clean Debian 12 VM | PASS — engine/agent active under systemd, mode-0660 agent-group sockets, successful agent `GetMetrics`/`GetSessions` |
+| packaged systemd units in a clean Debian 12 VM | PASS — control/engine/agent active under systemd; PostgreSQL-backed REST session reached `active`; agent `GetSessions` saw the peer; revocation emptied the engine and released the lease |
 | `tests/lab/session-e2e.sh --engine-restart` | PASS — agent exited on backend ID change; fresh registration reconciled empty state; pre-restart sessions became `failed`; leases released; old keys failed; fresh session passed HTTP |
 | route rollback in that scenario | PASS — `SIGKILL` removed client `tun0` and the connected `10.80.1.0/24` route |
 | final server metrics in the recorded restart run | `rx_pkts=5`, `tx_pkts=5`, `dropped_pkts=2`, `peers=1` |
@@ -337,4 +337,5 @@ pass line means those transitions were observed in the test root.
 - `r0` — milestone-5 implementation: repeatable Debian release/install/upgrade/rollback automation, supervised backend restart detection, confirmed invalidation of pre-restart sessions, fresh-session recovery, and observed transient-TUN/route rollback in the isolated laboratory.
 - `r1` — review hardening: unprivileged group-owned control socket with UID authorization preserved; atomic backend-reset registration; reset reuse across pre-ACK reconnects; node exclusion from provisioning until the reset ACK.
 - `r2` — installation hardening: service-readable release/directory permissions are normalized even under a restrictive umask.
+- `r3` — validation hardening: clean Debian systemd evidence now covers control-plane startup plus REST-to-engine session provisioning and revocation.
 

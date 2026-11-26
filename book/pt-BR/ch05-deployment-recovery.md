@@ -241,7 +241,7 @@ marco:
 |---|---|
 | `tests/deploy/install-rollback.test.sh` | PASS — reinstalação idempotente, configuração preservada, upgrade v1→v2 e rollback corretos |
 | build real + instalação em staging | PASS — a release continha artefatos Rust, Go e .NET publicado e instalou numa raiz temporária |
-| units systemd empacotadas numa VM Debian 12 limpa | PASS — engine/agent ativos sob systemd, sockets modo `0660` do grupo do agente, `GetMetrics`/`GetSessions` com sucesso como agente |
+| units systemd empacotadas numa VM Debian 12 limpa | PASS — control/engine/agent ativos sob systemd; sessão REST com PostgreSQL chegou a `active`; `GetSessions` do agente viu o peer; revogação esvaziou o engine e liberou o lease |
 | `tests/lab/session-e2e.sh --engine-restart` | PASS — o agente saiu ao trocar o backend; o registro novo reconciliou estado vazio; sessões antigas ficaram `failed`; leases foram liberados; chaves antigas falharam; nova sessão passou HTTP |
 | reversão de rota | PASS — `SIGKILL` removeu `tun0` e a rota conectada `10.80.1.0/24` |
 | métricas finais registradas | `rx_pkts=5`, `tx_pkts=5`, `dropped_pkts=2`, `peers=1` |
@@ -327,4 +327,5 @@ transições foram observadas.
 - `r0` — implementação do Marco 5: automação repetível de release/instalação/upgrade/rollback Debian, detecção supervisionada do reinício do backend, invalidação/finalização confirmada das sessões anteriores ao reinício, recuperação com sessão nova e reversão observada de TUN/rota transitórios no laboratório isolado.
 - `r1` — hardening de revisão: socket de controle com grupo dono sem privilégio e autorização por UID preservada; registro atômico do reset do backend; reutilização do reset entre reconexões antes do ACK; exclusão do nó do provisionamento até esse ACK.
 - `r2` — hardening de instalação: permissões legíveis pelos serviços normalizadas em release/diretórios mesmo sob umask restritiva.
+- `r3` — hardening de validação: a evidência limpa do Debian systemd agora cobre partida do control-plane, provisionamento REST→engine e revogação.
 
