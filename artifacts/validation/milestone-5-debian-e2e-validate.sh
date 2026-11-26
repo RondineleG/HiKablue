@@ -23,11 +23,11 @@ sudo chmod 0755 /usr/share/dotnet/dotnet
 
 log "install hikablue release"
 cd /tmp
-rm -rf hk-debian-release hk-pki
-mkdir hk-debian-release hk-pki
-tar xzf /tmp/hk-release.tar.gz -C hk-debian-release --strip-components=1
+rm -rf hk-debian-e2e-release hk-pki
+mkdir hk-debian-e2e-release hk-pki
+tar xzf /tmp/hk-release.tar.gz -C hk-debian-e2e-release --strip-components=1
 tar xzf /tmp/hk-pki.tar.gz -C hk-pki
-sudo bash /tmp/hk-debian-install.sh --release /tmp/hk-debian-release
+sudo bash /tmp/hk-debian-install.sh --release /tmp/hk-debian-e2e-release
 
 log "configure postgres"
 sudo systemctl enable --now postgresql >/dev/null
