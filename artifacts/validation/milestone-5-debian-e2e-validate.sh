@@ -9,7 +9,7 @@ fail() { echo "DEBIAN-E2E-FAIL: $*" >&2; exit 1; }
 log "install validation prerequisites"
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
-sudo apt-get install -y -qq postgresql postgresql-client curl jq openssl python3 ca-certificates libicu72 >/tmp/hk-apt.log
+sudo apt-get install -y -qq postgresql postgresql-client curl jq openssl python3 ca-certificates libicu72 2>&1 | tee /tmp/hk-apt.log >/dev/null
 
 log "install dotnet runtime"
 sudo rm -rf /usr/share/dotnet /tmp/hk-dotnet-runtime
@@ -139,8 +139,8 @@ curl --cacert /etc/hikablue/pki/ca.crt -sf -X POST https://127.0.0.1:7443/v1/ses
 cat "$create_json"
 session_id=$(jq -r '.data.sessionId' "$create_json")
 session_token=$(jq -r '.data.sessionToken' "$create_json")
-[ "$session_id" != null ] && [ -n "$session_id" ] || fail "session id missing"
-[ "$session_token" != null ] && [ -n "$session_token" ] || fail "session token missing"
+if [ "$session_id" = null ] || [ -z "$session_id" ]; then fail "session id missing"; fi
+if [ "$session_token" = null ] || [ -z "$session_token" ]; then fail "session token missing"; fi
 status=unknown
 status_json=/tmp/hk-session-status.json
 for _ in $(seq 100); do
@@ -230,6 +230,7 @@ sudo -u hikablue-agent python3 /tmp/hk-control-query-empty.py
 printf 'leases_remaining=%s\n' "$(sudo -u postgres psql -d hikablue -Atc "select count(*) from ip_leases where session_id='$session_id'")"
 
 log "system evidence"
+# shellcheck disable=SC1091
 . /etc/os-release
 printf 'debian=%s\n' "$PRETTY_NAME"
 printf 'kernel=%s\n' "$(uname -r)"
