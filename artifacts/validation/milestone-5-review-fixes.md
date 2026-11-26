@@ -3,12 +3,19 @@
 - Repository: `RondineleG/HiKablue`
 - Fix branch: `fix/milestone-5-review-blockers`
 - Base under review: PR #24 HEAD `3be9fe620a1b9b33c4fe1731151e7c04117f4db1`
-- Validated code/test commit: `3dbc5fd71be65838ce6ca25db1f364aa395be0c5`
-- Documentation alignment commit: `bacf03f478c52f43608e9f0ccb62b5807734a3f0`
+- Stream-publication implementation commit: `a3e039a4af5348c2b2269d5a57c3a2f5016fb82c`
+- Validated executable/test commit: `8b1424e21b50650e1aa90c17885bc67e4fbce3cb`
+- Debian-validated release commit: `e2e1addf92d1fc3f408e24148de075fc0785d80a` (`e2e1addf92d1` in the release `VERSION` file; later commits on the branch changed documentation/evidence only)
 - Host for regression/lab gates: Ubuntu 22.04.5 LTS, kernel 6.8.0-1060-aws
-- systemd service validation VM: Debian GNU/Linux 12 (bookworm), kernel 6.1.0-56-cloud-amd64, booted as a clean ephemeral cloud-image VM and discarded after validation
+- systemd end-to-end validation VM: Debian GNU/Linux 12 (bookworm), kernel 6.1.0-56-cloud-amd64, booted as a clean ephemeral cloud-image VM and discarded after validation
 - Toolchains observed: Go 1.18.1, Rust 1.99.1, .NET SDK 10.0.300, ShellCheck 0.8.0
-- Traffic boundary: only repository-generated isolated-lab traffic in network namespaces and loopback/RFC1918 test addresses. The Debian validation used no tunnel traffic; it checked service startup and local Unix sockets only.
+- Traffic boundary: repository-generated isolated-lab traffic only in network namespaces and loopback/RFC1918 test addresses. The Debian validation provisioned and revoked one lab session through local services but generated no external tunnel traffic.
+
+## Fixes covered by this round
+
+- The node stream is now allocated and the superseded stream hidden before registration state is touched, but the replacement is not visible to the dispatcher until the registration transaction commits (`BeginAttach`/`Publish`). If registrations race, only the newer committed generation remains published.
+- Release and parent directories are normalized to service-readable permissions even when a release archive was unpacked under a restrictive umask. Live `.env` files remain root-owned mode `0600`; secrets do not belong in release trees.
+- The earlier review fixes remain covered: atomic backend-reset registration, pending-reset reuse across pre-ACK reconnects, provisioning exclusion until reset ACK, and group-owned sockets with UID authorization preserved.
 
 ## Regression and coverage
 
@@ -17,8 +24,6 @@ Commands:
 ```bash
 bash tests/checks.sh --lab
 export PATH="$HOME/.dotnet:$PATH"
-dotnet test control-dotnet/VpnControl.Tests -v q --nologo
-bash tests/coverage.sh
 bash tests/deploy/install-rollback.test.sh
 bash tests/book/check-parity.sh
 ```
@@ -30,11 +35,16 @@ Observed results:
 | full repository gate `bash tests/checks.sh --lab` | PASS — `passed: 21 failed: 0 skipped: 0` |
 | Rust fmt/clippy/test/release build inside gate | PASS — 115 tests passed |
 | Go gofmt/vet/tests inside gate | PASS |
-| .NET build/tests inside gate | PASS — 162 tests passed, 0 failed, 0 skipped |
-| final .NET regression at commit `3dbc5fd` | PASS — 162 tests passed, 0 failed, 0 skipped |
-| offline install/rollback | PASS — installation repeatable, config preserved, upgrade/rollback correct |
+| .NET build/tests inside gate | PASS — 165 tests passed, 0 failed, 0 skipped |
+| offline install/rollback | PASS — installation repeatable, config preserved, restrictive-umask permissions corrected, upgrade/rollback correct |
 | book parity | PASS — en/es/pt-BR chapter parity |
-| coverage floor | PASS — Rust 91.69% lines, Go 90.4% statements, C# 96.0% lines |
+| coverage floor | PASS — Rust 91.69% lines, Go 90.4% statements, C# 95.9% lines |
+
+The stream-publication regression tests include:
+
+- `BeginAttachHidesTheOldStreamWithoutPublishingTheNewOne` — the previous stream is hidden/cancelled while no replacement is visible before commit.
+- `PublishKeepsTheNewerStreamWhenRegistrationsRace` — a newer prepared registration wins; the older stream is not left published.
+- `StreamIsHiddenUntilRegistrationCommitThenPublished` — a PostgreSQL trigger slows the node update; during the open registration transaction the node has no visible stream, and after commit the replacement becomes visible.
 
 The reset-recovery regression tests include:
 
@@ -69,45 +79,55 @@ OBSERVED: a fresh session with fresh keys restored service connectivity after en
 session-e2e (engine-restart): PASS
 ```
 
-## Real Debian systemd validation — distinct from offline install
+## Real Debian systemd end-to-end validation — distinct from offline install
 
-Offline install/rollback is a file-layout validation in a temporary root. It does not start services. Real service startup was validated separately in a clean Debian 12 cloud-image VM with systemd running.
+Offline install/rollback is a file-layout validation in a temporary root. It does not start services. Real service startup and provisioning were validated separately in a clean Debian 12 cloud-image VM with systemd running.
 
 Commands, summarized exactly by phase:
 
 ```bash
 # built the release on the validation host
-deploy/debian/build-release.sh --force --output /tmp/hk-debian-release
+deploy/debian/build-release.sh --force --output /tmp/hk-debian-e2e-release
 
-# inside the clean Debian VM, after copying the release and lab-only test PKI
+# inside the clean Debian VM, after copying the release, a portable .NET runtime,
+# and lab-only test PKI
 sudo bash /tmp/hk-debian-install.sh --release /tmp/hk-debian-release
-sudo systemctl start hikablue-engine.service
-sudo systemctl start hikablue-agent.service
-stat -c '%a %U %G %n' /run/hikablue-engine/*.sock
-sudo -u hikablue-agent python3 /tmp/hk-debian-socket-query.py
+sudo systemctl restart hikablue-control.service
+sudo systemctl restart hikablue-engine.service
+sudo systemctl restart hikablue-agent.service
+curl --cacert /etc/hikablue/pki/ca.crt -X POST https://127.0.0.1:7443/v1/sessions ...
+sudo -u hikablue-agent python3 /tmp/hk-control-query.py
+sudo -u hikablue-agent /opt/hikablue/current/bin/vpn-agent --metrics-sock /run/hikablue-engine/engine.sock
+curl --cacert /etc/hikablue/pki/ca.crt -X DELETE https://127.0.0.1:7443/v1/sessions/<id> ...
 ```
 
 Observed output:
 
 ```text
-debian=Debian GNU/Linux 12 (bookworm)
-kernel=6.1.0-56-cloud-amd64
-release=4aa44d137717
+installed release e2e1addf92d1
+control=active
 engine=active
 agent=active
 660 hikablue-engine hikablue-agent /run/hikablue-engine/control.sock
 660 hikablue-engine hikablue-agent /run/hikablue-engine/engine.sock
-GetMetrics:ok:{"dropped_pkts": 13, "epochs": [], "invalid_inner_dst_total": 0, "invalid_inner_src_total": 0, "peers": 0, "rotations_total": 0, "rx_bytes": 0, "rx_pkts": 0, "rx_unknown_sender_index_total": 0, "tx_bytes": 0, "tx_pkts": 0, "uptime_secs": 5}
-GetSessions:ok:{"backend_instance_id": "5d7e9cc16021a2ab27a76f15916a9832", "epochs": [], "lab_session_id": null, "peers": [], "revocations": 0}
+session_status=active
+session_virtual_ip=10.80.1.134
+outbox_states=SyncState:acked:attempts=1,ProvisionPeer:acked:attempts=1
+GetSessions status=ok with one active peer at 10.80.1.134
+GetMetrics:{"rx_bytes":0,"rx_pkts":0,"tx_bytes":0,"tx_pkts":0,"dropped_pkts":12,"peers":0,"uptime_secs":2}
+session_final_status=revoked
+GetSessionsAfterRevoke status=ok with zero peers and revocations=1
+leases_remaining=0
+debian=Debian GNU/Linux 12 (bookworm)
+kernel=6.1.0-56-cloud-amd64
+release=e2e1addf92d1
+control=active engine=active agent=active
+DEBIAN-E2E-PASS
 ```
 
-The raw captured output is stored beside this report as `milestone-5-review-fixes-systemd.txt`. The agent deliberately pointed at `127.0.0.1:1` because this validation targeted service account/socket startup, not control-plane availability; it remained active while retrying the orchestrator. The control-plane unit was not started in this VM.
-
-## Remaining review blocker
-
-- The dispatcher/stream-publication race in `NodeStreamRegistry.Attach` remains escalated for human architectural review. The direct database tests cover the requested registration/provisioning lock, but changing when streams become visible to the dispatcher is a broader design decision and was not hidden inside this fix.
+The sanitized captured output is stored beside this report as `milestone-5-review-fixes-debian-e2e.txt`; ephemeral session keys and the one-time session token are redacted. This validation proves the packaged control-plane, engine, and agent units start under their service accounts, the agent registers over mTLS, REST session creation reaches the outbox/gRPC/agent/engine path, the peer is visible through the UID-authorized control socket, and revocation removes the peer and releases the lease.
 
 ## Explicitly not validated here
 
 - PostgreSQL rollback/backup, certificate issuance by a real CA process, secret rotation, production routing, NAT, DNS, full tunneling, IPv6 policy, and WireGuard remain outside this milestone.
-- The Debian systemd validation did not start the control-plane unit or perform end-to-end provisioning; those paths were covered by the isolated laboratory gate on the Ubuntu host.
+- The Debian end-to-end validation did not generate client tunnel traffic; packet forwarding and application connectivity remain covered by the isolated Ubuntu laboratory scenarios above.

@@ -1,0 +1,95 @@
+
+== install validation prerequisites
+debconf: unable to initialize frontend: Dialog
+debconf: (Dialog frontend will not work on a dumb terminal, an emacs shell buffer, or without a controlling terminal.)
+debconf: falling back to frontend: Readline
+debconf: unable to initialize frontend: Readline
+debconf: (Can't locate Term/ReadLine.pm in @INC (you may need to install the Term::ReadLine module) (@INC contains: /etc/perl /usr/local/lib/x86_64-linux-gnu/perl/5.36.0 /usr/local/share/perl/5.36.0 /usr/lib/x86_64-linux-gnu/perl5/5.36 /usr/share/perl5 /usr/lib/x86_64-linux-gnu/perl-base /usr/lib/x86_64-linux-gnu/perl/5.36 /usr/share/perl/5.36 /usr/local/lib/site_perl) at /usr/share/perl5/Debconf/FrontEnd/Readline.pm line 7, <> line 26.)
+debconf: falling back to frontend: Teletype
+dpkg-preconfigure: unable to re-open stdin: 
+
+== install dotnet runtime
+Microsoft.AspNetCore.App 10.0.8 [/usr/share/dotnet/shared/Microsoft.AspNetCore.App]
+Microsoft.NETCore.App 10.0.8 [/usr/share/dotnet/shared/Microsoft.NETCore.App]
+
+== install hikablue release
+installed release e2e1addf92d1
+current release: e2e1addf92d1
+services installed but not started: hikablue-engine.service hikablue-agent.service hikablue-control.service
+
+== configure postgres
+Synchronizing state of postgresql.service with SysV service script with /lib/systemd/systemd-sysv-install.
+Executing: /lib/systemd/systemd-sysv-install enable postgresql
+NOTICE:  database "hikablue" does not exist, skipping
+NOTICE:  role "hikablue" does not exist, skipping
+
+== configure services
+
+== start control plane
+control=active
+
+== start engine and agent
+engine=active
+agent=active
+660 hikablue-engine hikablue-agent /run/hikablue-engine/control.sock
+660 hikablue-engine hikablue-agent /run/hikablue-engine/engine.sock
+
+== provision session end to end
+{"success":true,"statusCode":202,"message":"session pending","data":{"sessionId":"9cda16d3-0206-406f-a846-494bd9893abb","status":"pending","virtualIp":"10.80.1.134","nodeId":"node-a","labSessionId":1,"expiresAt":"2026-11-26T00:24:47.5166395+00:00","failureReason":null,"statusUrl":"/v1/sessions/9cda16d3-0206-406f-a846-494bd9893abb","egressKey":"<redacted>","ingressKey":"<redacted>","senderIndex":231674809,"peerIndex":1086366530,"sessionToken":"<redacted>"},"errors":null,"timestamp":"2026-11-26T00:21:47.6148982+00:00","correlationId":"00-9101ebeb3543eeabbda3236d1fa3b0bf-c897912609210724-00"}session_status=active
+session_virtual_ip=10.80.1.134
+outbox_states=SyncState:acked:attempts=1,ProvisionPeer:acked:attempts=1
+
+== query engine control socket as agent
+GetSessions:{"request_id": "debian-validation", "result": {"backend_instance_id": "87d12c23f0e417d80f9635fb96018c4f", "epochs": [{"key_epoch": 1, "peer_index": 1086366530, "role": "active", "rx_pkts": 0, "sender_index": 231674809, "tx_pkts": 0}], "lab_session_id": 1, "peers": [{"endpoint": null, "epochs": [{"key_epoch": 1, "peer_index": 1086366530, "role": "active", "rx_pkts": 0, "sender_index": 231674809, "tx_pkts": 0}], "lab_session_id": 1, "virtual_ip": "10.80.1.134"}], "revocations": 0}, "status": "ok", "version": 1}
+GetMetrics:{"rx_bytes":0,"rx_pkts":0,"tx_bytes":0,"tx_pkts":0,"dropped_pkts":12,"peers":0,"uptime_secs":2}
+
+== revoke session and confirm removal
+session_final_status=revoked
+GetSessionsAfterRevoke:{"request_id": "debian-validation", "result": {"backend_instance_id": "87d12c23f0e417d80f9635fb96018c4f", "epochs": [], "lab_session_id": null, "peers": [], "revocations": 1}, "status": "ok", "version": 1}
+leases_remaining=0
+
+== system evidence
+debian=Debian GNU/Linux 12 (bookworm)
+kernel=6.1.0-56-cloud-amd64
+release=e2e1addf92d1
+control=active engine=active agent=active
+
+JOURNAL_CONTROL
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]: info: Microsoft.EntityFrameworkCore.Database.Command[20101]
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       Executed DbCommand (1ms) [Parameters=[@sessionId='?' (DbType = Guid)], CommandType='Text', CommandTimeout='30']
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       SELECT s.session_id, s.created_at, s.egress_key, s.expires_at, s.failure_reason, s.idempotency_key, s.ingress_key, s.key_epoch, s.lab_session_id, s.node_id, s.owner_subject, s.peer_index, s.peer_public_key, s.request_hash, s.sender_index, s.session_token_hash, s.status, s.updated_at, s.virtual_ip
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       FROM sessions AS s
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       WHERE s.session_id = @sessionId
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       LIMIT 1
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]: info: Microsoft.AspNetCore.Http.Result.OkObjectResult[1]
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       Setting HTTP status code 200.
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]: info: Microsoft.AspNetCore.Http.Result.OkObjectResult[3]
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       Writing value of type 'ApiResponse`1' as Json.
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]: info: Microsoft.AspNetCore.Routing.EndpointMiddleware[1]
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       Executed endpoint 'HTTP: GET /v1/sessions/{id:guid} => GetAsync'
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]: info: Microsoft.AspNetCore.Hosting.Diagnostics[2]
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       Request finished HTTP/2 GET https://127.0.0.1:7443/v1/sessions/9cda16d3-0206-406f-a846-494bd9893abb - 200 - application/json;+charset=utf-8 1.4497ms
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]: info: Microsoft.EntityFrameworkCore.Database.Command[20101]
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       Executed DbCommand (1ms) [Parameters=[p0='?' (DbType = DateTime), p1='?' (DbType = DateTime), p2='?' (DbType = Int32)], CommandType='Text', CommandTimeout='30']
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       SELECT candidate.* FROM outbox candidate
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       WHERE ((candidate.status = 'pending'
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:            AND (candidate.next_retry_at IS NULL OR candidate.next_retry_at <= @p0))
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:           OR (candidate.status = 'sent' AND candidate.deadline <= @p1))
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:         AND NOT EXISTS (
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:           SELECT 1 FROM outbox earlier
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:           WHERE earlier.node_id = candidate.node_id
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:             AND earlier.status IN ('pending', 'sent')
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:             AND (earlier.revision, earlier.created_at, earlier.command_id) <
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:                 (candidate.revision, candidate.created_at, candidate.command_id)
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:         )
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       ORDER BY candidate.revision, candidate.created_at, candidate.command_id
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       LIMIT @p2
+Nov 26 00:21:48 hkdebian hikablue-control-service[3057]:       FOR UPDATE OF candidate SKIP LOCKED
+
+JOURNAL_ENGINE
+Nov 26 00:21:45 hkdebian systemd[1]: Started hikablue-engine.service - HiKablue isolated-lab VPN engine.
+Nov 26 00:21:45 hkdebian hikablue-engine-service[3088]: vpn-engine server: 10.232.0.1/24 mtu=1400 bind=127.0.0.1:51820
+
+JOURNAL_AGENT
+Nov 26 00:21:46 hkdebian systemd[1]: Started hikablue-agent.service - HiKablue node orchestration agent.
+DEBIAN-E2E-PASS
