@@ -103,6 +103,8 @@ curl --cacert /etc/hikablue/pki/ca.crt -sf -X POST https://127.0.0.1:7443/v1/ses
     -H 'Idempotency-Key: debian-validation-1' \
     -d '{"nodeId":"node-a","ttlSeconds":180}' > "$create_json"
 jq '.data.sessionToken="<redacted>" | .data.egressKey="<redacted>" | .data.ingressKey="<redacted>"' "$create_json"
+session_id=$(jq -r '.data.sessionId' "$create_json")
+session_token=$(jq -r '.data.sessionToken' "$create_json")
 sudo -u hikablue-agent python3 /tmp/hk-control-query.py
 sudo -u hikablue-agent /opt/hikablue/current/bin/vpn-agent --metrics-sock /run/hikablue-engine/engine.sock
 curl --cacert /etc/hikablue/pki/ca.crt -sf -X DELETE "https://127.0.0.1:7443/v1/sessions/$session_id" \
