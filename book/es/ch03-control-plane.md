@@ -430,15 +430,31 @@ commit, y solo si ningún registro más nuevo ya ganó:
 ```csharp
 var prepared = streams.BeginAttach(nodeId, register.BackendInstanceId,
     responseStream, closed);
-await OnRegisterAsync(nodeId, register, linked.Token, streamEpoch);
-if (!streams.Publish(nodeId, prepared))
+var streamEpoch = prepared.StreamEpoch;
+ActiveStream? active = null;
+
+try
+{
+    using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+        ct, closed.Token);
+    await OnRegisterAsync(nodeId, register, linked.Token, streamEpoch);
+    if (!streams.Publish(nodeId, prepared))
+    {
+        throw new RpcException(new Status(StatusCode.Aborted,
+            "stream superseded by a newer registration"));
+    }
+    active = prepared;
 ```
 
-La línea 1 reserva un epoch único dentro del proceso y quita el stream
-anterior de la vista del dispatcher. La línea 3 ejecuta la transacción
-atómica de registro. La línea 5 publica solo después del commit; un
-resultado falso significa que un registro más nuevo manda y este stream
-se cierra. La asignación del epoch conserva el cálculo monótono:
+`BeginAttach` reserva un epoch único dentro del proceso y quita el
+stream anterior de la vista del dispatcher. `streamEpoch` lleva esa
+identidad al registro y al detach posterior. `active` empieza nulo para
+que la limpieza no desacople un stream nunca publicado. `linked` combina
+la cancelación del llamador con la cancelación de fencing.
+`OnRegisterAsync` ejecuta la transacción atómica de registro. `Publish`
+corre solo después del commit; un resultado falso significa que un
+registro más nuevo manda y lanza `Aborted` en lugar de activar este
+stream. `active = prepared` solo se alcanza tras publicar con éxito. La asignación del epoch conserva el cálculo monótono:
 
 ```csharp
 _lastEpoch = Math.Max(_timeProvider.GetUtcNow().ToUnixTimeMilliseconds(),

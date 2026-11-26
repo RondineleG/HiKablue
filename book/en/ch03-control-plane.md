@@ -400,14 +400,34 @@ commit, and only if no newer registration has already won:
 ```csharp
 var prepared = streams.BeginAttach(nodeId, register.BackendInstanceId,
     responseStream, closed);
-await OnRegisterAsync(nodeId, register, linked.Token, streamEpoch);
-if (!streams.Publish(nodeId, prepared))
+var streamEpoch = prepared.StreamEpoch;
+ActiveStream? active = null;
+
+try
+{
+    using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+        ct, closed.Token);
+    await OnRegisterAsync(nodeId, register, linked.Token, streamEpoch);
+    if (!streams.Publish(nodeId, prepared))
+    {
+        throw new RpcException(new Status(StatusCode.Aborted,
+            "stream superseded by a newer registration"));
+    }
+    active = prepared;
 ```
 
-Line 1 reserves a unique process-local epoch and removes the old stream
-from dispatcher visibility. Line 3 performs the atomic registration
-transaction. Line 5 publishes only after commit; a false result means a
-newer registration is authoritative and this stream closes instead.
+`BeginAttach` reserves a unique process-local epoch and removes the old
+stream from dispatcher visibility. `streamEpoch` carries that identity
+into registration and later detach. `active` starts null so cleanup does
+not detach a stream that was never published. `linked` combines caller
+cancellation with fencing cancellation. `OnRegisterAsync` performs the
+atomic registration transaction. `Publish` runs only after commit; a
+false result means a newer registration is authoritative and throws
+`Aborted` instead of activating this stream. `active = prepared` is
+reached only after publication succeeds. After taking the node-row lock,
+registration also checks that its epoch is still the latest prepared epoch
+for that node; a superseded registration aborts before it can overwrite
+the newer backend identity or enqueue another reset.
 Epoch allocation itself still uses the monotonic calculation:
 
 ```csharp
