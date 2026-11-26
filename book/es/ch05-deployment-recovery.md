@@ -57,6 +57,9 @@ sin secretos, crea los usuarios en un host real y mueve atómicamente
 `/opt/hikablue/current`. No arranca los servicios. Repetir la instalación
 de la misma release sin cambios es no-op; usar la misma versión con contenido
 distinto falla en lugar de mutar una release activa.
+Los directorios de la release y sus padres quedan normalizados con permisos
+legibles por los servicios; los archivos de entorno siguen root en modo
+`0600` y los secretos nunca pertenecen al árbol de release.
 
 Una actualización usa el mismo comando con otra versión. El destino anterior
 queda en `/opt/hikablue/previous`. `deploy/debian/rollback.sh` devuelve
@@ -66,7 +69,8 @@ irreversible exige backup o una migración inversa probada.
 
 La prueba offline es [`tests/deploy/install-rollback.test.sh`](../../tests/deploy/install-rollback.test.sh).
 Usa una raíz temporal, demuestra idempotencia, conserva configuración del
-operador, actualiza `v1`→`v2`, revierte y rechaza una release ausente. No
+operador, comprueba permisos legibles por los servicios con una umask
+restrictiva, actualiza `v1`→`v2`, revierte y rechaza una release ausente. No
 crea usuarios ni toca rutas, firewall o servicios del host.
 
 ## systemd como supervisor
@@ -325,4 +329,5 @@ transiciones fueron observadas.
 
 - `r0` — implementación del milestone 5: automatización repetible de release/instalación/upgrade/rollback Debian, detección supervisada del reinicio del backend, invalidación/finalización confirmada de sesiones anteriores al reinicio, recuperación con sesión fresca y reversión observada de TUN/ruta transitorios en el laboratorio aislado.
 - `r1` — endurecimiento de revisión: socket de control con grupo propietario sin privilegios y autorización UID preservada; registro atómico del reset de backend; reutilización del reset entre reconexiones antes del ACK; exclusión del nodo del aprovisionamiento hasta ese ACK.
+- `r2` — endurecimiento de instalación: permisos legibles por los servicios normalizados en release/directorios incluso con una umask restrictiva.
 

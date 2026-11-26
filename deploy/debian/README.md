@@ -44,7 +44,10 @@ sudo deploy/debian/install.sh --release /path/to/hikablue-<version>
 Repeat installation is intentional and safe: an identical version is reused,
 while the same version with different content is rejected instead of being
 mutated in place. A different version becomes the new `current`; the former
-`current` is recorded as `previous`. Services are installed but not started.
+`current` is recorded as `previous`. Release and parent directories are
+normalized to service-readable permissions even under a restrictive umask;
+live `.env` files remain root-owned mode `0600`. Services are installed but
+not started.
 
 The real install creates these service users when absent:
 `hikablue-engine`, `hikablue-agent`, and `hikablue-control`. The engine unit

@@ -56,6 +56,9 @@ configuration, creates the service users on a real host, and atomically moves
 `/opt/hikablue/current`. It does not start the services. Running it twice
 with the same unchanged release is a no-op; running it with different content
 under the same version fails instead of mutating a running release.
+Release and parent directories are normalized to service-readable
+permissions during installation; environment files remain root-owned mode
+`0600` and live secrets never belong in the release tree.
 
 An upgrade is the same command with a new version. The old target is kept in
 `/opt/hikablue/previous`. `deploy/debian/rollback.sh` swaps `current` back
@@ -66,7 +69,8 @@ migration.
 
 The offline proof is [`tests/deploy/install-rollback.test.sh`](../../tests/deploy/install-rollback.test.sh).
 It uses a temporary root, proves reinstall idempotence, proves operator
-configuration is preserved, upgrades from `v1` to `v2`, rolls back, and
+configuration is preserved, proves service-readable permissions under a
+restrictive umask, upgrades from `v1` to `v2`, rolls back, and
 rejects a missing release. It creates no users and touches no host routes,
 firewall rules, or services.
 
@@ -332,4 +336,5 @@ pass line means those transitions were observed in the test root.
 
 - `r0` — milestone-5 implementation: repeatable Debian release/install/upgrade/rollback automation, supervised backend restart detection, confirmed invalidation of pre-restart sessions, fresh-session recovery, and observed transient-TUN/route rollback in the isolated laboratory.
 - `r1` — review hardening: unprivileged group-owned control socket with UID authorization preserved; atomic backend-reset registration; reset reuse across pre-ACK reconnects; node exclusion from provisioning until the reset ACK.
+- `r2` — installation hardening: service-readable release/directory permissions are normalized even under a restrictive umask.
 

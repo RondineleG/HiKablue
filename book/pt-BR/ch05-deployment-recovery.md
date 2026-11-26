@@ -56,6 +56,9 @@ sem segredos, cria usuários num host real e move atomicamente
 `/opt/hikablue/current`. Ele não inicia os serviços. Repetir a instalação da
 mesma release inalterada é no-op; usar a mesma versão com conteúdo diferente
 falha em vez de mutar uma release ativa.
+Os diretórios da release e seus pais são normalizados com permissões
+legíveis pelos serviços; os arquivos de ambiente continuam root em modo
+`0600` e segredos nunca pertencem à árvore da release.
 
 Upgrade usa o mesmo comando com uma versão nova. O destino anterior fica em
 `/opt/hikablue/previous`. `deploy/debian/rollback.sh` devolve `current` para
@@ -65,7 +68,8 @@ migration reversa testada.
 
 A prova offline é [`tests/deploy/install-rollback.test.sh`](../../tests/deploy/install-rollback.test.sh).
 Ela usa uma raiz temporária, comprova idempotência, preserva configuração do
-operador, atualiza `v1`→`v2`, reverte e rejeita release ausente. Não cria
+operador, verifica permissões legíveis pelos serviços sob umask restritiva,
+atualiza `v1`→`v2`, reverte e rejeita release ausente. Não cria
 usuários nem toca rotas, firewall ou serviços do host.
 
 ## systemd como supervisor
@@ -322,4 +326,5 @@ transições foram observadas.
 
 - `r0` — implementação do Marco 5: automação repetível de release/instalação/upgrade/rollback Debian, detecção supervisionada do reinício do backend, invalidação/finalização confirmada das sessões anteriores ao reinício, recuperação com sessão nova e reversão observada de TUN/rota transitórios no laboratório isolado.
 - `r1` — hardening de revisão: socket de controle com grupo dono sem privilégio e autorização por UID preservada; registro atômico do reset do backend; reutilização do reset entre reconexões antes do ACK; exclusão do nó do provisionamento até esse ACK.
+- `r2` — hardening de instalação: permissões legíveis pelos serviços normalizadas em release/diretórios mesmo sob umask restritiva.
 
