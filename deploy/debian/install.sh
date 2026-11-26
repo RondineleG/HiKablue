@@ -80,6 +80,11 @@ else
     mkdir -p "$tmp"
     cp -a "$release/." "$tmp/"
     chmod 0755 "$tmp/bin/"*
+    # Release trees are public service artifacts: binaries, unit files and
+    # secret-free samples must remain traversable/readable by the service
+    # accounts even when the release archive was unpacked with a restrictive
+    # umask. Live secrets never belong in the release tree.
+    chmod -R a+rX "$tmp"
     mv -- "$tmp" "$target"
     if [ "$real_system" -eq 1 ]; then chown -R root:root "$target"; fi
     echo "installed release $version"
