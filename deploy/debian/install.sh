@@ -69,6 +69,9 @@ install -d -m 0755 "$systemd_dir" "$config_dir"
 
 if [ -d "$target" ]; then
     if diff -qr "$release" "$target" >/dev/null 2>&1; then
+        # diff compares content, not modes. Repair an earlier restrictive
+        # installation as well as accepting an already correct reinstall.
+        chmod -R a+rX "$target"
         echo "release $version already installed unchanged"
     else
         echo "release directory $target exists with different content; build a new version" >&2

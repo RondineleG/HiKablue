@@ -55,8 +55,13 @@ done
 [ -f "$root/etc/systemd/system/hikablue-engine.service" ] || { echo "FAIL: unit not installed" >&2; exit 1; }
 printf '# operator edit\n' >"$root/etc/hikablue/engine.env"
 
+chmod -R go-rwx "$root/opt/hikablue/releases/v1"
 bash "$repo_root/deploy/debian/install.sh" --release "$r1" --root "$root" --no-systemctl >/dev/null
 assert_link "$root/opt/hikablue/current" releases/v1
+[ "$(stat -c %a "$root/opt/hikablue/releases/v1/control/VpnControl.dll")" = 644 ] || {
+    echo "FAIL: reinstall did not repair existing release permissions" >&2
+    exit 1
+}
 [ "$(cat "$root/etc/hikablue/engine.env")" = '# operator edit' ] || {
     echo "FAIL: reinstall overwrote operator config" >&2
     exit 1
