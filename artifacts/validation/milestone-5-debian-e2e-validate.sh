@@ -133,10 +133,9 @@ curl --cacert /etc/hikablue/pki/ca.crt -sf -X POST https://127.0.0.1:7443/v1/ses
     -H 'Content-Type: application/json' -H 'X-Subject: debian-validation' \
     -H 'Idempotency-Key: debian-validation-1' \
     -d '{"nodeId":"node-a","ttlSeconds":180}' >"$create_json" || {
-    cat "$create_json" >&2 2>/dev/null || true
     fail "session creation request failed"
 }
-cat "$create_json"
+jq '.data.sessionToken="<redacted>" | .data.egressKey="<redacted>" | .data.ingressKey="<redacted>"' "$create_json"
 session_id=$(jq -r '.data.sessionId' "$create_json")
 session_token=$(jq -r '.data.sessionToken' "$create_json")
 if [ "$session_id" = null ] || [ -z "$session_id" ]; then fail "session id missing"; fi
@@ -170,13 +169,18 @@ def request(path, op):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(path)
     s.sendall(struct.pack(">I", len(body)) + body)
-    hdr = b""
-    while len(hdr) < 4:
-        hdr += s.recv(4 - len(hdr))
+    def read_exact(count):
+        data = b""
+        while len(data) < count:
+            chunk = s.recv(count - len(data))
+            if not chunk:
+                s.close()
+                raise EOFError("socket closed before complete reply")
+            data += chunk
+        return data
+    hdr = read_exact(4)
     n = struct.unpack(">I", hdr)[0]
-    data = b""
-    while len(data) < n:
-        data += s.recv(n - len(data))
+    data = read_exact(n)
     s.close()
     return json.loads(data)
 
@@ -210,13 +214,18 @@ def request(path, op):
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(path)
     s.sendall(struct.pack(">I", len(body)) + body)
-    hdr = b""
-    while len(hdr) < 4:
-        hdr += s.recv(4 - len(hdr))
+    def read_exact(count):
+        data = b""
+        while len(data) < count:
+            chunk = s.recv(count - len(data))
+            if not chunk:
+                s.close()
+                raise EOFError("socket closed before complete reply")
+            data += chunk
+        return data
+    hdr = read_exact(4)
     n = struct.unpack(">I", hdr)[0]
-    data = b""
-    while len(data) < n:
-        data += s.recv(n - len(data))
+    data = read_exact(n)
     s.close()
     return json.loads(data)
 
@@ -227,7 +236,9 @@ assert len(resp["result"]["peers"]) == 0
 PY
 chmod 0644 /tmp/hk-control-query-empty.py
 sudo -u hikablue-agent python3 /tmp/hk-control-query-empty.py
-printf 'leases_remaining=%s\n' "$(sudo -u postgres psql -d hikablue -Atc "select count(*) from ip_leases where session_id='$session_id'")"
+leases_remaining=$(sudo -u postgres psql -d hikablue -Atc "select count(*) from ip_leases where session_id='$session_id'") || fail "lease count query failed"
+[ "$leases_remaining" = 0 ] || fail "revocation left $leases_remaining lease(s) behind"
+printf 'leases_remaining=%s\n' "$leases_remaining"
 
 log "system evidence"
 # shellcheck disable=SC1091
