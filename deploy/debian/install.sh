@@ -64,10 +64,14 @@ previous="$base/previous"
 systemd_dir=$(path_in_root /etc/systemd/system)
 config_dir=$(path_in_root /etc/hikablue)
 
-mkdir -p "$releases" "$systemd_dir" "$config_dir"
+install -d -m 0755 "$base" "$releases"
+install -d -m 0755 "$systemd_dir" "$config_dir"
 
 if [ -d "$target" ]; then
     if diff -qr "$release" "$target" >/dev/null 2>&1; then
+        # diff compares content, not modes. Repair an earlier restrictive
+        # installation as well as accepting an already correct reinstall.
+        chmod -R a+rX "$target"
         echo "release $version already installed unchanged"
     else
         echo "release directory $target exists with different content; build a new version" >&2
@@ -79,6 +83,11 @@ else
     mkdir -p "$tmp"
     cp -a "$release/." "$tmp/"
     chmod 0755 "$tmp/bin/"*
+    # Release trees are public service artifacts: binaries, unit files and
+    # secret-free samples must remain traversable/readable by the service
+    # accounts even when the release archive was unpacked with a restrictive
+    # umask. Live secrets never belong in the release tree.
+    chmod -R a+rX "$tmp"
     mv -- "$tmp" "$target"
     if [ "$real_system" -eq 1 ]; then chown -R root:root "$target"; fi
     echo "installed release $version"

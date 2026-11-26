@@ -56,6 +56,9 @@ configuration, creates the service users on a real host, and atomically moves
 `/opt/hikablue/current`. It does not start the services. Running it twice
 with the same unchanged release is a no-op; running it with different content
 under the same version fails instead of mutating a running release.
+Release and parent directories are normalized to service-readable
+permissions during installation; environment files remain root-owned mode
+`0600` and live secrets never belong in the release tree.
 
 An upgrade is the same command with a new version. The old target is kept in
 `/opt/hikablue/previous`. `deploy/debian/rollback.sh` swaps `current` back
@@ -66,7 +69,8 @@ migration.
 
 The offline proof is [`tests/deploy/install-rollback.test.sh`](../../tests/deploy/install-rollback.test.sh).
 It uses a temporary root, proves reinstall idempotence, proves operator
-configuration is preserved, upgrades from `v1` to `v2`, rolls back, and
+configuration is preserved, proves service-readable permissions under a
+restrictive umask, upgrades from `v1` to `v2`, rolls back, and
 rejects a missing release. It creates no users and touches no host routes,
 firewall rules, or services.
 
@@ -101,7 +105,8 @@ exec /opt/hikablue/current/bin/vpn-engine server \
     --metrics-sock /run/hikablue-engine/engine.sock \
     --metrics-group "$AGENT_USER" \
     --control-sock /run/hikablue-engine/control.sock \
-    --control-uid "$agent_uid"
+    --control-uid "$agent_uid" \
+    --control-group "$AGENT_USER"
 ```
 
 Line by line:
@@ -118,7 +123,13 @@ Line by line:
 - The metrics socket is telemetry; the control socket is separate because
   provisioning commands can carry key material.
 - `--control-uid` admits the agent account (root and the engine user are
-  also accepted by the socket policy).
+  also accepted by the socket policy); `--control-group` gives the socket
+  file group ownership and mode `0660`. This separation matters: group
+  membership opens the filesystem door, but every accepted connection is
+  still checked by `SO_PEERCRED` against the numeric UID. The unprivileged
+  engine can group-chown a file it owns because systemd places it in the
+  agent group as a supplementary group; it does not need the privileged
+  `chown` operation that made the first version of the unit fail.
 
 ## Backend restart is a new identity
 
@@ -166,7 +177,19 @@ than replayed, because replay could reinstall state before the reset snapshot.
 Registration with a changed backend therefore creates a special empty-state
 `SyncState`. It excludes pre-restart pending/active sessions from the desired
 peer list and carries their IDs plus already-`revoking` IDs as metadata. The agent can apply it
-because the empty desired state matches the fresh backend.
+because the empty desired state matches the fresh backend. The database work
+is atomic: the backend identity change, terminal invalidation of commands
+from the dead generation, and the reset snapshot are committed in one
+transaction. Registration takes the same node-row `FOR UPDATE` lock used by
+session creation, so a concurrent create cannot slip between those writes.
+
+If the stream drops before the reset ACK, the next registration for the same
+backend requeues that same reset row. It does not enqueue a replacement
+snapshot that would resurrect the old peer list. While a reset row with
+backend-reset metadata remains `pending` or `sent`, the node is ineligible
+for new sessions. After the valid applied ACK, creation is allowed again;
+the new session's `ProvisionPeer` command belongs to the new generation and
+is never part of the pre-registration invalidation sweep.
 
 Only an applied ACK has a side effect:
 
@@ -224,6 +247,7 @@ Observed on the Ubuntu development VM during this milestone implementation:
 |---|---|
 | `tests/deploy/install-rollback.test.sh` | PASS — reinstall idempotent, config preserved, v1→v2 upgrade and rollback correct |
 | real release build + staged install | PASS — release tree contained the Rust, Go, and published .NET artifacts and installed into a temporary root |
+| packaged systemd units in a clean Debian 12 VM | PASS — control/engine/agent active under systemd; PostgreSQL-backed REST session reached `active`; agent `GetSessions` saw the peer; revocation emptied the engine and released the lease |
 | `tests/lab/session-e2e.sh --engine-restart` | PASS — agent exited on backend ID change; fresh registration reconciled empty state; pre-restart sessions became `failed`; leases released; old keys failed; fresh session passed HTTP |
 | route rollback in that scenario | PASS — `SIGKILL` removed client `tun0` and the connected `10.80.1.0/24` route |
 | final server metrics in the recorded restart run | `rx_pkts=5`, `tx_pkts=5`, `dropped_pkts=2`, `peers=1` |
@@ -239,7 +263,7 @@ post-restart session.
 |---|---|---|
 | repeatable Debian installation | `deploy/debian/build-release.sh`, `install.sh` | `tests/deploy/install-rollback.test.sh` |
 | upgrade and binary rollback | `deploy/debian/rollback.sh` | same offline test |
-| service ownership | `deploy/debian/systemd/`, `service-scripts/` | shell syntax/static review + runbook |
+| service ownership | `deploy/debian/systemd/`, `service-scripts/` | shell syntax/static review + real systemd socket check |
 | backend restart requires new session | `agent-go/cmd/vpn-agent/main.go`, `control-dotnet/VpnControl/Services/NodeChannelService.cs` | Go/.NET tests + `--engine-restart` lab |
 | stream loss still reconciles | milestone-4 outbox/NodeChannel | `session-e2e.sh --drop` |
 | network restoration | transient TUN ownership | `session-e2e.sh --engine-restart` |
@@ -272,6 +296,7 @@ post-restart session.
 - **`GetSessions`** — engine control operation that reports the backend ID and live peer/key references.
 - **`SO_PEERCRED`** — Unix-socket credential check used to identify the local peer process.
 - **`SyncState`** — control-plane snapshot command carrying the desired peer set plus validation metadata.
+- **`--control-group`** — engine flag choosing the local group that owns the control socket file at mode `0660`; it does not replace UID authorization.
 - **systemd** — Linux service manager responsible for starting, restarting,
   and logging services.
 - **transient TUN** — TUN interface owned by an open file descriptor; it is
@@ -310,4 +335,7 @@ pass line means those transitions were observed in the test root.
 ## Revisions
 
 - `r0` — milestone-5 implementation: repeatable Debian release/install/upgrade/rollback automation, supervised backend restart detection, confirmed invalidation of pre-restart sessions, fresh-session recovery, and observed transient-TUN/route rollback in the isolated laboratory.
+- `r1` — review hardening: unprivileged group-owned control socket with UID authorization preserved; atomic backend-reset registration; reset reuse across pre-ACK reconnects; node exclusion from provisioning until the reset ACK.
+- `r2` — installation hardening: service-readable release/directory permissions are normalized even under a restrictive umask.
+- `r3` — validation hardening: clean Debian systemd evidence now covers control-plane startup plus REST-to-engine session provisioning and revocation.
 

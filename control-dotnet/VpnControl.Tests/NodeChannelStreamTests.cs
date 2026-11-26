@@ -182,6 +182,110 @@ public sealed class NodeChannelStreamTests : IAsyncLifetime
         Assert.False(_streams.TryGet("edge-1", out _));
     }
 
+    [Fact]
+    public async Task StreamIsHiddenUntilRegistrationCommitThenPublished()
+    {
+        var firstReader = new FakeReader(new[] { Register("edge-1", "b1") },
+            blockWhenEmpty: true);
+        var first = NewService().NodeChannelCore("edge-1", firstReader,
+            new FakeWriter(), CancellationToken.None);
+        await WaitForAsync(() =>
+            _streams.TryGet("edge-1", out var s) && s.BackendInstanceId == "b1");
+        await WaitForAsync(async () => await SyncStateQueued());
+
+        await using (var setup = new ControlDbContext(_options))
+        {
+            await setup.Database.ExecuteSqlAsync($"""
+                CREATE OR REPLACE FUNCTION slow_registration_node_update() RETURNS trigger AS $fn$
+                BEGIN
+                    PERFORM pg_sleep(1);
+                    RETURN NEW;
+                END;
+                $fn$ LANGUAGE plpgsql
+                """);
+            await setup.Database.ExecuteSqlAsync($"""
+                CREATE TRIGGER slow_registration_node_update_trigger BEFORE UPDATE ON nodes
+                FOR EACH ROW EXECUTE FUNCTION slow_registration_node_update()
+                """);
+        }
+
+        var secondReader = new FakeReader(new[] { Register("edge-1", "b2") },
+            blockWhenEmpty: true);
+        using var secondCts = new CancellationTokenSource();
+        var second = NewService().NodeChannelCore("edge-1", secondReader,
+            new FakeWriter(), secondCts.Token);
+        try
+        {
+            await Task.Delay(200);
+            Assert.False(_streams.TryGet("edge-1", out _));
+
+            await WaitForAsync(() =>
+                _streams.TryGet("edge-1", out var s) && s.BackendInstanceId == "b2");
+            await first;
+        }
+        finally
+        {
+            secondCts.Cancel();
+            try
+            {
+                await second;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (RpcException)
+            {
+            }
+            await using var cleanup = new ControlDbContext(_options);
+            await cleanup.Database.ExecuteSqlAsync(
+                $"DROP TRIGGER IF EXISTS slow_registration_node_update_trigger ON nodes");
+            await cleanup.Database.ExecuteSqlAsync(
+                $"DROP FUNCTION IF EXISTS slow_registration_node_update()");
+        }
+    }
+
+    [Fact]
+    public async Task SupersededRegistrationCannotOverwriteNewerBackendOrQueueReset()
+    {
+        await NewService().OnRegisterAsync("edge-1", new NodeRegister
+        {
+            NodeId = "edge-1", BackendInstanceId = "b0"
+        }, CancellationToken.None);
+
+        using var olderClosed = new CancellationTokenSource();
+        using var newerClosed = new CancellationTokenSource();
+        var older = _streams.BeginAttach("edge-1", "b1", new FakeWriter(), olderClosed);
+        var newer = _streams.BeginAttach("edge-1", "b2", new FakeWriter(), newerClosed);
+
+        await NewService().OnRegisterAsync("edge-1", new NodeRegister
+        {
+            NodeId = "edge-1", BackendInstanceId = "b2"
+        }, CancellationToken.None, newer.StreamEpoch);
+
+        int outboxCount;
+        int resetCount;
+        await using (var before = new ControlDbContext(_options))
+        {
+            outboxCount = await before.Outbox.CountAsync();
+            resetCount = (await before.Outbox.Select(o => o.Payload).ToListAsync())
+                .Count(BackendResetState.IsPendingResetPayload);
+            Assert.Equal(1, resetCount);
+        }
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            NewService().OnRegisterAsync("edge-1", new NodeRegister
+            {
+                NodeId = "edge-1", BackendInstanceId = "b1"
+            }, CancellationToken.None, older.StreamEpoch));
+        Assert.Equal(StatusCode.Aborted, ex.Status.StatusCode);
+
+        await using var db = new ControlDbContext(_options);
+        Assert.Equal("b2", (await db.Nodes.SingleAsync()).BackendInstanceId);
+        Assert.Equal(outboxCount, await db.Outbox.CountAsync());
+        Assert.Equal(resetCount, (await db.Outbox.Select(o => o.Payload).ToListAsync())
+            .Count(BackendResetState.IsPendingResetPayload));
+    }
+
     private async Task<bool> SyncStateQueued()
     {
         await using var db = new ControlDbContext(_options);

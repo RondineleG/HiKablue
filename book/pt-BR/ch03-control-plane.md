@@ -87,6 +87,8 @@ migration, e insert/delete do lease vão por SQL bruto — Npgsql mapea
 
 1. `INSERT ... ON CONFLICT DO NOTHING` do nó, depois
    `SELECT node_id ... FOR UPDATE` — um provisionamento por vez por nó.
+   O registro do backend toma esse mesmo lock, e um nó com reset de backend
+   ainda esperando ACK não é elegível para novas sessões.
 2. `lab_session_id = COALESCE(MAX(...), 0) + 1` sob esse lock.
 3. Endereços candidatos vêm do CIDR **inteiro**, embaralhados por hash
    com `HashCode.Combine(node_id, session_id, address)` — sondagem
@@ -132,9 +134,12 @@ prometia:
   falar como si mesmo.
 - **`NodeChannelService`.** O primeiro frame tem que ser `NodeRegister`;
   o `stream_epoch` é um ID numérico monotônico iniciado em milissegundos Unix,
-  atribuído na conexão (veja r2 abaixo), e o
-  `NodeStreamRegistry` substitui atomicamente qualquer stream anterior
-  (seu CancellationTokenSource é cancelado — o interruptor de fencing).
+  atribuído ao preparar o stream substituto (veja r2 abaixo). O
+  `NodeStreamRegistry` oculta qualquer stream anterior antes da transação
+  de registro e publica o substituto somente depois do commit. Enquanto o
+  registro está aberto, o dispatcher não vê stream para o nó, então não
+  consegue carimbar comandos com uma geração ainda não confirmada; um
+  registro superado nunca se torna visível.
   Heartbeats renovam `nodes.last_seen_at` e o registry em memória. Um
   `CommandAck` é correlacionado por `command_id` *e* verificado: um ack
   com outro `stream_epoch` ou `backend_instance_id` é ignorado.
@@ -146,9 +151,12 @@ prometia:
   e revoga a sessão); `FENCED_STREAM`/`FENCED_BACKEND` falham a linha,
   fecham o stream e enfileiram um `SyncState` de ressincronização;
   `REVISION_REGRESSION` e `INVALID_PAYLOAD` marcam a linha como falha.
-  Na primeira tentativa, uma rejeição por prazo marca a linha como
-  falha e um erro recuperável volta a `pending` com `next_retry_at`
-  de 250 ms. No reenvio, essas respostas podem ser de uma tentativa
+  Na primeira tentativa, uma rejeição por prazo marca como falha um comando
+  comum e um erro recuperável volta a `pending` com `next_retry_at` de
+  250 ms. Um `SyncState` de reset do backend é a exceção: a rejeição prova
+  que aquela tentativa não foi aplicada, então o reset volta a `pending`
+  em vez de reabrir o provisionamento antes da confirmação. No reenvio,
+  essas respostas podem ser de uma tentativa
   anterior: o ACK não inclui o número da tentativa. A linha continua
   `sent` até um `APPLIED` ou a recuperação no prazo atual.
 - **`OutboxDispatcherWorker`.** Uma transação curta com
@@ -200,6 +208,16 @@ prometia:
   solicita reconciliação via `SyncState`. O estado não é salvo em disco;
   o handler continua precisando ser idempotente.
 
+  No lado do plano de controle, o registro do backend é uma única transação:
+  atualização da identidade do nó, invalidação dos comandos da geração
+  antiga e enfileiramento do `SyncState` de reset fazem commit ou rollback
+  juntos. A transação primeiro bloqueia a mesma linha do nó usada no
+  provisionamento. Se o stream desconecta antes do ACK do reset, uma
+  reconexão do mesmo backend reenfileira essa linha pendente ou enviada em
+  vez de duplicá-la com um snapshot que inclua sessões anteriores ao
+  reinício. O nó marcado pelo reset fica excluído da criação de sessões
+  até que um ACK válido complete a recuperação.
+
 Verificado localmente: 16 novos testes C# (matriz de aceitação e rejeição
 SPIFFE, fencing, liberação do lease em ack de revogação) e 14 testes Go —
 um handshake mTLS real contra uma CA de teste, rejeição de certificado
@@ -238,6 +256,9 @@ private Task<int> LockNodeAsync(string nodeId, CancellationToken ct) =>
   `CreateSessionAsync` concorrente deste nó se serializa aqui, então o
   `MAX(lab_session_id)+1` abaixo é calculado por exatamente uma
   transação.
+  O `NodeChannelService.OnRegisterAsync` toma deliberadamente o mesmo
+  lock, então mudanças de geração do backend não podem se intercalar com
+  o provisionamento.
 - `ExecuteSqlAsync` interpola parâmetros (`{nodeId}`) — **não** é
   concatenação de string; Npgsql os envia como parâmetros vinculados.
 
@@ -400,21 +421,56 @@ aberto e encerra com `PermissionDenied`. Após o EOF no envio seguinte,
 o keepalive do transporte continua como contingência.
 
 Duas reconexões podem ocorrer no mesmo milissegundo; o relógio pode recuar.
-`NodeStreamRegistry.Attach` calcula o seguinte dentro do mesmo bloqueio
-que publica o stream substituto:
+`BeginAttach` atribui o epoch e oculta o stream anterior antes da transação
+de registro. `Publish` expõe o substituto somente depois do commit, e só
+se nenhum registro mais novo já tiver vencido:
+
+```csharp
+var prepared = streams.BeginAttach(nodeId, register.BackendInstanceId,
+    responseStream, closed);
+var streamEpoch = prepared.StreamEpoch;
+ActiveStream? active = null;
+
+try
+{
+    using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+        ct, closed.Token);
+    await OnRegisterAsync(nodeId, register, linked.Token, streamEpoch);
+    if (!streams.Publish(nodeId, prepared))
+    {
+        throw new RpcException(new Status(StatusCode.Aborted,
+            "stream superseded by a newer registration"));
+    }
+    active = prepared;
+```
+
+`BeginAttach` reserva um epoch único no processo e remove o stream
+anterior da visão do dispatcher. `streamEpoch` carrega essa identidade
+para o registro e o detach posterior. `active` começa nulo para que a
+limpeza não desconecte um stream nunca publicado. `linked` combina o
+cancelamento do chamador com o cancelamento de fencing. `OnRegisterAsync`
+executa a transação atômica de registro. `Publish` roda somente depois
+do commit; um resultado falso significa que um registro mais novo é
+autoritativo e lança `Aborted` em vez de ativar este stream.
+`active = prepared` só é alcançado após publicação bem-sucedida. Depois
+de obter o lock da linha do nó, o registro também verifica se seu epoch
+ainda é o mais recente preparado para esse nó; um registro superado aborta
+antes de sobrescrever a identidade do backend novo ou enfileirar outro reset. A
+atribuição do epoch mantém o cálculo monotônico:
 
 ```csharp
 _lastEpoch = Math.Max(_timeProvider.GetUtcNow().ToUnixTimeMilliseconds(),
     checked(_lastEpoch + 1));
 ```
 
-A linha 1 obtém os milissegundos Unix de um relógio injetável. A linha 2
-escolhe pelo menos o ID anterior mais um; `checked` lança uma exceção em vez
-de permitir overflow. A atribuição do epoch e a substituição são serializadas;
-o cancelamento permanece fora do bloqueio. O `Detach` antigo não remove o
-sucessor. `NodeStreamRegistryTests` cobre relógio congelado, recuo do relógio,
-limpeza obsoleta e conexões concorrentes. A monotonicidade vale **dentro de
-um registro/processo**, não é um protocolo persistente entre control planes.
+A primeira linha obtém milissegundos Unix de um relógio injetável. A
+segunda escolhe pelo menos o ID anterior mais um; `checked` lança exceção
+em vez de permitir overflow. O cancelamento permanece fora do bloqueio do
+registry, e o `Detach` antigo não remove o sucessor.
+`NodeStreamRegistryTests` cobre relógio congelado, recuo do relógio,
+limpeza obsoleta, conexões concorrentes, ocultação antes do commit e
+publicações concorrentes. A monotonicidade vale **dentro de um
+registro/processo**, não é um protocolo persistente entre control planes.
 
 **Termos:** `context.WithCancel` cria um escopo filho de cancelamento;
 `defer` executa limpeza ao retornar; `<-heartbeatDone` espera o fechamento
@@ -567,3 +623,5 @@ a sessão ficou `revoked` e o lease chegou a zero. A não foi reativada.
   ownership de recursos por execução e o cenário `--expire-restart` que
   prova a expiração local através de um reinício do agente.
 - `r6` — semântica do reinício do backend refinada no Marco 5: sessões antigas ficam fora do primeiro snapshot do backend novo, viram `failed` só após aplicação confirmada e exigem nova sessão de API.
+- `r7` — recuperação do reset serializada com provisionamento: registro atômico, resets pendentes preservados entre reconexões antes do ACK e nós inelegíveis até o ACK confirmador.
+- `r8` — publicação de stream endurecida: streams substitutos ficam ocultos enquanto o registro não confirma e são publicados somente depois do commit da transação.

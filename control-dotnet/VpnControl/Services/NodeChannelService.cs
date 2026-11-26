@@ -63,15 +63,25 @@ public sealed class NodeChannelService(
         }
 
         var closed = new CancellationTokenSource();
-        var active = streams.Attach(nodeId, register.BackendInstanceId,
+        // Hide the previous stream before touching registration state, but do
+        // not publish this stream yet. The dispatcher must not stamp commands
+        // with a generation whose invalidation/reset transaction is still open.
+        var prepared = streams.BeginAttach(nodeId, register.BackendInstanceId,
             responseStream, closed);
-        var streamEpoch = active.StreamEpoch;
+        var streamEpoch = prepared.StreamEpoch;
+        ActiveStream? active = null;
 
         try
         {
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(
                 ct, closed.Token);
             await OnRegisterAsync(nodeId, register, linked.Token, streamEpoch);
+            if (!streams.Publish(nodeId, prepared))
+            {
+                throw new RpcException(new Status(StatusCode.Aborted,
+                    "stream superseded by a newer registration"));
+            }
+            active = prepared;
             while (await requestStream.MoveNext(linked.Token))
             {
                 await DispatchAsync(nodeId, active, requestStream.Current, linked.Token);
@@ -79,7 +89,10 @@ public sealed class NodeChannelService(
         }
         finally
         {
-            streams.Detach(nodeId, streamEpoch);
+            if (active is not null)
+            {
+                streams.Detach(nodeId, streamEpoch);
+            }
             closed.Cancel();
             logger.LogInformation("node {NodeId} stream {Epoch} closed", nodeId, streamEpoch);
         }
@@ -105,19 +118,34 @@ public sealed class NodeChannelService(
     public async Task OnRegisterAsync(string nodeId, NodeRegister register,
         CancellationToken ct, string? streamEpoch = null)
     {
-        var count = await db.Nodes.CountAsync(ct);
-        var exists = await db.Nodes.AnyAsync(n => n.NodeId == nodeId, ct);
-        if (!exists && count >= MaxNodes)
+        var now = DateTimeOffset.UtcNow;
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+        // Serialize registration with session creation on the same node-row
+        // lock used by SessionService. The lock is held until commit, so a
+        // concurrent create cannot slip between the backend-generation check,
+        // old-generation command invalidation, and reset snapshot enqueue.
+        var nodeRow = await db.Nodes
+            .FromSql($"SELECT * FROM nodes WHERE node_id = {nodeId} FOR UPDATE")
+            .FirstOrDefaultAsync(ct);
+        if (streamEpoch is not null && !streams.IsLatestPrepared(nodeId, streamEpoch))
         {
-            throw new RpcException(new Status(StatusCode.ResourceExhausted,
-                "node registry is at capacity"));
+            throw new RpcException(new Status(StatusCode.Aborted,
+                "stream superseded by a newer registration"));
         }
 
-        var now = DateTimeOffset.UtcNow;
-        var previousBackendInstanceId = exists
-            ? await db.Nodes.Where(n => n.NodeId == nodeId)
-                .Select(n => n.BackendInstanceId).FirstAsync(ct)
-            : null;
+        var exists = nodeRow is not null;
+        if (!exists)
+        {
+            var count = await db.Nodes.CountAsync(ct);
+            if (count >= MaxNodes)
+            {
+                throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                    "node registry is at capacity"));
+            }
+        }
+
+        var previousBackendInstanceId = nodeRow?.BackendInstanceId;
         await db.Database.ExecuteSqlAsync($"""
             INSERT INTO nodes (node_id, backend_instance_id, registered_at, last_seen_at, engine_healthy, desired_revision)
             VALUES ({nodeId}, {register.BackendInstanceId}, {now}, {now}, {true}, 0)
@@ -126,8 +154,6 @@ public sealed class NodeChannelService(
                 last_seen_at = EXCLUDED.last_seen_at,
                 engine_healthy = EXCLUDED.engine_healthy
             """, ct);
-
-        nodeRegistry.Record(new Models.Heartbeat(nodeId, true));
 
         var backendRestarted = previousBackendInstanceId is not null &&
             !string.Equals(previousBackendInstanceId, register.BackendInstanceId, StringComparison.Ordinal);
@@ -140,15 +166,12 @@ public sealed class NodeChannelService(
                 .ToListAsync(ct)
             : [];
 
-        // Commands marked sent on a previous stream may have been lost with
-        // it (at-least-once). Requeue them only when the backend identity is
-        // unchanged. After a backend restart all pre-registration attempts belong to a dead
-        // data-plane generation: replaying a Provision/Revoke/SyncState command
-        // before the reset snapshot could reinstall old keys or contradict state
-        // that the fresh backend no longer owns. They become terminal because no
-        // reset-safe interpretation of those commands exists.
         if (backendRestarted)
         {
+            // Every pre-registration attempt belongs to the dead data-plane
+            // generation. The node lock above prevents a concurrent session
+            // creation from entering this set, so no fresh-session command is
+            // discarded with it.
             await db.Outbox
                 .Where(o => o.NodeId == nodeId && (o.Status == "sent" || o.Status == "pending"))
                 .ExecuteUpdateAsync(o => o.SetProperty(r => r.Status, "failed")
@@ -156,6 +179,9 @@ public sealed class NodeChannelService(
         }
         else
         {
+            // Same generation: sent rows from a dead stream are at-least-once
+            // attempts and may be retried. This also requeues a pending reset
+            // snapshot, but does not duplicate it.
             await db.Outbox
                 .Where(o => o.NodeId == nodeId && o.Status == "sent" &&
                     (streamEpoch == null || o.StreamEpoch != streamEpoch))
@@ -163,9 +189,16 @@ public sealed class NodeChannelService(
                     .SetProperty(r => r.NextRetryAt, now), ct);
         }
 
-        await EnqueueSyncStateAsync(nodeId, ct,
-            restartedSessionIds.Count == 0 ? null : restartedSessionIds,
-            restartedSessionIds.Count == 0 ? null : restartedSessionIds);
+        var resetPending = await BackendResetState.HasPendingBackendResetAsync(db, nodeId, ct);
+        if (backendRestarted || !resetPending)
+        {
+            var resetSessionIds = backendRestarted ? restartedSessionIds : null;
+            await EnqueueSyncStateCoreAsync(nodeId, ct, resetSessionIds, resetSessionIds);
+        }
+
+        await db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+        nodeRegistry.Record(new Models.Heartbeat(nodeId, true));
     }
 
     public async Task OnHeartbeatAsync(string nodeId, NodeHeartbeat heartbeat,
@@ -256,6 +289,17 @@ public sealed class NodeChannelService(
                 // The wire ACK does not identify the attempt. A deadline
                 // rejection may refer to an older send on this stream.
                 return;
+            case AckOutcome.Rejected when ack.ErrorCode == AckErrorCode.AckErrorDeadlineExceeded &&
+                BackendResetState.IsPendingResetPayload(row.Payload):
+            case AckOutcome.Error when ack.ErrorCode == AckErrorCode.AckErrorDeadlineExceeded &&
+                BackendResetState.IsPendingResetPayload(row.Payload):
+                // A first-attempt deadline rejection proves this attempt was
+                // not applied. A backend reset must not become terminal before
+                // confirmation: retrying it keeps the node blocked instead of
+                // reopening provisioning with old leases still intact.
+                row.Status = "pending";
+                row.NextRetryAt = now.AddMilliseconds(250);
+                break;
             case AckOutcome.Rejected:
             case AckOutcome.Error when ack.ErrorCode
                 is AckErrorCode.AckErrorDeadlineExceeded

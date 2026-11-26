@@ -1,8 +1,11 @@
 using Grpc.Core;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 using Testcontainers.PostgreSql;
 using VpnControl.Data;
+using VpnControl.Models;
+using VpnControl.Requests;
 using VpnControl.Proto;
 using VpnControl.Services;
 using Xunit;
@@ -172,6 +175,21 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
         var outbox = await db.Outbox.SingleAsync();
         Assert.Equal("failed", outbox.Status);
         Assert.True(ControlMetrics.Snapshot().FailedCommands > before);
+    }
+
+    [Fact]
+    public async Task BackendResetDeadlineRejectionRetriesInsteadOfReopeningProvisioning()
+    {
+        var row = await SeedCommandAsync("edge-1", "SyncState",
+            """{"backend_reset_session_ids":[]}""");
+        await _service.OnCommandAckAsync("edge-1", Stream(),
+            Ack(row, AckOutcome.Rejected, AckErrorCode.AckErrorDeadlineExceeded),
+            CancellationToken.None);
+        await using var db = NewDb();
+        var outbox = await db.Outbox.SingleAsync();
+        Assert.Equal("pending", outbox.Status);
+        Assert.NotNull(outbox.NextRetryAt);
+        Assert.True(await BackendResetState.HasPendingBackendResetAsync(db, "edge-1", CancellationToken.None));
     }
 
     [Fact]
@@ -524,6 +542,217 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
         Assert.Equal(SessionStatus.Revoked, revoking.Status);
         Assert.Equal(0, await verify.IpLeases.CountAsync(l => l.SessionId == sessionId));
         Assert.Equal(0, await verify.IpLeases.CountAsync(l => l.SessionId == revokingSessionId));
+    }
+
+    [Fact]
+    public async Task BackendRestartWithoutSessionsStillMarksResetUntilAck()
+    {
+        await _service.OnRegisterAsync("edge-1",
+            new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b1" },
+            CancellationToken.None, "e1");
+        await NewService().OnRegisterAsync("edge-1",
+            new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b2" },
+            CancellationToken.None, "e2");
+        await using var db = NewDb();
+        var reset = await db.Outbox.OrderByDescending(o => o.Revision)
+            .FirstAsync(o => o.CommandType == "SyncState");
+        using var payload = System.Text.Json.JsonDocument.Parse(reset.Payload);
+        var ids = payload.RootElement.GetProperty("backend_reset_session_ids");
+        Assert.Equal(System.Text.Json.JsonValueKind.Array, ids.ValueKind);
+        Assert.Empty(ids.EnumerateArray());
+        Assert.True(await BackendResetState.HasPendingBackendResetAsync(db, "edge-1", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task InterruptedBackendRestartRegistrationRollsBackAndRetryRecovers()
+    {
+        var sessionId = Guid.NewGuid();
+        await using (var db = NewDb())
+        {
+            db.Nodes.Add(new NodeRow
+            {
+                NodeId = "edge-1", BackendInstanceId = "b1",
+                RegisteredAt = DateTimeOffset.UtcNow, EngineHealthy = true
+            });
+            db.Sessions.Add(new SessionRow
+            {
+                SessionId = sessionId, OwnerSubject = "alice",
+                Status = SessionStatus.Active, NodeId = "edge-1",
+                LabSessionId = 7, ExpiresAt = DateTimeOffset.UtcNow.AddHours(1),
+                VirtualIp = System.Net.IPAddress.Parse("10.99.0.7"), KeyEpoch = 1,
+                CreatedAt = DateTimeOffset.UtcNow, UpdatedAt = DateTimeOffset.UtcNow
+            });
+            db.Outbox.Add(new OutboxRow
+            {
+                CommandId = Guid.NewGuid(), NodeId = "edge-1", CommandType = "ProvisionPeer",
+                Payload = "{}", Revision = 1, CreatedAt = DateTimeOffset.UtcNow,
+                Status = "pending"
+            });
+            await db.SaveChangesAsync();
+            await db.Database.ExecuteSqlAsync($"""
+                CREATE OR REPLACE FUNCTION fail_sync_insert() RETURNS trigger AS $fn$
+                BEGIN
+                    IF NEW.command_type = 'SyncState' THEN
+                        RAISE EXCEPTION 'injected registration interruption';
+                    END IF;
+                    RETURN NEW;
+                END;
+                $fn$ LANGUAGE plpgsql
+                """);
+            await db.Database.ExecuteSqlAsync($"""
+                CREATE TRIGGER fail_sync_insert_trigger BEFORE INSERT ON outbox
+                FOR EACH ROW EXECUTE FUNCTION fail_sync_insert()
+                """);
+        }
+
+        await Assert.ThrowsAnyAsync<Exception>(() => _service.OnRegisterAsync("edge-1",
+            new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b2" },
+            CancellationToken.None, "e2"));
+
+        await using (var verify = NewDb())
+        {
+            Assert.Equal("b1", (await verify.Nodes.SingleAsync()).BackendInstanceId);
+            Assert.Equal("pending", (await verify.Outbox.SingleAsync()).Status);
+            await verify.Database.ExecuteSqlAsync($"DROP TRIGGER fail_sync_insert_trigger ON outbox");
+            await verify.Database.ExecuteSqlAsync($"DROP FUNCTION fail_sync_insert()");
+        }
+
+        await NewService().OnRegisterAsync("edge-1",
+            new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b2" },
+            CancellationToken.None, "e3");
+
+        await using var recovered = NewDb();
+        Assert.Equal("b2", (await recovered.Nodes.SingleAsync()).BackendInstanceId);
+        var reset = await recovered.Outbox.SingleAsync(o => o.CommandType == "SyncState");
+        var payload = System.Text.Json.JsonDocument.Parse(reset.Payload).RootElement;
+        Assert.Equal(sessionId.ToString(),
+            payload.GetProperty("backend_reset_session_ids")[0].GetString());
+    }
+
+    [Fact]
+    public async Task ConcurrentCreateWaitsBehindRegistrationAndCannotJoinInvalidatedGeneration()
+    {
+        await using (var db = NewDb())
+        {
+            db.Nodes.Add(new NodeRow
+            {
+                NodeId = "edge-1", BackendInstanceId = "b1",
+                RegisteredAt = DateTimeOffset.UtcNow, EngineHealthy = true
+            });
+            db.Sessions.Add(new SessionRow
+            {
+                SessionId = Guid.NewGuid(), OwnerSubject = "alice",
+                Status = SessionStatus.Active, NodeId = "edge-1",
+                LabSessionId = 7, ExpiresAt = DateTimeOffset.UtcNow.AddHours(1),
+                VirtualIp = System.Net.IPAddress.Parse("10.99.0.7"), KeyEpoch = 1,
+                CreatedAt = DateTimeOffset.UtcNow, UpdatedAt = DateTimeOffset.UtcNow
+            });
+            await db.SaveChangesAsync();
+            await db.Database.ExecuteSqlAsync($"""
+                CREATE OR REPLACE FUNCTION slow_registration_node_update() RETURNS trigger AS $fn$
+                BEGIN
+                    PERFORM pg_sleep(1);
+                    RETURN NEW;
+                END;
+                $fn$ LANGUAGE plpgsql
+                """);
+            await db.Database.ExecuteSqlAsync($"""
+                CREATE TRIGGER slow_registration_node_update_trigger BEFORE UPDATE ON nodes
+                FOR EACH ROW EXECUTE FUNCTION slow_registration_node_update()
+                """);
+        }
+        _nodeRegistry.Record(new Heartbeat("edge-1", true));
+        var sessions = new SessionService(
+            new ControlDbContext(_options), new NodeService(_nodeRegistry),
+            new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["VpnControl:IpPoolCidr"] = "10.99.0.0/24",
+                ["VpnControl:SessionTokenSecret"] = "0123456789abcdef0123456789abcdef"
+            }).Build(),
+            NullLogger<SessionService>.Instance);
+
+        var registerTask = NewService().OnRegisterAsync("edge-1",
+            new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b2" },
+            CancellationToken.None, "e2");
+        await Task.Delay(200);
+        var createTask = sessions.CreateSessionAsync(new CreateSessionRequest(), "bob", null);
+        await Task.WhenAll(registerTask, createTask);
+
+        var createResult = await createTask;
+        Assert.False(createResult.IsSuccess);
+        Assert.Equal(EResultStatus.Unavailable, createResult.Status);
+        Assert.Contains("backend reset", createResult.ErrorMessage);
+        await using var verify = NewDb();
+        Assert.False(await verify.Outbox.AnyAsync(o => o.CommandType == "ProvisionPeer"));
+        Assert.Equal(1, await verify.Outbox.CountAsync(o => o.CommandType == "SyncState"));
+    }
+
+    [Fact]
+    public async Task ReconnectBeforeResetAckReusesPendingResetAndAckCompletesRecovery()
+    {
+        var sessionId = Guid.NewGuid();
+        await using (var db = NewDb())
+        {
+            db.Nodes.Add(new NodeRow
+            {
+                NodeId = "edge-1", BackendInstanceId = "b1",
+                RegisteredAt = DateTimeOffset.UtcNow, EngineHealthy = true
+            });
+            db.Sessions.Add(new SessionRow
+            {
+                SessionId = sessionId, OwnerSubject = "alice",
+                Status = SessionStatus.Active, NodeId = "edge-1",
+                LabSessionId = 7, ExpiresAt = DateTimeOffset.UtcNow.AddHours(1),
+                VirtualIp = System.Net.IPAddress.Parse("10.99.0.7"), KeyEpoch = 1,
+                CreatedAt = DateTimeOffset.UtcNow, UpdatedAt = DateTimeOffset.UtcNow
+            });
+            await db.SaveChangesAsync();
+            await db.Database.ExecuteSqlAsync(
+                $"INSERT INTO ip_leases (address, session_id, node_id, reserved_at) VALUES (CAST({"10.99.0.7"} AS inet), {sessionId}, {"edge-1"}, {DateTimeOffset.UtcNow})");
+        }
+
+        await _service.OnRegisterAsync("edge-1",
+            new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b2" },
+            CancellationToken.None, "e2");
+
+        OutboxRow reset;
+        await using (var db = NewDb())
+        {
+            reset = await db.Outbox.SingleAsync(o => o.CommandType == "SyncState");
+            reset.Status = "sent";
+            reset.Attempts = 1;
+            reset.StreamEpoch = "e2";
+            reset.BackendInstanceId = "b2";
+            db.Outbox.Update(reset);
+            await db.SaveChangesAsync();
+        }
+
+        await _service.OnRegisterAsync("edge-1",
+            new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b2" },
+            CancellationToken.None, "e3");
+
+        await using (var db = NewDb())
+        {
+            Assert.Equal(1, await db.Outbox.CountAsync(o => o.CommandType == "SyncState"));
+            reset = await db.Outbox.SingleAsync(o => o.CommandType == "SyncState");
+            Assert.Equal("pending", reset.Status);
+            reset.Status = "sent";
+            reset.Attempts = 1;
+            reset.StreamEpoch = "e3";
+            reset.BackendInstanceId = "b2";
+            db.Outbox.Update(reset);
+            await db.SaveChangesAsync();
+        }
+
+        await _service.OnCommandAckAsync("edge-1", Stream("e3", "b2"),
+            Ack(reset, AckOutcome.Applied, epoch: "e3", backend: "b2"), CancellationToken.None);
+
+        await using var verify = NewDb();
+        var session = await verify.Sessions.SingleAsync();
+        Assert.Equal(SessionStatus.Failed, session.Status);
+        Assert.Equal("backend_restart_requires_new_session", session.FailureReason);
+        Assert.Equal(0, await verify.IpLeases.CountAsync(l => l.SessionId == sessionId));
+        Assert.False(await BackendResetState.HasPendingBackendResetAsync(verify, "edge-1", CancellationToken.None));
     }
 
     [Fact]

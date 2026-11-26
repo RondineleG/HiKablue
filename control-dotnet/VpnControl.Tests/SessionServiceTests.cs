@@ -299,6 +299,42 @@ public sealed class SessionServiceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task PendingBackendResetBlocksNewSessionsUntilAckThenProvisionSurvives()
+    {
+        BeatNode();
+        var resetCommandId = Guid.NewGuid();
+        await using (var db = NewDb())
+        {
+            db.Outbox.Add(new OutboxRow
+            {
+                CommandId = resetCommandId, NodeId = "node-a", CommandType = "SyncState",
+                Payload = "{\"backend_reset_session_ids\":[]}",
+                Revision = 1, CreatedAt = DateTimeOffset.UtcNow, Status = "pending"
+            });
+            await db.SaveChangesAsync();
+        }
+
+        var blocked = await _service.CreateSessionAsync(new CreateSessionRequest(), "alice", null);
+        Assert.False(blocked.IsSuccess);
+        Assert.Equal(EResultStatus.Unavailable, blocked.Status);
+        Assert.Contains("no eligible node", blocked.ErrorMessage);
+        await using (var db = NewDb())
+        {
+            Assert.False(await db.Outbox.AnyAsync(o => o.CommandType == "ProvisionPeer"));
+            var reset = await db.Outbox.SingleAsync(o => o.CommandId == resetCommandId);
+            reset.Status = "acked";
+            await db.SaveChangesAsync();
+        }
+
+        var allowed = await _service.CreateSessionAsync(new CreateSessionRequest(), "alice", null);
+        Assert.True(allowed.IsSuccess);
+        await using var verify = NewDb();
+        var provision = await verify.Outbox.SingleAsync(o => o.CommandType == "ProvisionPeer");
+        Assert.Equal("pending", provision.Status);
+        Assert.Contains(allowed.Data!.SessionId.ToString(), provision.Payload);
+    }
+
+    [Fact]
     public async Task LabSessionIdsAreUniquePerNodeAndSequential()
     {
         BeatNode("node-a");
