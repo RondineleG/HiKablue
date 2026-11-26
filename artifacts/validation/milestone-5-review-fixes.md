@@ -91,15 +91,26 @@ deploy/debian/build-release.sh --force --output /tmp/hk-debian-e2e-release
 
 # inside the clean Debian VM, after copying the release, a portable .NET runtime,
 # and lab-only test PKI
-sudo bash /tmp/hk-debian-install.sh --release /tmp/hk-debian-release
+sudo bash /tmp/hk-debian-install.sh --release /tmp/hk-debian-e2e-release
 sudo systemctl restart hikablue-control.service
 sudo systemctl restart hikablue-engine.service
 sudo systemctl restart hikablue-agent.service
-curl --cacert /etc/hikablue/pki/ca.crt -X POST https://127.0.0.1:7443/v1/sessions ...
+curl --cacert /etc/hikablue/pki/ca.crt -sf -X POST https://127.0.0.1:7443/v1/sessions \
+    -H 'Content-Type: application/json' -H 'X-Subject: debian-validation' \
+    -H 'Idempotency-Key: debian-validation-1' \
+    -d '{"nodeId":"node-a","ttlSeconds":180}'
 sudo -u hikablue-agent python3 /tmp/hk-control-query.py
 sudo -u hikablue-agent /opt/hikablue/current/bin/vpn-agent --metrics-sock /run/hikablue-engine/engine.sock
-curl --cacert /etc/hikablue/pki/ca.crt -X DELETE https://127.0.0.1:7443/v1/sessions/<id> ...
+curl --cacert /etc/hikablue/pki/ca.crt -sf -X DELETE "https://127.0.0.1:7443/v1/sessions/$session_id" \
+    -H 'X-Subject: debian-validation' -H "X-Session-Token: $session_token"
 ```
+
+The complete ephemeral in-VM recipe is stored as
+`artifacts/validation/milestone-5-debian-e2e-validate.sh`. It includes the
+PostgreSQL/.NET setup, random secret generation, service environment files,
+the framed `GetSessions` Unix-socket helper, polling loops, revocation
+check, lease query, and redactable evidence output. The script was copied
+into the VM and executed as the unprivileged `debian` user with sudo.
 
 Observed output:
 
