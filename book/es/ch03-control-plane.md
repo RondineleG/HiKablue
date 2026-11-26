@@ -454,7 +454,11 @@ la cancelación del llamador con la cancelación de fencing.
 `OnRegisterAsync` ejecuta la transacción atómica de registro. `Publish`
 corre solo después del commit; un resultado falso significa que un
 registro más nuevo manda y lanza `Aborted` en lugar de activar este
-stream. `active = prepared` solo se alcanza tras publicar con éxito. La asignación del epoch conserva el cálculo monótono:
+stream. `active = prepared` solo se alcanza tras publicar con éxito. Tras
+tomar el lock de la fila del nodo, el registro también comprueba que su
+epoch siga siendo el más reciente preparado para ese nodo; un registro
+superado aborta antes de sobrescribir la identidad del backend nuevo o
+encolar otro reset. La asignación del epoch conserva el cálculo monótono:
 
 ```csharp
 _lastEpoch = Math.Max(_timeProvider.GetUtcNow().ToUnixTimeMilliseconds(),

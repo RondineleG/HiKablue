@@ -452,7 +452,10 @@ cancelamento do chamador com o cancelamento de fencing. `OnRegisterAsync`
 executa a transação atômica de registro. `Publish` roda somente depois
 do commit; um resultado falso significa que um registro mais novo é
 autoritativo e lança `Aborted` em vez de ativar este stream.
-`active = prepared` só é alcançado após publicação bem-sucedida. A
+`active = prepared` só é alcançado após publicação bem-sucedida. Depois
+de obter o lock da linha do nó, o registro também verifica se seu epoch
+ainda é o mais recente preparado para esse nó; um registro superado aborta
+antes de sobrescrever a identidade do backend novo ou enfileirar outro reset. A
 atribuição do epoch mantém o cálculo monotônico:
 
 ```csharp
