@@ -22,6 +22,7 @@ public sealed record ActiveStream(
 public sealed class NodeStreamRegistry(TimeProvider? timeProvider = null)
 {
     private readonly ConcurrentDictionary<string, ActiveStream> _streams = new();
+    private readonly ConcurrentDictionary<string, long> _latestPreparedEpochs = new();
     private readonly TimeProvider _timeProvider = timeProvider ?? TimeProvider.System;
     private readonly object _attachLock = new();
     private long _lastEpoch;
@@ -38,6 +39,7 @@ public sealed class NodeStreamRegistry(TimeProvider? timeProvider = null)
         lock (_attachLock)
         {
             stream = AllocateStream(backendInstanceId, writer, closed);
+            NotePrepared(nodeId, stream);
             _streams.TryGetValue(nodeId, out replaced);
             _streams[nodeId] = stream;
         }
@@ -58,6 +60,7 @@ public sealed class NodeStreamRegistry(TimeProvider? timeProvider = null)
         lock (_attachLock)
         {
             stream = AllocateStream(backendInstanceId, writer, closed);
+            NotePrepared(nodeId, stream);
             _streams.TryRemove(nodeId, out replaced);
         }
         replaced?.Closed.Cancel();
@@ -91,6 +94,17 @@ public sealed class NodeStreamRegistry(TimeProvider? timeProvider = null)
         }
         return publish;
     }
+
+    /// True while this registration is still the newest prepared stream for
+    /// the node. The latest marker is deliberately retained after disconnect:
+    /// an older in-flight registration must not become valid merely because
+    /// the replacement stream later closed.
+    public bool IsLatestPrepared(string nodeId, string streamEpoch) =>
+        !_latestPreparedEpochs.TryGetValue(nodeId, out var latest) ||
+        latest <= EpochValue(streamEpoch);
+
+    private void NotePrepared(string nodeId, ActiveStream stream) =>
+        _latestPreparedEpochs[nodeId] = EpochValue(stream.StreamEpoch);
 
     private ActiveStream AllocateStream(string backendInstanceId,
         IServerStreamWriter<ControlCommand> writer, CancellationTokenSource closed)

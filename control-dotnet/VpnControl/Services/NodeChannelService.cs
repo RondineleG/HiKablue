@@ -128,6 +128,12 @@ public sealed class NodeChannelService(
         var nodeRow = await db.Nodes
             .FromSql($"SELECT * FROM nodes WHERE node_id = {nodeId} FOR UPDATE")
             .FirstOrDefaultAsync(ct);
+        if (streamEpoch is not null && !streams.IsLatestPrepared(nodeId, streamEpoch))
+        {
+            throw new RpcException(new Status(StatusCode.Aborted,
+                "stream superseded by a newer registration"));
+        }
+
         var exists = nodeRow is not null;
         if (!exists)
         {

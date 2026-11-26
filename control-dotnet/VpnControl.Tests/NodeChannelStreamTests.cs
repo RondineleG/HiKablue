@@ -244,6 +244,48 @@ public sealed class NodeChannelStreamTests : IAsyncLifetime
         }
     }
 
+    [Fact]
+    public async Task SupersededRegistrationCannotOverwriteNewerBackendOrQueueReset()
+    {
+        await NewService().OnRegisterAsync("edge-1", new NodeRegister
+        {
+            NodeId = "edge-1", BackendInstanceId = "b0"
+        }, CancellationToken.None);
+
+        using var olderClosed = new CancellationTokenSource();
+        using var newerClosed = new CancellationTokenSource();
+        var older = _streams.BeginAttach("edge-1", "b1", new FakeWriter(), olderClosed);
+        var newer = _streams.BeginAttach("edge-1", "b2", new FakeWriter(), newerClosed);
+
+        await NewService().OnRegisterAsync("edge-1", new NodeRegister
+        {
+            NodeId = "edge-1", BackendInstanceId = "b2"
+        }, CancellationToken.None, newer.StreamEpoch);
+
+        int outboxCount;
+        int resetCount;
+        await using (var before = new ControlDbContext(_options))
+        {
+            outboxCount = await before.Outbox.CountAsync();
+            resetCount = (await before.Outbox.Select(o => o.Payload).ToListAsync())
+                .Count(BackendResetState.IsPendingResetPayload);
+            Assert.Equal(1, resetCount);
+        }
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            NewService().OnRegisterAsync("edge-1", new NodeRegister
+            {
+                NodeId = "edge-1", BackendInstanceId = "b1"
+            }, CancellationToken.None, older.StreamEpoch));
+        Assert.Equal(StatusCode.Aborted, ex.Status.StatusCode);
+
+        await using var db = new ControlDbContext(_options);
+        Assert.Equal("b2", (await db.Nodes.SingleAsync()).BackendInstanceId);
+        Assert.Equal(outboxCount, await db.Outbox.CountAsync());
+        Assert.Equal(resetCount, (await db.Outbox.Select(o => o.Payload).ToListAsync())
+            .Count(BackendResetState.IsPendingResetPayload));
+    }
+
     private async Task<bool> SyncStateQueued()
     {
         await using var db = new ControlDbContext(_options);
