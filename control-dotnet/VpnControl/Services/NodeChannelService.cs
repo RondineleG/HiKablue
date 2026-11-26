@@ -63,15 +63,25 @@ public sealed class NodeChannelService(
         }
 
         var closed = new CancellationTokenSource();
-        var active = streams.Attach(nodeId, register.BackendInstanceId,
+        // Hide the previous stream before touching registration state, but do
+        // not publish this stream yet. The dispatcher must not stamp commands
+        // with a generation whose invalidation/reset transaction is still open.
+        var prepared = streams.BeginAttach(nodeId, register.BackendInstanceId,
             responseStream, closed);
-        var streamEpoch = active.StreamEpoch;
+        var streamEpoch = prepared.StreamEpoch;
+        ActiveStream? active = null;
 
         try
         {
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(
                 ct, closed.Token);
             await OnRegisterAsync(nodeId, register, linked.Token, streamEpoch);
+            if (!streams.Publish(nodeId, prepared))
+            {
+                throw new RpcException(new Status(StatusCode.Aborted,
+                    "stream superseded by a newer registration"));
+            }
+            active = prepared;
             while (await requestStream.MoveNext(linked.Token))
             {
                 await DispatchAsync(nodeId, active, requestStream.Current, linked.Token);
@@ -79,7 +89,10 @@ public sealed class NodeChannelService(
         }
         finally
         {
-            streams.Detach(nodeId, streamEpoch);
+            if (active is not null)
+            {
+                streams.Detach(nodeId, streamEpoch);
+            }
             closed.Cancel();
             logger.LogInformation("node {NodeId} stream {Epoch} closed", nodeId, streamEpoch);
         }

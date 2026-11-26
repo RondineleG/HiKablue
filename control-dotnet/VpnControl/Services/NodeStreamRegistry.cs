@@ -26,9 +26,10 @@ public sealed class NodeStreamRegistry(TimeProvider? timeProvider = null)
     private readonly object _attachLock = new();
     private long _lastEpoch;
 
-    /// Registers the stream; if a previous stream for the node is still
-    /// attached it is cancelled so the agent cannot be fed from two
-    /// streams at once.
+    /// Registers the stream immediately; if a previous stream for the node
+    /// is still attached it is cancelled so the agent cannot be fed from two
+    /// streams at once. Production NodeChannel setup uses BeginAttach/Publish
+    /// instead so registration can commit before the dispatcher sees a stream.
     public ActiveStream Attach(string nodeId, string backendInstanceId,
         IServerStreamWriter<ControlCommand> writer, CancellationTokenSource closed)
     {
@@ -36,12 +37,7 @@ public sealed class NodeStreamRegistry(TimeProvider? timeProvider = null)
         ActiveStream stream;
         lock (_attachLock)
         {
-            // Allocate and publish together: even a stopped/backward clock
-            // or concurrent reconnect cannot reuse or regress an epoch.
-            _lastEpoch = Math.Max(_timeProvider.GetUtcNow().ToUnixTimeMilliseconds(),
-                checked(_lastEpoch + 1));
-            stream = new ActiveStream(_lastEpoch.ToString(CultureInfo.InvariantCulture),
-                backendInstanceId, writer, closed);
+            stream = AllocateStream(backendInstanceId, writer, closed);
             _streams.TryGetValue(nodeId, out replaced);
             _streams[nodeId] = stream;
         }
@@ -49,6 +45,66 @@ public sealed class NodeStreamRegistry(TimeProvider? timeProvider = null)
         replaced?.Closed.Cancel();
         return stream;
     }
+
+    /// Allocates the next stream epoch and hides any previous stream for the
+    /// node without publishing the new one. Registration mutations can then
+    /// commit before the dispatcher has any stream for this node. Failure is
+    /// fail-closed: the old stream stays cancelled and the agent reconnects.
+    public ActiveStream BeginAttach(string nodeId, string backendInstanceId,
+        IServerStreamWriter<ControlCommand> writer, CancellationTokenSource closed)
+    {
+        ActiveStream? replaced;
+        ActiveStream stream;
+        lock (_attachLock)
+        {
+            stream = AllocateStream(backendInstanceId, writer, closed);
+            _streams.TryRemove(nodeId, out replaced);
+        }
+        replaced?.Closed.Cancel();
+        return stream;
+    }
+
+    /// Publishes a prepared stream after registration commits. If a newer
+    /// registration won the race while this one was committing, the newer
+    /// stream remains authoritative and this stream is closed instead.
+    public bool Publish(string nodeId, ActiveStream stream)
+    {
+        ActiveStream? replaced = null;
+        var publish = false;
+        lock (_attachLock)
+        {
+            if (!_streams.TryGetValue(nodeId, out var current) ||
+                EpochValue(current.StreamEpoch) < EpochValue(stream.StreamEpoch))
+            {
+                _streams[nodeId] = stream;
+                replaced = current;
+                publish = true;
+            }
+        }
+        if (publish)
+        {
+            replaced?.Closed.Cancel();
+        }
+        else
+        {
+            stream.Closed.Cancel();
+        }
+        return publish;
+    }
+
+    private ActiveStream AllocateStream(string backendInstanceId,
+        IServerStreamWriter<ControlCommand> writer, CancellationTokenSource closed)
+    {
+        // Allocate epochs inside the registry lock: even a stopped/backward
+        // clock or concurrent reconnect cannot reuse or regress an epoch.
+        _lastEpoch = Math.Max(_timeProvider.GetUtcNow().ToUnixTimeMilliseconds(),
+            checked(_lastEpoch + 1));
+        return new ActiveStream(_lastEpoch.ToString(CultureInfo.InvariantCulture),
+            backendInstanceId, writer, closed);
+    }
+
+    private static long EpochValue(string epoch) =>
+        long.Parse(epoch, CultureInfo.InvariantCulture);
 
     public bool TryGet(string nodeId, out ActiveStream stream) =>
         _streams.TryGetValue(nodeId, out stream!);

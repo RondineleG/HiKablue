@@ -68,6 +68,39 @@ public sealed class NodeStreamRegistryTests
     }
 
     [Fact]
+    public void BeginAttachHidesTheOldStreamWithoutPublishingTheNewOne()
+    {
+        var streams = new NodeStreamRegistry(new Clock());
+        using var oldClosed = new CancellationTokenSource();
+        var old = Attach(streams, "edge-1", oldClosed);
+        using var newClosed = new CancellationTokenSource();
+        var prepared = streams.BeginAttach("edge-1", "backend", new Writer(), newClosed);
+
+        Assert.True(oldClosed.IsCancellationRequested);
+        Assert.False(streams.TryGet("edge-1", out _));
+        Assert.True(streams.Publish("edge-1", prepared));
+        Assert.True(streams.TryGet("edge-1", out var current));
+        Assert.Same(prepared, current);
+    }
+
+    [Fact]
+    public void PublishKeepsTheNewerStreamWhenRegistrationsRace()
+    {
+        var streams = new NodeStreamRegistry(new Clock());
+        using var olderClosed = new CancellationTokenSource();
+        using var newerClosed = new CancellationTokenSource();
+        var older = streams.BeginAttach("edge-1", "backend", new Writer(), olderClosed);
+        var newer = streams.BeginAttach("edge-1", "backend", new Writer(), newerClosed);
+
+        Assert.True(streams.Publish("edge-1", newer));
+        Assert.False(streams.Publish("edge-1", older));
+        Assert.True(olderClosed.IsCancellationRequested);
+        Assert.False(newerClosed.IsCancellationRequested);
+        Assert.True(streams.TryGet("edge-1", out var current));
+        Assert.Same(newer, current);
+    }
+
+    [Fact]
     public void ConcurrentAttachesHaveUniqueEpochsAndKeepTheNewestStream()
     {
         var streams = new NodeStreamRegistry(new Clock());

@@ -182,6 +182,68 @@ public sealed class NodeChannelStreamTests : IAsyncLifetime
         Assert.False(_streams.TryGet("edge-1", out _));
     }
 
+    [Fact]
+    public async Task StreamIsHiddenUntilRegistrationCommitThenPublished()
+    {
+        var firstReader = new FakeReader(new[] { Register("edge-1", "b1") },
+            blockWhenEmpty: true);
+        var first = NewService().NodeChannelCore("edge-1", firstReader,
+            new FakeWriter(), CancellationToken.None);
+        await WaitForAsync(() =>
+            _streams.TryGet("edge-1", out var s) && s.BackendInstanceId == "b1");
+        await WaitForAsync(async () => await SyncStateQueued());
+
+        await using (var setup = new ControlDbContext(_options))
+        {
+            await setup.Database.ExecuteSqlAsync($"""
+                CREATE OR REPLACE FUNCTION slow_registration_node_update() RETURNS trigger AS $fn$
+                BEGIN
+                    PERFORM pg_sleep(1);
+                    RETURN NEW;
+                END;
+                $fn$ LANGUAGE plpgsql
+                """);
+            await setup.Database.ExecuteSqlAsync($"""
+                CREATE TRIGGER slow_registration_node_update_trigger BEFORE UPDATE ON nodes
+                FOR EACH ROW EXECUTE FUNCTION slow_registration_node_update()
+                """);
+        }
+
+        var secondReader = new FakeReader(new[] { Register("edge-1", "b2") },
+            blockWhenEmpty: true);
+        using var secondCts = new CancellationTokenSource();
+        var second = NewService().NodeChannelCore("edge-1", secondReader,
+            new FakeWriter(), secondCts.Token);
+        try
+        {
+            await Task.Delay(200);
+            Assert.False(_streams.TryGet("edge-1", out _));
+
+            await WaitForAsync(() =>
+                _streams.TryGet("edge-1", out var s) && s.BackendInstanceId == "b2");
+            await first;
+        }
+        finally
+        {
+            secondCts.Cancel();
+            try
+            {
+                await second;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (RpcException)
+            {
+            }
+            await using var cleanup = new ControlDbContext(_options);
+            await cleanup.Database.ExecuteSqlAsync(
+                $"DROP TRIGGER IF EXISTS slow_registration_node_update_trigger ON nodes");
+            await cleanup.Database.ExecuteSqlAsync(
+                $"DROP FUNCTION IF EXISTS slow_registration_node_update()");
+        }
+    }
+
     private async Task<bool> SyncStateQueued()
     {
         await using var db = new ControlDbContext(_options);
