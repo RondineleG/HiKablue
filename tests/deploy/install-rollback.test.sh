@@ -39,8 +39,14 @@ root="$tmp/root"
 make_release "$r1" v1 first
 make_release "$r2" v2 second
 
-bash "$repo_root/deploy/debian/install.sh" --release "$r1" --root "$root" --no-systemctl >/dev/null
+(umask 077; bash "$repo_root/deploy/debian/install.sh" --release "$r1" --root "$root" --no-systemctl >/dev/null)
 assert_link "$root/opt/hikablue/current" releases/v1
+for dir in "$root/opt/hikablue" "$root/opt/hikablue/releases" "$root/etc/hikablue"; do
+    [ "$(stat -c %a "$dir")" = 755 ] || {
+        echo "FAIL: $dir is not service-readable under a restrictive install umask" >&2
+        exit 1
+    }
+done
 [ -f "$root/etc/systemd/system/hikablue-engine.service" ] || { echo "FAIL: unit not installed" >&2; exit 1; }
 printf '# operator edit\n' >"$root/etc/hikablue/engine.env"
 

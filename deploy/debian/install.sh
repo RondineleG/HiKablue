@@ -64,7 +64,8 @@ previous="$base/previous"
 systemd_dir=$(path_in_root /etc/systemd/system)
 config_dir=$(path_in_root /etc/hikablue)
 
-mkdir -p "$releases" "$systemd_dir" "$config_dir"
+install -d -m 0755 "$base" "$releases"
+install -d -m 0755 "$systemd_dir" "$config_dir"
 
 if [ -d "$target" ]; then
     if diff -qr "$release" "$target" >/dev/null 2>&1; then
