@@ -128,9 +128,12 @@ contract promised:
   as itself.
 - **`NodeChannelService`.** The first frame must be `NodeRegister`;
   `stream_epoch` is a monotonic numeric ID seeded from Unix milliseconds,
-  allocated at attach (see r2 below). `NodeStreamRegistry`
-  atomically replaces any previous stream (its CancellationTokenSource is
-  cancelled — the fencing switch). Heartbeats refresh `nodes.last_seen_at`
+  allocated when a replacement stream is prepared (see r2 below).
+  `NodeStreamRegistry` hides any previous stream before the registration
+  transaction and publishes the replacement only after that transaction
+  commits. While registration is open the dispatcher sees no stream for
+  the node, so it cannot stamp commands with an uncommitted generation;
+  a superseded registration never becomes visible. Heartbeats refresh `nodes.last_seen_at`
   and the in-memory registry. A `CommandAck` is correlated by
   `command_id` *and* fenced: an ack stamped for another `stream_epoch` or
   `backend_instance_id` is ignored. The ACK must also match a stored
@@ -390,22 +393,36 @@ then closes with `PermissionDenied`. After the next send reports EOF,
 so the existing transport keepalive remains the fallback.
 
 Two reconnects can occur in one millisecond; a clock can move backward.
-`NodeStreamRegistry.Attach` now computes this inside the same lock that
-publishes the replacement stream:
+`BeginAttach` allocates the epoch and hides the old stream before the
+registration transaction. `Publish` exposes the replacement only after
+commit, and only if no newer registration has already won:
+
+```csharp
+var prepared = streams.BeginAttach(nodeId, register.BackendInstanceId,
+    responseStream, closed);
+await OnRegisterAsync(nodeId, register, linked.Token, streamEpoch);
+if (!streams.Publish(nodeId, prepared))
+```
+
+Line 1 reserves a unique process-local epoch and removes the old stream
+from dispatcher visibility. Line 3 performs the atomic registration
+transaction. Line 5 publishes only after commit; a false result means a
+newer registration is authoritative and this stream closes instead.
+Epoch allocation itself still uses the monotonic calculation:
 
 ```csharp
 _lastEpoch = Math.Max(_timeProvider.GetUtcNow().ToUnixTimeMilliseconds(),
     checked(_lastEpoch + 1));
 ```
 
-Line 1 takes the current Unix milliseconds from an injectable clock.
-Line 2 chooses at least the previous ID plus one; `checked` throws rather
-than wrapping at integer overflow. Epoch allocation and stream replacement
-are serialized, while cancellation stays outside the lock. An old stream's
-`Detach` cannot remove its successor. `NodeStreamRegistryTests` covers a
-frozen clock, clock rollback, stale cleanup and concurrent attaches.
-This is monotonic **within one registry/process**, not a durable,
-multi-control-plane fencing protocol.
+The first line takes Unix milliseconds from an injectable clock. The
+second chooses at least the previous ID plus one; `checked` throws rather
+than wrapping at integer overflow. Cancellation stays outside the
+registry lock, and an old stream's `Detach` cannot remove its successor.
+`NodeStreamRegistryTests` covers a frozen clock, clock rollback, stale
+cleanup, concurrent attaches, hidden pre-commit registration, and racing
+publications. This is monotonic **within one registry/process**, not a
+durable, multi-control-plane fencing protocol.
 
 **Terms:** `context.WithCancel` creates a child cancellation scope;
 `defer` runs cleanup on return; `<-heartbeatDone` waits for a channel
@@ -574,3 +591,4 @@ become 0. A was not reactivated.
   restart.
 - `r6` — backend restart semantics refined in milestone 5: old sessions are excluded from the first fresh-backend snapshot, become `failed` only after confirmed application, and require a fresh API session.
 - `r7` — reset recovery serialized with provisioning: registration writes are atomic, pending resets survive pre-ACK reconnects, and reset-marked nodes are ineligible for new sessions until the confirming ACK.
+- `r8` — stream publication hardened: replacement streams are hidden while registration is uncommitted and published only after the registration transaction commits.

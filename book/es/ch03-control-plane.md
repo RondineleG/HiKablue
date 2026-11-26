@@ -131,9 +131,12 @@ contrato prometía:
   solo puede hablar como sí mismo.
 - **`NodeChannelService`.** El primer frame debe ser `NodeRegister`;
   `stream_epoch` es un ID numérico monótono iniciado con milisegundos Unix,
-  asignado al conectar (véase r2 abajo), y
-  `NodeStreamRegistry` reemplaza atómicamente cualquier stream anterior
-  (su CancellationTokenSource se cancela — el interruptor de fencing).
+  asignado al preparar el stream sustituto (véase r2 abajo).
+  `NodeStreamRegistry` oculta cualquier stream anterior antes de la
+  transacción de registro y publica el sustituto solo después del commit.
+  Mientras el registro está abierto, el dispatcher no ve stream para el
+  nodo, así no puede sellar comandos con una generación aún no confirmada;
+  un registro superado nunca se vuelve visible.
   Los heartbeats refrescan `nodes.last_seen_at` y el registro en memoria.
   Un `CommandAck` se correlaciona por `command_id` *y* se verifica: un
   ack con otro `stream_epoch` o `backend_instance_id` se ignora.
@@ -420,21 +423,36 @@ siguiente, `Recv` todavía lee ese estado. No se reprodujo un bloqueo de
 recepción; se conserva el keepalive del transporte como respaldo.
 
 Dos reconexiones pueden ocurrir en un milisegundo; el reloj puede retroceder.
-`NodeStreamRegistry.Attach` calcula lo siguiente bajo el mismo bloqueo que
-publica el stream sustituto:
+`BeginAttach` asigna el epoch y oculta el stream anterior antes de la
+transacción de registro. `Publish` expone el sustituto solo después del
+commit, y solo si ningún registro más nuevo ya ganó:
+
+```csharp
+var prepared = streams.BeginAttach(nodeId, register.BackendInstanceId,
+    responseStream, closed);
+await OnRegisterAsync(nodeId, register, linked.Token, streamEpoch);
+if (!streams.Publish(nodeId, prepared))
+```
+
+La línea 1 reserva un epoch único dentro del proceso y quita el stream
+anterior de la vista del dispatcher. La línea 3 ejecuta la transacción
+atómica de registro. La línea 5 publica solo después del commit; un
+resultado falso significa que un registro más nuevo manda y este stream
+se cierra. La asignación del epoch conserva el cálculo monótono:
 
 ```csharp
 _lastEpoch = Math.Max(_timeProvider.GetUtcNow().ToUnixTimeMilliseconds(),
     checked(_lastEpoch + 1));
 ```
 
-La línea 1 obtiene los milisegundos Unix de un reloj inyectable. La línea 2
-elige al menos el ID anterior más uno; `checked` lanza una excepción en vez
-de desbordar. La asignación del epoch y la sustitución se serializan; la
-cancelación permanece fuera del bloqueo. El `Detach` antiguo no elimina al
-sucesor. `NodeStreamRegistryTests` cubre reloj congelado, retroceso del reloj,
-limpieza obsoleta y conexiones concurrentes. La monotonía vale **dentro de
-un registro/proceso**, no es un protocolo persistente entre control planes.
+La primera línea obtiene milisegundos Unix de un reloj inyectable. La
+segunda elige al menos el ID anterior más uno; `checked` lanza excepción
+en vez de desbordar. La cancelación permanece fuera del bloqueo del
+registry, y el `Detach` antiguo no elimina al sucesor.
+`NodeStreamRegistryTests` cubre reloj congelado, retroceso del reloj,
+limpieza obsoleta, conexiones concurrentes, ocultamiento antes del commit
+y publicaciones en carrera. La monotonía vale **dentro de un
+registro/proceso**, no es un protocolo persistente entre control planes.
 
 **Términos:** `context.WithCancel` crea un ámbito hijo de cancelación;
 `defer` ejecuta limpieza al retornar; `<-heartbeatDone` espera al cierre de
@@ -594,3 +612,4 @@ reactivó.
   de un reinicio del agente.
 - `r6` — semántica del reinicio del backend refinada en el milestone 5: las sesiones viejas quedan fuera del primer snapshot del backend nuevo, pasan a `failed` solo tras aplicación confirmada y exigen una nueva sesión API.
 - `r7` — recuperación del reset serializada con aprovisionamiento: registro atómico, resets pendientes conservados entre reconexiones antes del ACK y nodos inelegibles hasta el ACK confirmador.
+- `r8` — publicación del stream endurecida: los streams sustitutos quedan ocultos mientras el registro no confirma y se publican solo después del commit de la transacción.

@@ -134,9 +134,12 @@ prometia:
   falar como si mesmo.
 - **`NodeChannelService`.** O primeiro frame tem que ser `NodeRegister`;
   o `stream_epoch` é um ID numérico monotônico iniciado em milissegundos Unix,
-  atribuído na conexão (veja r2 abaixo), e o
-  `NodeStreamRegistry` substitui atomicamente qualquer stream anterior
-  (seu CancellationTokenSource é cancelado — o interruptor de fencing).
+  atribuído ao preparar o stream substituto (veja r2 abaixo). O
+  `NodeStreamRegistry` oculta qualquer stream anterior antes da transação
+  de registro e publica o substituto somente depois do commit. Enquanto o
+  registro está aberto, o dispatcher não vê stream para o nó, então não
+  consegue carimbar comandos com uma geração ainda não confirmada; um
+  registro superado nunca se torna visível.
   Heartbeats renovam `nodes.last_seen_at` e o registry em memória. Um
   `CommandAck` é correlacionado por `command_id` *e* verificado: um ack
   com outro `stream_epoch` ou `backend_instance_id` é ignorado.
@@ -418,21 +421,36 @@ aberto e encerra com `PermissionDenied`. Após o EOF no envio seguinte,
 o keepalive do transporte continua como contingência.
 
 Duas reconexões podem ocorrer no mesmo milissegundo; o relógio pode recuar.
-`NodeStreamRegistry.Attach` calcula o seguinte dentro do mesmo bloqueio
-que publica o stream substituto:
+`BeginAttach` atribui o epoch e oculta o stream anterior antes da transação
+de registro. `Publish` expõe o substituto somente depois do commit, e só
+se nenhum registro mais novo já tiver vencido:
+
+```csharp
+var prepared = streams.BeginAttach(nodeId, register.BackendInstanceId,
+    responseStream, closed);
+await OnRegisterAsync(nodeId, register, linked.Token, streamEpoch);
+if (!streams.Publish(nodeId, prepared))
+```
+
+A linha 1 reserva um epoch único no processo e remove o stream anterior
+da visão do dispatcher. A linha 3 executa a transação atômica de registro.
+A linha 5 publica somente depois do commit; um resultado falso significa
+que um registro mais novo é autoritativo e este stream é fechado. A
+atribuição do epoch mantém o cálculo monotônico:
 
 ```csharp
 _lastEpoch = Math.Max(_timeProvider.GetUtcNow().ToUnixTimeMilliseconds(),
     checked(_lastEpoch + 1));
 ```
 
-A linha 1 obtém os milissegundos Unix de um relógio injetável. A linha 2
-escolhe pelo menos o ID anterior mais um; `checked` lança uma exceção em vez
-de permitir overflow. A atribuição do epoch e a substituição são serializadas;
-o cancelamento permanece fora do bloqueio. O `Detach` antigo não remove o
-sucessor. `NodeStreamRegistryTests` cobre relógio congelado, recuo do relógio,
-limpeza obsoleta e conexões concorrentes. A monotonicidade vale **dentro de
-um registro/processo**, não é um protocolo persistente entre control planes.
+A primeira linha obtém milissegundos Unix de um relógio injetável. A
+segunda escolhe pelo menos o ID anterior mais um; `checked` lança exceção
+em vez de permitir overflow. O cancelamento permanece fora do bloqueio do
+registry, e o `Detach` antigo não remove o sucessor.
+`NodeStreamRegistryTests` cobre relógio congelado, recuo do relógio,
+limpeza obsoleta, conexões concorrentes, ocultação antes do commit e
+publicações concorrentes. A monotonicidade vale **dentro de um
+registro/processo**, não é um protocolo persistente entre control planes.
 
 **Termos:** `context.WithCancel` cria um escopo filho de cancelamento;
 `defer` executa limpeza ao retornar; `<-heartbeatDone` espera o fechamento
@@ -586,3 +604,4 @@ a sessão ficou `revoked` e o lease chegou a zero. A não foi reativada.
   prova a expiração local através de um reinício do agente.
 - `r6` — semântica do reinício do backend refinada no Marco 5: sessões antigas ficam fora do primeiro snapshot do backend novo, viram `failed` só após aplicação confirmada e exigem nova sessão de API.
 - `r7` — recuperação do reset serializada com provisionamento: registro atômico, resets pendentes preservados entre reconexões antes do ACK e nós inelegíveis até o ACK confirmador.
+- `r8` — publicação de stream endurecida: streams substitutos ficam ocultos enquanto o registro não confirma e são publicados somente depois do commit da transação.
