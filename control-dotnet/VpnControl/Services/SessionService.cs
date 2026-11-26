@@ -172,6 +172,13 @@ public sealed class SessionService(
             try
             {
                 await EnsureNodeLockedAsync(node.NodeId, node, cancellationToken);
+                if (await BackendResetState.HasPendingBackendResetAsync(db, node.NodeId, cancellationToken))
+                {
+                    await tx.RollbackAsync(cancellationToken);
+                    return RequestResult<SessionView>.WithError(
+                        "node is waiting for backend reset acknowledgment",
+                        EResultStatus.Unavailable);
+                }
 
                 var labId = await db.Sessions
                     .Where(s => s.NodeId == node.NodeId &&
@@ -370,7 +377,15 @@ public sealed class SessionService(
         {
             return null;
         }
-        var eligible = result.Data.Where(n => n.EngineHealthy).ToList();
+        var resetting = (await db.Outbox.AsNoTracking()
+                .Where(o => o.CommandType == "SyncState" &&
+                    (o.Status == "pending" || o.Status == "sent"))
+                .Select(o => new { o.NodeId, o.Payload })
+                .ToListAsync(ct))
+            .Where(o => BackendResetState.IsPendingResetPayload(o.Payload))
+            .Select(o => o.NodeId)
+            .ToHashSet();
+        var eligible = result.Data.Where(n => n.EngineHealthy && !resetting.Contains(n.NodeId)).ToList();
         return requested is null
             ? eligible.MaxBy(n => n.LastSeen)
             : eligible.FirstOrDefault(n => n.NodeId == requested);

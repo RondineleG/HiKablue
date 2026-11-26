@@ -64,6 +64,8 @@ pub struct Config {
     /// unprivileged agent's uid. Root always passes the peer-credential
     /// check.
     pub control_uid: Option<u32>,
+    /// Group that owns the control socket when using mode-0660 group access.
+    pub control_group: Option<String>,
     /// Optional 32-byte session key enabling the AEAD wire format.
     pub key: Option<Zeroizing<[u8; 32]>>,
     /// Exact directional key pair for control-plane-issued lab sessions.
@@ -350,7 +352,7 @@ async fn run_loop(cfg: Config, tun: Tun) -> io::Result<()> {
         cfg.control_sock.is_some(),
     ));
     let control_task = if let Some(path) = &cfg.control_sock {
-        let listener = control::bind(path, cfg.control_uid)?;
+        let listener = control::bind(path, cfg.control_uid, cfg.control_group.as_deref())?;
         Some(tokio::spawn(control::serve(
             sessions.clone(),
             metrics.clone(),
@@ -677,6 +679,7 @@ mod tests {
             metrics_group: None,
             control_sock: None,
             control_uid: None,
+            control_group: None,
             key: None,
             tx_key: None,
             rx_key: None,
@@ -978,6 +981,7 @@ mod tests {
             metrics_group: None,
             control_sock: None,
             control_uid: None,
+            control_group: None,
             key: None,
             tx_key: None,
             rx_key: None,

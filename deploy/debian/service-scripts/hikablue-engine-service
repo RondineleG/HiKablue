@@ -1,0 +1,21 @@
+#!/bin/sh
+# hikablue-engine-service — resolve the agent uid and start the lab engine.
+set -eu
+
+: "${ENGINE_BIND:?set ENGINE_BIND in /etc/hikablue/engine.env}"
+: "${ENGINE_TUN_CIDR:?set ENGINE_TUN_CIDR in /etc/hikablue/engine.env}"
+ENGINE_TUN_NAME=${ENGINE_TUN_NAME:-tun0}
+ENGINE_MTU=${ENGINE_MTU:-1400}
+AGENT_USER=${AGENT_USER:-hikablue-agent}
+agent_uid=$(id -u "$AGENT_USER")
+
+exec /opt/hikablue/current/bin/vpn-engine server \
+    --bind "$ENGINE_BIND" \
+    --tun-cidr "$ENGINE_TUN_CIDR" \
+    --tun-name "$ENGINE_TUN_NAME" \
+    --mtu "$ENGINE_MTU" \
+    --metrics-sock /run/hikablue-engine/engine.sock \
+    --metrics-group "$AGENT_USER" \
+    --control-sock /run/hikablue-engine/control.sock \
+    --control-uid "$agent_uid" \
+    --control-group "$AGENT_USER"

@@ -1,0 +1,20 @@
+#!/bin/sh
+# hikablue-agent-service — start the node orchestration agent.
+set -eu
+
+: "${CONTROL_ORCHESTRATOR:?set CONTROL_ORCHESTRATOR in /etc/hikablue/agent.env}"
+: "${NODE_ID:?set NODE_ID in /etc/hikablue/agent.env}"
+CA_PATH=${CA_PATH:-/etc/hikablue/pki/ca.crt}
+CERT_PATH=${CERT_PATH:-/etc/hikablue/pki/node.crt}
+KEY_PATH=${KEY_PATH:-/etc/hikablue/pki/node.key}
+
+exec /opt/hikablue/current/bin/vpn-agent -serve \
+    -orchestrator "$CONTROL_ORCHESTRATOR" \
+    -ca "$CA_PATH" \
+    -cert "$CERT_PATH" \
+    -key "$KEY_PATH" \
+    -node-id "$NODE_ID" \
+    -agent-version "${AGENT_VERSION:-unknown}" \
+    -metrics-sock /run/hikablue-engine/engine.sock \
+    -control-sock /run/hikablue-engine/control.sock \
+    -state-dir /var/lib/hikablue/agent-state

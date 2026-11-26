@@ -66,7 +66,7 @@ Persist the following states: `pending`, `active`, `revoking`, `revoked`, and `f
 | `backend_instance_id` | Fresh identifier for one running data-plane instance, reported at registration and checked in commands and ACKs. A backend restart triggers reconciliation and invalidates lab keys bound to that instance. |
 | `key_epoch` | Identifier for fresh directional keys and their send counters and receive windows. It changes on rekey or restart of either lab endpoint, independently of the control stream and desired revision. |
 
-**Command delivery.** Include `command_id`, `node_id`, `stream_epoch`, `backend_instance_id`, desired `revision`, deadline, and payload. ACKs echo the identifiers and report the applied revision and outcome. Accept ACKs only from the current authenticated stream for the current backend instance and matching command. Apply at-least-once delivery idempotently and request a snapshot on a revision gap. A rejected or partially applied snapshot does not advance the applied revision or release leases. Reread applied state and reconcile before reporting success. Define the messages in `edge_orchestrator.proto` and reserve removed fields.
+**Command delivery.** Include `command_id`, `node_id`, `stream_epoch`, `backend_instance_id`, desired `revision`, deadline, and payload. ACKs echo the identifiers and report the applied revision and outcome. Accept ACKs only from the current authenticated stream for the current backend instance and matching command. A replacement stream must not become visible to the dispatcher before its registration transaction commits; hide the superseded stream while registration is in progress so no command can be stamped with a generation whose invalidation or reset is still uncommitted. Once a newer registration has been prepared, an older in-flight registration must abort rather than overwrite the node identity or enqueue another reset. Apply at-least-once delivery idempotently and request a snapshot on a revision gap. A rejected or partially applied snapshot does not advance the applied revision or release leases. Reread applied state and reconcile before reporting success. Define the messages in `edge_orchestrator.proto` and reserve removed fields.
 
 **Snapshot validation and deletion guard.** Read desired state and revision in one consistent database transaction. A read error aborts publication. Frame the raw serialized peer list with its byte length, declared peer count, and SHA-256 digest; verify all three against the received bytes and decoded list before mutation. Reject stale revisions, duplicate identities, invalid entries, and snapshots for a different node or backend. Treat accidental empty reads, truncated payloads, and invalid digests as errors, leaving the applied state intact.
 
@@ -148,14 +148,24 @@ are preserved rather than renumbered:
   retiring the HTTP heartbeat and the cross-process gRPC lab remain
   explicitly deferred to milestone 4; the full milestone-3 demonstration
   is not yet an observed end-to-end result.
-- **4 · End-to-end session — in progress.** Phase 2 crypto shipped in
-  [PR #14](https://github.com/RondineleG/HiKablue/pull/14): AEAD framing,
-  directional keys, atomic replay acceptance, nonce-exhaustion latch and
-  symmetric inner-VIP checks in lab `--key` mode. CLI, dynamic peers,
-  restart-safe key lifecycle, local expiration and reconciliation remain.
-- **5–6 — pending.** Deployment/recovery and WireGuard follow the
-  end-to-end session work. Full tunneling and the HTTP check still depend
-  on the deferred forwarding/NAT work above.
+- **4 · End-to-end session — delivered and validated locally.** The merged
+  milestone-4 correction restored the full `tests/checks.sh --lab` gate:
+  two-client HTTP connectivity, revocation without interrupting the other
+  client, reconciliation after gRPC loss, and local expiry across an agent
+  restart all passed in the isolated laboratory.
+- **5 · Deployment and recovery — implemented locally.** Debian release
+  construction, idempotent installation, binary upgrade and rollback are
+  covered offline. Backend restart recovery is covered end to end: the
+  agent exits when the engine returns a fresh `backend_instance_id`, the
+  control plane invalidates pre-restart sessions only after confirmed
+  empty-state reconciliation, leases are released, stale keys cannot pass
+  traffic, and a fresh session restores HTTP connectivity. Client TUN and
+  connected-route rollback after `SIGKILL` are observed. Automatic rekey of
+  the same session, full-tunnel rollback, PostgreSQL backup/rollback, real
+  secret provisioning, and production-network validation remain explicit
+  deferrals.
+- **6 — pending.** WireGuard follows deployment/recovery. Full tunneling
+  and the HTTP check still depend on the deferred forwarding/NAT work above.
 
 ### First implementation session
 

@@ -94,11 +94,16 @@ pub struct CommonArgs {
     /// Without this flag the control socket is not opened.
     #[arg(long)]
     pub control_sock: Option<std::path::PathBuf>,
-    /// UID of the node agent allowed to connect to the control socket;
-    /// the socket file is chowned to it. Root always passes the
-    /// peer-credential check. Requires --control-sock.
+    /// UID of the node agent allowed to connect to the control socket.
+    /// Root always passes the peer-credential check. Requires --control-sock.
     #[arg(long)]
     pub control_uid: Option<u32>,
+    /// Group that owns the control socket file with mode 0660. Use this
+    /// for unprivileged service deployments: membership grants connect
+    /// permission while --control-uid remains the identity check. Without
+    /// it, --control-uid preserves the legacy root-oriented chown behavior.
+    #[arg(long)]
+    pub control_group: Option<String>,
     /// 32-byte ChaCha20-Poly1305 session key as 64 hex chars. Legacy lab
     /// option: the value is visible in the process command line; prefer
     /// --key-file. Without either, the engine speaks the M2 plaintext format.

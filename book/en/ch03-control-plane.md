@@ -83,6 +83,8 @@ natively.
 
 1. `INSERT ... ON CONFLICT DO NOTHING` the node, then
    `SELECT node_id ... FOR UPDATE` — one provisioning at a time per node.
+   Backend registration takes this same lock, and a node with a backend
+   reset still waiting for ACK is not eligible for new sessions.
 2. `lab_session_id = COALESCE(MAX(...), 0) + 1` under that lock.
 3. Candidate addresses come from the **whole** CIDR, hash-shuffled by
    `HashCode.Combine(node_id, session_id, address)` — dispersed probing,
@@ -126,9 +128,12 @@ contract promised:
   as itself.
 - **`NodeChannelService`.** The first frame must be `NodeRegister`;
   `stream_epoch` is a monotonic numeric ID seeded from Unix milliseconds,
-  allocated at attach (see r2 below). `NodeStreamRegistry`
-  atomically replaces any previous stream (its CancellationTokenSource is
-  cancelled — the fencing switch). Heartbeats refresh `nodes.last_seen_at`
+  allocated when a replacement stream is prepared (see r2 below).
+  `NodeStreamRegistry` hides any previous stream before the registration
+  transaction and publishes the replacement only after that transaction
+  commits. While registration is open the dispatcher sees no stream for
+  the node, so it cannot stamp commands with an uncommitted generation;
+  a superseded registration never becomes visible. Heartbeats refresh `nodes.last_seen_at`
   and the in-memory registry. A `CommandAck` is correlated by
   `command_id` *and* fenced: an ack stamped for another `stream_epoch` or
   `backend_instance_id` is ignored. The ACK must also match a stored
@@ -140,8 +145,11 @@ contract promised:
   `FENCED_STREAM`/`FENCED_BACKEND` fail the row, close the stream and
   enqueue a `SyncState` resync; `REVISION_REGRESSION` and
   `INVALID_PAYLOAD` fail the row. On the first attempt, a deadline
-  rejection fails the row and a retryable error returns it to `pending`
-  with a 250 ms `next_retry_at`. On redelivery, those responses may refer
+  rejection fails an ordinary command and a retryable error returns it to
+  `pending` with a 250 ms `next_retry_at`. A backend-reset `SyncState` is
+  the exception: the rejection proves that attempt was not applied, so the
+  reset returns to `pending` rather than reopening provisioning before
+  confirmation. On redelivery, those responses may refer
   to an older attempt: the ACK does not include an attempt number. The
   row stays `sent` until `APPLIED` or recovery at the current deadline.
 - **`OutboxDispatcherWorker`.** A short `FOR UPDATE SKIP LOCKED`
@@ -191,6 +199,15 @@ contract promised:
   requests reconciliation via `SyncState`. This is not disk persistence;
   the handler still has to be idempotent.
 
+  On the control-plane side, backend registration is one transaction: node
+  identity update, old-generation command invalidation, and the reset
+  `SyncState` enqueue commit or roll back together. The transaction first
+  locks the same node row used by provisioning. If the stream disconnects
+  before the reset ACK, a reconnect for the same backend requeues that
+  pending/sent reset row instead of duplicating it with a snapshot that
+  includes pre-restart sessions. The reset-marked node is excluded from
+  new session creation until the valid ACK completes recovery.
+
 Verified locally: 16 new C# tests (SPIFFE acceptance/rejection matrix,
 fencing, lease release on revoke ack) plus 14 Go tests — a real mTLS
 handshake against a test CA, untrusted-cert rejection, and an in-process
@@ -227,6 +244,8 @@ private Task<int> LockNodeAsync(string nodeId, CancellationToken ct) =>
 - `SELECT ... FOR UPDATE` is the lease on the *parent* row: every
   concurrent `CreateSessionAsync` for this node serializes here, so the
   `MAX(lab_session_id)+1` below is computed by exactly one transaction.
+  `NodeChannelService.OnRegisterAsync` deliberately takes the same lock,
+  so backend generation changes cannot interleave with provisioning.
 - `ExecuteSqlAsync` interpolates parameters (`{nodeId}`) — it is **not**
   string concatenation; Npgsql sends them as bound parameters.
 
@@ -374,22 +393,56 @@ then closes with `PermissionDenied`. After the next send reports EOF,
 so the existing transport keepalive remains the fallback.
 
 Two reconnects can occur in one millisecond; a clock can move backward.
-`NodeStreamRegistry.Attach` now computes this inside the same lock that
-publishes the replacement stream:
+`BeginAttach` allocates the epoch and hides the old stream before the
+registration transaction. `Publish` exposes the replacement only after
+commit, and only if no newer registration has already won:
+
+```csharp
+var prepared = streams.BeginAttach(nodeId, register.BackendInstanceId,
+    responseStream, closed);
+var streamEpoch = prepared.StreamEpoch;
+ActiveStream? active = null;
+
+try
+{
+    using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+        ct, closed.Token);
+    await OnRegisterAsync(nodeId, register, linked.Token, streamEpoch);
+    if (!streams.Publish(nodeId, prepared))
+    {
+        throw new RpcException(new Status(StatusCode.Aborted,
+            "stream superseded by a newer registration"));
+    }
+    active = prepared;
+```
+
+`BeginAttach` reserves a unique process-local epoch and removes the old
+stream from dispatcher visibility. `streamEpoch` carries that identity
+into registration and later detach. `active` starts null so cleanup does
+not detach a stream that was never published. `linked` combines caller
+cancellation with fencing cancellation. `OnRegisterAsync` performs the
+atomic registration transaction. `Publish` runs only after commit; a
+false result means a newer registration is authoritative and throws
+`Aborted` instead of activating this stream. `active = prepared` is
+reached only after publication succeeds. After taking the node-row lock,
+registration also checks that its epoch is still the latest prepared epoch
+for that node; a superseded registration aborts before it can overwrite
+the newer backend identity or enqueue another reset.
+Epoch allocation itself still uses the monotonic calculation:
 
 ```csharp
 _lastEpoch = Math.Max(_timeProvider.GetUtcNow().ToUnixTimeMilliseconds(),
     checked(_lastEpoch + 1));
 ```
 
-Line 1 takes the current Unix milliseconds from an injectable clock.
-Line 2 chooses at least the previous ID plus one; `checked` throws rather
-than wrapping at integer overflow. Epoch allocation and stream replacement
-are serialized, while cancellation stays outside the lock. An old stream's
-`Detach` cannot remove its successor. `NodeStreamRegistryTests` covers a
-frozen clock, clock rollback, stale cleanup and concurrent attaches.
-This is monotonic **within one registry/process**, not a durable,
-multi-control-plane fencing protocol.
+The first line takes Unix milliseconds from an injectable clock. The
+second chooses at least the previous ID plus one; `checked` throws rather
+than wrapping at integer overflow. Cancellation stays outside the
+registry lock, and an old stream's `Detach` cannot remove its successor.
+`NodeStreamRegistryTests` covers a frozen clock, clock rollback, stale
+cleanup, concurrent attaches, hidden pre-commit registration, and racing
+publications. This is monotonic **within one registry/process**, not a
+durable, multi-control-plane fencing protocol.
 
 **Terms:** `context.WithCancel` creates a child cancellation scope;
 `defer` runs cleanup on return; `<-heartbeatDone` waits for a channel
@@ -510,9 +563,11 @@ Contract note: the specification table still calls the Go↔Rust methods
 keeps the already delivered boundary instead — a separate control socket
 with `StagePeer`, `Activate`, `Retire`, `RevokePeer`, and `GetSessions` —
 because renaming it was not needed for the acceptance behavior. Backend
-restart reprovisioning is deliberately not claimed: snapshots carry key
-references, not raw keys, so a new backend cannot reconstruct old epochs
-without fresh explicit provisioning.
+restart reprovisioning of the same session is deliberately not claimed:
+snapshots carry key references, not raw keys, so a new backend cannot
+reconstruct old epochs. Milestone 5 instead invalidates pre-restart
+sessions after confirmed empty-state reconciliation and requires a fresh
+API session with fresh keys.
 
 ### Observed control-plane result
 
@@ -554,3 +609,6 @@ become 0. A was not reactivated.
   the laboratory gains run-scoped resource ownership and the
   `--expire-restart` scenario proving local expiry across an agent
   restart.
+- `r6` — backend restart semantics refined in milestone 5: old sessions are excluded from the first fresh-backend snapshot, become `failed` only after confirmed application, and require a fresh API session.
+- `r7` — reset recovery serialized with provisioning: registration writes are atomic, pending resets survive pre-ACK reconnects, and reset-marked nodes are ineligible for new sessions until the confirming ACK.
+- `r8` — stream publication hardened: replacement streams are hidden while registration is uncommitted and published only after the registration transaction commits.

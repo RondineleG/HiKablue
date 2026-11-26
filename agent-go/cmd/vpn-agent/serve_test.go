@@ -16,6 +16,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -71,6 +72,13 @@ func writeTestPKI(t *testing.T, dir string) (ca, cert, key string) {
 
 func sessionsSocket(t *testing.T) string {
 	t.Helper()
+	backend := &atomic.Value{}
+	backend.Store("backend-test")
+	return sessionsSocketWithBackend(t, backend)
+}
+
+func sessionsSocketWithBackend(t *testing.T, backend *atomic.Value) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "control.sock")
 	l, err := net.Listen("unix", path)
 	if err != nil {
@@ -99,7 +107,7 @@ func sessionsSocket(t *testing.T) string {
 				_ = json.Unmarshal(buf, &req)
 				resp, _ := json.Marshal(map[string]any{
 					"request_id": req.RequestID, "version": 1, "status": "ok",
-					"result": map[string]any{"backend_instance_id": "backend-test", "peers": []any{}},
+					"result": map[string]any{"backend_instance_id": backend.Load().(string), "peers": []any{}},
 				})
 				_ = binary.Write(c, binary.BigEndian, uint32(len(resp)))
 				_, _ = c.Write(resp)
@@ -140,6 +148,34 @@ func TestServeStartsChannelAndStopsWithContext(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("serve did not stop with context")
+	}
+}
+
+func TestServeExitsWhenBackendInstanceChanges(t *testing.T) {
+	dir := t.TempDir()
+	ca, cert, key := writeTestPKI(t, dir)
+	backend := &atomic.Value{}
+	backend.Store("backend-test")
+	done := make(chan int, 1)
+	var out, errout bytes.Buffer
+	go func() {
+		done <- runWithContext(context.Background(), []string{
+			"-serve", "-orchestrator", "127.0.0.1:1",
+			"-ca", ca, "-cert", cert, "-key", key, "-node-id", "exit-node",
+			"-control-sock", sessionsSocketWithBackend(t, backend),
+			"-metrics-sock", filepath.Join(dir, "metrics.sock"),
+			"-state-dir", filepath.Join(dir, "agent-state"),
+		}, &out, &errout)
+	}()
+	time.Sleep(300 * time.Millisecond)
+	backend.Store("backend-restarted")
+	select {
+	case code := <-done:
+		if code != 0 || !bytes.Contains(errout.Bytes(), []byte("backend instance changed")) {
+			t.Fatalf("exit %d stderr %q", code, errout.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("serve did not exit after backend instance changed")
 	}
 }
 

@@ -72,9 +72,10 @@ run_step "commit validator" bash .github/scripts/validate-commits.sh
 run_step "diff safety (forbidden patterns)" bash tests/lab/check-diff-safety.sh "$BASE_SHA" "$HEAD_SHA"
 run_step "diff safety self-tests" bash tests/lab/check-diff-safety.test.sh
 run_step "lab PKI issuance tests" bash tests/lab/gen-lab-pki.test.sh
+run_step "deployment install/rollback offline test" bash tests/deploy/install-rollback.test.sh
 
 step_shell() {
-    mapfile -t scripts < <(git ls-files '*.sh')
+    mapfile -t scripts < <(git ls-files '*.sh' 'deploy/debian/service-scripts/hikablue-*')
     for f in "${scripts[@]}"; do
         case "$(head -1 "$f")" in
             *bash*) bash -n "$f" ;;
@@ -144,6 +145,8 @@ if [ "$run_lab" -eq 1 ]; then
         tests/lab/session-e2e.sh --drop
     run_step "lab integration: milestone 4 local expiry across agent restart" \
         tests/lab/session-e2e.sh --expire-restart
+    run_step "lab integration: milestone 5 engine restart and route rollback" \
+        tests/lab/session-e2e.sh --engine-restart
     run_step "lab integration: session resource ownership regressions (sudo)" \
         sudo tests/lab/session-e2e-safety.test.sh
 else

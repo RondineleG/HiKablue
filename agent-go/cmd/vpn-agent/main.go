@@ -38,6 +38,28 @@ func reconnectDelays(current time.Duration, establishedAt, endedAt time.Time) (d
 	return current, next
 }
 
+func watchBackendInstance(ctx context.Context, control agent.ControlClient, want string,
+	stderr io.Writer, cancel context.CancelFunc) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		sessions, err := control.Sessions(ctx)
+		if err != nil {
+			continue
+		}
+		if sessions.BackendInstanceID != "" && sessions.BackendInstanceID != want {
+			fmt.Fprintln(stderr, "vpn-agent: engine backend instance changed; exiting for supervised restart")
+			cancel()
+			return
+		}
+	}
+}
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
@@ -87,6 +109,8 @@ func runWithContext(parent context.Context, args []string, stdout, stderr io.Wri
 
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
 	expiryStatePath, err := agent.PrepareExpiryStateDir(*stateDir)
 	if err != nil {
 		fmt.Fprintln(stderr, "vpn-agent:", err)
@@ -104,7 +128,7 @@ func runWithContext(parent context.Context, args []string, stdout, stderr io.Wri
 		fmt.Fprintln(stderr, "vpn-agent: load expiry state:", err)
 		return 1
 	}
-	go handler.RunExpiryLoop(ctx, 500*time.Millisecond)
+	go handler.RunExpiryLoop(runCtx, 500*time.Millisecond)
 
 	cfg := orchestrator.Config{
 		Address:           *address,
@@ -117,26 +141,27 @@ func runWithContext(parent context.Context, args []string, stdout, stderr io.Wri
 		HeartbeatInterval: 2 * time.Second,
 	}
 	cfg.ReplayState = orchestrator.NewReplayState(cfg.NodeId, cfg.BackendInstanceId)
+	go watchBackendInstance(runCtx, control, cfg.BackendInstanceId, stderr, cancelRun)
 
 	backoff := reconnectInitialDelay
-	for ctx.Err() == nil {
-		conn, err := orchestrator.Dial(ctx, cfg)
+	for runCtx.Err() == nil {
+		conn, err := orchestrator.Dial(runCtx, cfg)
 		establishedAt := time.Time{}
 		if err != nil {
 			fmt.Fprintln(stderr, "vpn-agent:", err)
 		} else {
 			channel := orchestrator.NewChannel(cfg, handler)
-			err = channel.Run(ctx, conn)
+			err = channel.Run(runCtx, conn)
 			establishedAt = channel.EstablishedAt()
 			_ = conn.Close()
-			if ctx.Err() != nil {
+			if runCtx.Err() != nil {
 				return 0
 			}
 			fmt.Fprintln(stderr, "vpn-agent: NodeChannel ended:", err)
 		}
 		delay, next := reconnectDelays(backoff, establishedAt, time.Now())
 		select {
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			return 0
 		case <-time.After(delay):
 		}

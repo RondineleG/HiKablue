@@ -108,6 +108,10 @@ tests/lab/session-e2e.sh --drop
 # local expiry enforced across an agent restart (control plane unreachable)
 tests/lab/session-e2e.sh --expire-restart
 
+# milestone 5 backend restart, confirmed invalidation, fresh-session
+# recovery, and client route rollback
+tests/lab/session-e2e.sh --engine-restart
+
 # repository quality gate, including the privileged labs and the
 # ownership-registry safety test
 tests/checks.sh --lab
@@ -132,6 +136,19 @@ fenced removal ACK release A's lease — the script asserts the lease stayed
 reserved while removal was unconfirmed and that the expired session is
 never resurrected during reconciliation.
 
+The engine-restart run is the milestone-5 backend recovery acceptance.
+After normal two-client HTTP connectivity, it terminates and restarts the
+exit engine. The agent observes the changed `backend_instance_id`, exits
+for supervised restart, and is started again. Registration with the fresh
+instance enqueues an empty-state reconciliation that deliberately excludes
+the pre-restart sessions. Only after that reconciliation is applied does
+the control plane mark those sessions `failed` with
+`backend_restart_requires_new_session` and release their leases. The script
+then proves three separate things: client B cannot continue with stale
+keys, killing client A with `SIGKILL` removes its transient `tun0` and the
+connected tunnel route, and a fresh session in the same namespace receives
+fresh keys and restores HTTP connectivity.
+
 ## Evidence ordering
 
 `OBSERVED:` lines are emitted only after the assertion they describe. The
@@ -153,6 +170,7 @@ Observed on the Ubuntu development VM used for this change:
 | Normal revocation | `session-e2e (normal): PASS` — A lost access, B had no failed continuous responses, and A's lease count changed from 1 to 0 only after the node ACK |
 | gRPC interruption | `session-e2e (drop): PASS` — A stayed `revoking` with lease count 1 while the channel was down; restoring the channel completed removal, marked the session `revoked`, released the lease, and A still had no access |
 | Agent restart expiry | `session-e2e (expire-restart): PASS` — the restarted agent expired A from its persisted deadline with no control plane, B had zero failed responses, the reconnect reconciled A to `revoked` without resurrecting it, and the lease was released only after the fenced removal ACK |
+| Engine restart recovery | `session-e2e (engine-restart): PASS` — the agent detected the fresh backend instance, pre-restart sessions became `failed` only after confirmed empty-state reconciliation, stale keys could not pass traffic, the killed client's TUN/route disappeared, and a fresh session restored HTTP connectivity |
 | Key material hygiene | every client engine command line was verified free of key material; keys live only in `0600` files under the private run directory |
 
 Exact counters vary because keepalives and continuous probe timing vary;
@@ -172,13 +190,14 @@ the acceptance output lines are the stable result.
   inline `--tx-key`/`--rx-key` flags remain only for compatibility, emit a
   warning when used, and must not be copied to production use — this is not
   the final client key-delivery design.
-- Backend restart reprovisioning is outside this laboratory. Snapshots
-  intentionally carry peer/key references, not raw keys, so a new backend
-  instance cannot reconstruct old epochs from `SyncState`; explicit fresh
-  provisioning remains a later architecture step.
+- Snapshots intentionally carry peer/key references, not raw keys, so a new
+  backend instance cannot resurrect old epochs from `SyncState`. The
+  milestone-5 recovery behavior is explicit invalidation plus a fresh API
+  session; automatic rekeying of an existing client session remains a later
+  architecture step.
 - The expire-restart scenario restarts only the Go agent while the Rust
-  backend keeps running; full recovery after a backend restart remains out
-  of scope by design.
+  backend keeps running; backend restart recovery is covered separately by
+  `--engine-restart`.
 - The agent persists expiry deadlines in `expiry.json` (`0600`, fsync'd
   write + rename + directory fsync) inside a private `-state-dir` (default
   `/run/vpn/agent-state`, validated `0700` and writable before the channel

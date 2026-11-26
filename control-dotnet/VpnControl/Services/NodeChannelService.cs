@@ -63,15 +63,25 @@ public sealed class NodeChannelService(
         }
 
         var closed = new CancellationTokenSource();
-        var active = streams.Attach(nodeId, register.BackendInstanceId,
+        // Hide the previous stream before touching registration state, but do
+        // not publish this stream yet. The dispatcher must not stamp commands
+        // with a generation whose invalidation/reset transaction is still open.
+        var prepared = streams.BeginAttach(nodeId, register.BackendInstanceId,
             responseStream, closed);
-        var streamEpoch = active.StreamEpoch;
+        var streamEpoch = prepared.StreamEpoch;
+        ActiveStream? active = null;
 
         try
         {
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(
                 ct, closed.Token);
             await OnRegisterAsync(nodeId, register, linked.Token, streamEpoch);
+            if (!streams.Publish(nodeId, prepared))
+            {
+                throw new RpcException(new Status(StatusCode.Aborted,
+                    "stream superseded by a newer registration"));
+            }
+            active = prepared;
             while (await requestStream.MoveNext(linked.Token))
             {
                 await DispatchAsync(nodeId, active, requestStream.Current, linked.Token);
@@ -79,7 +89,10 @@ public sealed class NodeChannelService(
         }
         finally
         {
-            streams.Detach(nodeId, streamEpoch);
+            if (active is not null)
+            {
+                streams.Detach(nodeId, streamEpoch);
+            }
             closed.Cancel();
             logger.LogInformation("node {NodeId} stream {Epoch} closed", nodeId, streamEpoch);
         }
@@ -105,15 +118,34 @@ public sealed class NodeChannelService(
     public async Task OnRegisterAsync(string nodeId, NodeRegister register,
         CancellationToken ct, string? streamEpoch = null)
     {
-        var count = await db.Nodes.CountAsync(ct);
-        var exists = await db.Nodes.AnyAsync(n => n.NodeId == nodeId, ct);
-        if (!exists && count >= MaxNodes)
+        var now = DateTimeOffset.UtcNow;
+        await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+        // Serialize registration with session creation on the same node-row
+        // lock used by SessionService. The lock is held until commit, so a
+        // concurrent create cannot slip between the backend-generation check,
+        // old-generation command invalidation, and reset snapshot enqueue.
+        var nodeRow = await db.Nodes
+            .FromSql($"SELECT * FROM nodes WHERE node_id = {nodeId} FOR UPDATE")
+            .FirstOrDefaultAsync(ct);
+        if (streamEpoch is not null && !streams.IsLatestPrepared(nodeId, streamEpoch))
         {
-            throw new RpcException(new Status(StatusCode.ResourceExhausted,
-                "node registry is at capacity"));
+            throw new RpcException(new Status(StatusCode.Aborted,
+                "stream superseded by a newer registration"));
         }
 
-        var now = DateTimeOffset.UtcNow;
+        var exists = nodeRow is not null;
+        if (!exists)
+        {
+            var count = await db.Nodes.CountAsync(ct);
+            if (count >= MaxNodes)
+            {
+                throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                    "node registry is at capacity"));
+            }
+        }
+
+        var previousBackendInstanceId = nodeRow?.BackendInstanceId;
         await db.Database.ExecuteSqlAsync($"""
             INSERT INTO nodes (node_id, backend_instance_id, registered_at, last_seen_at, engine_healthy, desired_revision)
             VALUES ({nodeId}, {register.BackendInstanceId}, {now}, {now}, {true}, 0)
@@ -123,18 +155,50 @@ public sealed class NodeChannelService(
                 engine_healthy = EXCLUDED.engine_healthy
             """, ct);
 
+        var backendRestarted = previousBackendInstanceId is not null &&
+            !string.Equals(previousBackendInstanceId, register.BackendInstanceId, StringComparison.Ordinal);
+        var restartedSessionIds = backendRestarted
+            ? await db.Sessions
+                .Where(s => s.NodeId == nodeId &&
+                    (s.Status == SessionStatus.Pending || s.Status == SessionStatus.Active ||
+                     s.Status == SessionStatus.Revoking))
+                .Select(s => s.SessionId)
+                .ToListAsync(ct)
+            : [];
+
+        if (backendRestarted)
+        {
+            // Every pre-registration attempt belongs to the dead data-plane
+            // generation. The node lock above prevents a concurrent session
+            // creation from entering this set, so no fresh-session command is
+            // discarded with it.
+            await db.Outbox
+                .Where(o => o.NodeId == nodeId && (o.Status == "sent" || o.Status == "pending"))
+                .ExecuteUpdateAsync(o => o.SetProperty(r => r.Status, "failed")
+                    .SetProperty(r => r.NextRetryAt, (DateTimeOffset?)null), ct);
+        }
+        else
+        {
+            // Same generation: sent rows from a dead stream are at-least-once
+            // attempts and may be retried. This also requeues a pending reset
+            // snapshot, but does not duplicate it.
+            await db.Outbox
+                .Where(o => o.NodeId == nodeId && o.Status == "sent" &&
+                    (streamEpoch == null || o.StreamEpoch != streamEpoch))
+                .ExecuteUpdateAsync(o => o.SetProperty(r => r.Status, "pending")
+                    .SetProperty(r => r.NextRetryAt, now), ct);
+        }
+
+        var resetPending = await BackendResetState.HasPendingBackendResetAsync(db, nodeId, ct);
+        if (backendRestarted || !resetPending)
+        {
+            var resetSessionIds = backendRestarted ? restartedSessionIds : null;
+            await EnqueueSyncStateCoreAsync(nodeId, ct, resetSessionIds, resetSessionIds);
+        }
+
+        await db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
         nodeRegistry.Record(new Models.Heartbeat(nodeId, true));
-
-        // Commands marked sent on a previous stream may have been lost
-        // with it (at-least-once): requeue them so the dispatcher
-        // re-delivers on this stream with fresh fencing fields.
-        await db.Outbox
-            .Where(o => o.NodeId == nodeId && o.Status == "sent" &&
-                (streamEpoch == null || o.StreamEpoch != streamEpoch))
-            .ExecuteUpdateAsync(o => o.SetProperty(r => r.Status, "pending")
-                .SetProperty(r => r.NextRetryAt, now), ct);
-
-        await EnqueueSyncStateAsync(nodeId, ct);
     }
 
     public async Task OnHeartbeatAsync(string nodeId, NodeHeartbeat heartbeat,
@@ -225,6 +289,17 @@ public sealed class NodeChannelService(
                 // The wire ACK does not identify the attempt. A deadline
                 // rejection may refer to an older send on this stream.
                 return;
+            case AckOutcome.Rejected when ack.ErrorCode == AckErrorCode.AckErrorDeadlineExceeded &&
+                BackendResetState.IsPendingResetPayload(row.Payload):
+            case AckOutcome.Error when ack.ErrorCode == AckErrorCode.AckErrorDeadlineExceeded &&
+                BackendResetState.IsPendingResetPayload(row.Payload):
+                // A first-attempt deadline rejection proves this attempt was
+                // not applied. A backend reset must not become terminal before
+                // confirmation: retrying it keeps the node blocked instead of
+                // reopening provisioning with old leases still intact.
+                row.Status = "pending";
+                row.NextRetryAt = now.AddMilliseconds(250);
+                break;
             case AckOutcome.Rejected:
             case AckOutcome.Error when ack.ErrorCode
                 is AckErrorCode.AckErrorDeadlineExceeded
@@ -302,21 +377,58 @@ public sealed class NodeChannelService(
                     }
                 }
                 break;
+            case "SyncState":
+                var sync = JsonDocument.Parse(row.Payload).RootElement;
+                if (!sync.TryGetProperty("backend_reset_session_ids", out var resetIds) ||
+                    resetIds.ValueKind != JsonValueKind.Array)
+                {
+                    break;
+                }
+                foreach (var element in resetIds.EnumerateArray())
+                {
+                    if (!Guid.TryParse(element.GetString(), out var resetSessionId))
+                    {
+                        continue;
+                    }
+                    await db.Database.ExecuteSqlAsync(
+                        $"DELETE FROM ip_leases WHERE session_id = {resetSessionId}", ct);
+                    var resetSession = await db.Sessions.FirstOrDefaultAsync(
+                        s => s.SessionId == resetSessionId, ct);
+                    if (resetSession is { Status: SessionStatus.Pending or SessionStatus.Active })
+                    {
+                        resetSession.Status = SessionStatus.Failed;
+                        resetSession.FailureReason = "backend_restart_requires_new_session";
+                        resetSession.UpdatedAt = DateTimeOffset.UtcNow;
+                    }
+                    else if (resetSession is { Status: SessionStatus.Revoking })
+                    {
+                        // Revocation was already the desired terminal state.
+                        // The fresh backend's confirmed empty state is the
+                        // removal confirmation the old backend can never send.
+                        resetSession.Status = SessionStatus.Revoked;
+                        resetSession.UpdatedAt = DateTimeOffset.UtcNow;
+                    }
+                }
+                break;
         }
     }
 
     /// Full desired state for a node: every live session becomes a Peer,
     /// serialized deterministically into a PeerList and framed with
     /// count/length/sha256 (proto contract, spec §5 snapshot validation).
-    public async Task EnqueueSyncStateAsync(string nodeId, CancellationToken ct)
+    public async Task EnqueueSyncStateAsync(string nodeId, CancellationToken ct,
+        IReadOnlyCollection<Guid>? excludeSessionIds = null,
+        IReadOnlyCollection<Guid>? backendResetSessionIds = null)
     {
         await using var tx = await db.Database.BeginTransactionAsync(ct);
-        await EnqueueSyncStateCoreAsync(nodeId, ct);
+        await EnqueueSyncStateCoreAsync(nodeId, ct, excludeSessionIds, backendResetSessionIds);
         await db.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);
     }
 
-    private async Task EnqueueSyncStateCoreAsync(string nodeId, CancellationToken ct)
+    private async Task EnqueueSyncStateCoreAsync(string nodeId, CancellationToken ct,
+        IReadOnlyCollection<Guid>? excludeSessionIds = null,
+        IReadOnlyCollection<Guid>? backendResetSessionIds = null)
     {
         // Serialize against provisioning: session creation locks this same
         // row FOR UPDATE, so the peer set and the bumped revision always
@@ -327,12 +439,16 @@ public sealed class NodeChannelService(
         // Revoking sessions are intentionally absent: the RevokePeer command
         // already enqueued is what removes them — including them here would
         // reinstall a peer that was just torn down (SEC review).
+        var excluded = excludeSessionIds is null
+            ? new HashSet<Guid>()
+            : new HashSet<Guid>(excludeSessionIds);
         var peers = await db.Sessions
             .Where(s => s.NodeId == nodeId &&
                         (s.Status == SessionStatus.Pending ||
                          s.Status == SessionStatus.Active))
             .OrderBy(s => s.LabSessionId)
             .ToListAsync(ct);
+        peers = peers.Where(s => !excluded.Contains(s.SessionId)).ToList();
 
         var list = new PeerList();
         foreach (var s in peers)
@@ -377,7 +493,9 @@ public sealed class NodeChannelService(
                 serialized_length = snapshot.SerializedLength,
                 sha256_digest = Convert.ToBase64String(snapshot.Sha256Digest.ToByteArray()),
                 peer_list = Convert.ToBase64String(peerBytes),
-                force = false
+                force = false,
+                backend_reset_session_ids = backendResetSessionIds?
+                    .Select(id => id.ToString()).ToArray()
             })
         });
     }

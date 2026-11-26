@@ -46,9 +46,15 @@ const MAX_CONNECTIONS: usize = 8;
 /// Binds the control socket with the same stale-file probing as the
 /// metrics socket, then tightens it to mode 0600 — it carries key
 /// material, unlike the group-readable telemetry socket. When
-/// `control_uid` is set the file is chowned to that user so the
-/// unprivileged agent can connect while everyone else is refused.
-pub fn bind(path: &Path, control_uid: Option<u32>) -> io::Result<UnixListener> {
+/// `control_group` is set the file is group-owned with mode 0660, allowing
+/// an unprivileged agent without requiring chown privileges. Otherwise
+/// `control_uid` preserves the legacy root-oriented behavior of chowning
+/// the file to that user.
+pub fn bind(
+    path: &Path,
+    control_uid: Option<u32>,
+    control_group: Option<&str>,
+) -> io::Result<UnixListener> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -77,6 +83,17 @@ pub fn bind(path: &Path, control_uid: Option<u32>) -> io::Result<UnixListener> {
         std::fs::remove_file(path)?;
     }
     let listener = UnixListener::bind(path)?;
+    if let Some(group) = control_group {
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o660))?;
+        let status = std::process::Command::new("chgrp")
+            .arg(group)
+            .arg(path)
+            .status()?;
+        if !status.success() {
+            return Err(io::Error::other(format!("chgrp {group} failed: {status}")));
+        }
+        return Ok(listener);
+    }
     std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     if let Some(uid) = control_uid {
         let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
@@ -391,7 +408,7 @@ mod tests {
     ) -> (PathBuf, Arc<SessionTable>, Arc<Metrics>) {
         let path = sock_path(tag);
         let _ = std::fs::remove_file(&path);
-        let listener = bind(&path, uid).unwrap();
+        let listener = bind(&path, uid, None).unwrap();
         let sessions = table();
         let metrics = Metrics::new();
         tokio::spawn(serve(sessions.clone(), metrics.clone(), listener, uid));
@@ -458,7 +475,7 @@ mod tests {
         let regular = sock_path("regular");
         let _ = std::fs::remove_file(&regular);
         std::fs::write(&regular, b"not a socket").unwrap();
-        let err = bind(&regular, None).unwrap_err();
+        let err = bind(&regular, None, None).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         let _ = std::fs::remove_file(&regular);
 
@@ -467,7 +484,7 @@ mod tests {
         {
             let _listener = std::os::unix::net::UnixListener::bind(&stale).unwrap();
         } // dropping the listener leaves the filesystem entry behind
-        let listener = bind(&stale, None).unwrap();
+        let listener = bind(&stale, None, None).unwrap();
         drop(listener);
         cleanup(&stale);
     }
@@ -630,10 +647,33 @@ mod tests {
     async fn socket_file_is_mode_0600() {
         let path = sock_path("mode");
         let _ = std::fs::remove_file(&path);
-        let _listener = bind(&path, None).unwrap();
+        let _listener = bind(&path, None, None).unwrap();
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn socket_file_can_use_group_access_without_chown() {
+        let path = sock_path("group-mode");
+        let _ = std::fs::remove_file(&path);
+        let output = std::process::Command::new("id")
+            .arg("-gn")
+            .output()
+            .unwrap();
+        let group = String::from_utf8(output.stdout).unwrap().trim().to_string();
+        let gid_output = std::process::Command::new("id").arg("-g").output().unwrap();
+        let gid: u32 = String::from_utf8(gid_output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let _listener = bind(&path, None, Some(&group)).unwrap();
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o660);
+        assert_eq!(metadata.gid(), gid);
         cleanup(&path);
     }
 

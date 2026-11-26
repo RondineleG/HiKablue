@@ -27,7 +27,8 @@ case "${1:-normal}" in
     normal|--normal) MODE=normal ;;
     --drop) MODE=drop ;;
     --expire-restart) MODE=expire-restart ;;
-    *) echo "usage: $0 [--drop|--expire-restart]" >&2; exit 2 ;;
+    --engine-restart) MODE=engine-restart ;;
+    *) echo "usage: $0 [--drop|--expire-restart|--engine-restart]" >&2; exit 2 ;;
 esac
 
 RUN_DIR=$(mktemp -d /tmp/hk-m4-session.XXXXXX)
@@ -44,6 +45,7 @@ CTRL_PID=""
 AGENT_PID=""
 BLOOP_PID=""
 HTTP_PID=""
+SERVER_ENGINE_PID=""
 lab_scope_init
 
 read -r CTRL_PORT PROXY_PORT PGPORT < <(python3 - <<'PY'
@@ -90,6 +92,22 @@ kill_user_pid() {
     if [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$$" ]; then
         kill "$pid" 2>/dev/null || true
     fi
+}
+
+stop_root_owned_pid() {
+    local pid=$1 signal=$2 cmdline
+    [ -n "$pid" ] || return 0
+    cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    case "$cmdline" in
+        *"$RUN_DIR"*) ;;
+        *) return 0 ;;
+    esac
+    lab_as_root kill -"$signal" "$pid" >/dev/null 2>&1 || true
+    for _ in $(seq 100); do
+        [ ! -r "/proc/$pid/cmdline" ] && return 0
+        sleep 0.05
+    done
+    return 1
 }
 
 fail() {
@@ -236,15 +254,26 @@ CTRL_PID=$!
 wait_for 20 curl --cacert "$RUN_DIR/pki/ca/ca.crt" -sf "$CTRL_URL/v1/nodes" \
     || { tail -60 "$CTRL_LOG" >&2; fail "control plane did not start"; }
 
+start_exit_engine() {
+    local log_file=$1
+    rm -f "$RUN_DIR/server-metrics.sock" "$RUN_DIR/server-control.sock" "$RUN_DIR/server-engine.pid"
+    lab_as_root ip netns exec "$NS_EXIT" sh -c "echo \$\$ >'$RUN_DIR/server-engine.pid'; exec '$ENGINE' server \
+        --bind 192.168.50.1:51820 --tun-cidr 10.80.1.1/24 --tun-name tun0 \
+        --metrics-sock '$RUN_DIR/server-metrics.sock' --metrics-group $(id -gn) \
+        --control-sock '$RUN_DIR/server-control.sock' --control-uid $(id -u)" \
+        >"$log_file" 2>&1 &
+    wait_for 10 test -S "$RUN_DIR/server-control.sock" || { cat "$log_file" >&2; fail "exit engine control socket missing"; }
+    SERVER_ENGINE_PID=$(lab_as_root cat "$RUN_DIR/server-engine.pid")
+    lab_register_root_pid "$SERVER_ENGINE_PID" "$RUN_DIR"
+}
+
+stop_exit_engine() {
+    stop_root_owned_pid "$SERVER_ENGINE_PID" TERM || fail "exit engine did not stop"
+    SERVER_ENGINE_PID=""
+}
+
 log "exit engine"
-lab_as_root ip netns exec "$NS_EXIT" sh -c "echo \$\$ >'$RUN_DIR/server-engine.pid'; exec '$ENGINE' server \
-    --bind 192.168.50.1:51820 --tun-cidr 10.80.1.1/24 --tun-name tun0 \
-    --metrics-sock '$RUN_DIR/server-metrics.sock' --metrics-group $(id -gn) \
-    --control-sock '$RUN_DIR/server-control.sock' --control-uid $(id -u)" \
-    >"$SERVER_LOG" 2>&1 &
-wait_for 10 test -S "$RUN_DIR/server-control.sock" || { cat "$SERVER_LOG" >&2; fail "exit engine control socket missing"; }
-SERVER_ENGINE_PID=$(lab_as_root cat "$RUN_DIR/server-engine.pid")
-lab_register_root_pid "$SERVER_ENGINE_PID" "$RUN_DIR"
+start_exit_engine "$SERVER_LOG"
 
 start_proxy() {
     local delay_ms=$1 log_file=$2
@@ -339,6 +368,13 @@ start_client() {
     lab_register_root_pid "$client_pid" "$RUN_DIR"
 }
 
+stop_client() {
+    local tag=$1 signal=${2:-TERM} pid
+    [ -f "$RUN_DIR/$tag-engine.pid" ] || return 0
+    pid=$(lab_as_root cat "$RUN_DIR/$tag-engine.pid")
+    stop_root_owned_pid "$pid" "$signal" || fail "$tag engine did not stop after $signal"
+}
+
 curl_client() {
     lab_as_root ip netns exec "$1" curl --connect-timeout 2 --max-time 3 -sf http://10.80.1.100:8080/ 2>/dev/null
 }
@@ -406,7 +442,85 @@ log "HTTP connectivity over both tunnels"
 [ "$(curl_client "$NS_B")" = "hikablue-m4-ok" ] || fail "client B did not receive the expected HTTP body"
 echo "  OBSERVED: clients A and B received hikablue-m4-ok through the tunnel"
 
-if [ "$MODE" = expire-restart ]; then
+if [ "$MODE" = engine-restart ]; then
+    log "restart the exit engine and require fresh sessions"
+    OLD_BACKEND=$(psql_lab "select backend_instance_id from nodes where node_id='exit-node'")
+    [ -n "$OLD_BACKEND" ] || fail "initial backend instance id missing"
+    ROUTE_BEFORE=$(lab_as_root ip netns exec "$NS_A" ip -4 route show 10.80.1.0/24 2>/dev/null || true)
+    case "$ROUTE_BEFORE" in
+        *"10.80.1.0/24"*) ;;
+        *) fail "client A tunnel route missing before restart" ;;
+    esac
+
+    stop_exit_engine
+    echo "  OBSERVED: exit engine stopped; no data-plane availability is inferred from process state"
+    start_exit_engine "$RUN_DIR/server-engine-restart.log"
+
+    AGENT_EXITED=0
+    for _ in $(seq 80); do
+        STATE=$(ps -o stat= -p "$AGENT_PID" 2>/dev/null | tr -d ' ' || true)
+        if [ -z "$STATE" ] || [ "${STATE#Z}" != "$STATE" ]; then
+            AGENT_EXITED=1
+            break
+        fi
+        sleep 0.1
+    done
+    [ "$AGENT_EXITED" = 1 ] || { tail -80 "$AGENT_LOG" >&2; fail "agent did not exit after backend instance change"; }
+    if wait "$AGENT_PID" 2>/dev/null; then AGENT_STATUS=0; else AGENT_STATUS=$?; fi
+    AGENT_PID=""
+    [ "$AGENT_STATUS" -eq 0 ] || { tail -80 "$AGENT_LOG" >&2; fail "agent crashed instead of supervised backend-change exit (status $AGENT_STATUS)"; }
+    grep -q "engine backend instance changed" "$AGENT_LOG" || { tail -80 "$AGENT_LOG" >&2; fail "agent exited without backend-change evidence"; }
+    echo "  OBSERVED: agent detected the new backend instance and exited for supervised restart"
+
+    start_agent "$CTRL_PORT" "$RUN_DIR/agent-backend-restart.log"
+    NEW_BACKEND=""
+    for _ in $(seq 150); do
+        NEW_BACKEND=$(psql_lab "select backend_instance_id from nodes where node_id='exit-node'" 2>/dev/null || true)
+        [ -n "$NEW_BACKEND" ] && [ "$NEW_BACKEND" != "$OLD_BACKEND" ] && break
+        sleep 0.1
+    done
+    [ -n "$NEW_BACKEND" ] && [ "$NEW_BACKEND" != "$OLD_BACKEND" ] || {
+        tail -80 "$RUN_DIR/agent-backend-restart.log" >&2
+        fail "restarted agent did not register the fresh backend instance"
+    }
+
+    A_DB="" B_DB=""
+    for _ in $(seq 200); do
+        A_DB=$(psql_lab "select status from sessions where session_id='$A_ID'" 2>/dev/null || true)
+        B_DB=$(psql_lab "select status from sessions where session_id='$B_ID'" 2>/dev/null || true)
+        [ "$A_DB" = Failed ] && [ "$B_DB" = Failed ] && break
+        sleep 0.1
+    done
+    [ "$A_DB" = Failed ] && [ "$B_DB" = Failed ] || {
+        tail -80 "$RUN_DIR/agent-backend-restart.log" >&2
+        fail "pre-restart sessions did not fail after confirmed backend reset (A=$A_DB B=$B_DB)"
+    }
+    [ "$(lease_count "$A_ID")" = 0 ] || fail "A lease survived confirmed backend reset"
+    [ "$(lease_count "$B_ID")" = 0 ] || fail "B lease survived confirmed backend reset"
+    echo "  OBSERVED: confirmed empty-state reconciliation failed pre-restart sessions and released leases"
+
+    if curl_client_fast "$NS_B" >/dev/null; then
+        fail "client B kept connectivity with pre-restart keys"
+    fi
+    echo "  OBSERVED: pre-restart keys cannot carry traffic on the new backend instance"
+
+    stop_client client-a KILL
+    LINK_ERR=$(mktemp "$RUN_DIR/link-check.XXXXXX")
+    if lab_as_root ip netns exec "$NS_A" ip link show dev tun0 >/dev/null 2>"$LINK_ERR"; then
+        fail "client A tun0 survived abrupt engine termination"
+    fi
+    grep -Eq 'does not exist|Cannot find device' "$LINK_ERR" || { cat "$LINK_ERR" >&2; fail "client A tun0 inspection failed"; }
+    ROUTE_ERR=$(mktemp "$RUN_DIR/route-check.XXXXXX")
+    ROUTE_AFTER=$(lab_as_root ip netns exec "$NS_A" ip -4 route show 10.80.1.0/24 2>"$ROUTE_ERR") || { cat "$ROUTE_ERR" >&2; fail "client A route inspection failed"; }
+    [ -z "$ROUTE_AFTER" ] || fail "client A tunnel route survived abrupt termination: $ROUTE_AFTER"
+    echo "  OBSERVED: abrupt client termination removed tun0 and rolled back its connected tunnel route"
+
+    log "provision a fresh post-restart session"
+    create_session carol "$RUN_DIR/session-c.json" 180
+    start_client "$NS_A" "$RUN_DIR/session-c.json.bootstrap" tun0 client-c
+    [ "$(curl_client "$NS_A")" = "hikablue-m4-ok" ] || fail "fresh post-restart session did not reach the service"
+    echo "  OBSERVED: a fresh session with fresh keys restored service connectivity after engine restart"
+elif [ "$MODE" = expire-restart ]; then
     start_b_monitor
     sleep 0.5
     b_monitor_counts
