@@ -97,6 +97,7 @@ sudo bash /tmp/hk-debian-install.sh --release /tmp/hk-debian-e2e-release
 sudo systemctl restart hikablue-control.service
 sudo systemctl restart hikablue-engine.service
 sudo systemctl restart hikablue-agent.service
+create_json=/tmp/hk-session-create.json
 curl --cacert /etc/hikablue/pki/ca.crt -sf -X POST https://127.0.0.1:7443/v1/sessions \
     -H 'Content-Type: application/json' -H 'X-Subject: debian-validation' \
     -H 'Idempotency-Key: debian-validation-1' \
