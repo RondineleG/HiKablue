@@ -3,17 +3,21 @@
 This directory automates the **isolated laboratory** deployment shape for
 milestone 5. It installs versioned binaries, systemd units, and editable
 sample configuration. It does not route real traffic, configure NAT, start
-services, or provision private keys.
+services, issue certificates, or generate private keys.
 
 ## Contents
 
 - `build-release.sh` — builds the Rust engine, Go agent, and published .NET
-  control plane into one versioned release tree.
+  control plane and client CLI into one versioned release tree.
 - `install.sh` — installs that tree under `/opt/hikablue/releases/<version>`,
   copies units/samples, creates service users on a real host, and atomically
   moves `/opt/hikablue/current`.
 - `rollback.sh` — atomically moves `current` back to the release recorded in
   `/opt/hikablue/previous`.
+- `backup-postgres.sh` / `restore-postgres.sh` — create and transactionally
+  restore private, checksummed PostgreSQL custom-format backups.
+- `provision-credentials.sh` — encrypts operator-issued credentials with
+  `systemd-creds`, rotates versioned credential sets, and rolls them back.
 - `systemd/` — service units for the engine, node agent, and control plane.
 - `config/` — secret-free samples. Copy them once, then edit the root-owned
   live files outside git.
@@ -29,9 +33,10 @@ deploy/debian/build-release.sh --force
 ```
 
 The output is `artifacts/release/hikablue-<commit>` unless `--output` is
-given. The directory contains `VERSION`, `BUILD_INFO`, `bin/`, `control/`,
-`systemd/`, and `config/`. It must not contain private keys, tokens, or a
-live database connection string.
+given. The directory contains `VERSION`, `BUILD_INFO`, `bin/` (including
+`vpn-engine`, `vpn-cli`, and the backup/credential tools), `control/`,
+`systemd/`, and `config/`. It must not contain private keys, tokens, or a live
+database connection string.
 
 ## Install or upgrade
 
@@ -68,20 +73,52 @@ deploy/debian/install.sh --release /path/to/release --root "$(mktemp -d)" --no-s
 bash tests/deploy/install-rollback.test.sh
 ```
 
-## Configure secrets and certificates
+## Encrypted systemd credentials
 
 The samples in `config/` are copied to `/etc/hikablue/*.env` only when those
-files do not already exist. They contain placeholders and empty values, not
-credentials. Provision real values out of band:
+files do not already exist. They contain non-secret settings only. Issue
+certificates and create the source credential directories out of band; each
+directory must be mode `0700`, and each credential file mode `0600`.
 
-1. Issue the lab CA, node certificate, node private key, and HTTPS server
-   certificate using the documented lab PKI process or your test CA.
-2. Install them under `/etc/hikablue/pki/` with owner-only private-key
-   permissions. Never commit these files.
-3. Edit `/etc/hikablue/control.env` as root with the database connection
-   string and random tokens. Keep it mode `0600`.
-4. Edit `engine.env` and `agent.env` for the node's lab addresses and SPIFFE
-   node identity.
+The control source directory must contain exactly the required inputs:
+`connection-string`, `heartbeat-token`, `admin-token`,
+`session-token-secret`, `server.crt`, `server.key`, and `lab-ca.crt`.
+The node source directory contains `lab-ca.crt`, `node.crt`, and `node.key`.
+The installer never creates these values. The control token secret must be
+at least 32 bytes.
+
+On Debian 12 or later with `systemd-creds` available, encrypt and stage each
+role on the host that will run it:
+
+```bash
+sudo deploy/debian/provision-credentials.sh \
+  --role control --source-dir /root/hikablue-control-credentials
+sudo deploy/debian/provision-credentials.sh \
+  --role node --source-dir /root/hikablue-node-credentials
+```
+
+`--with-key=host` makes each encrypted credential set specific to that
+machine. The script keeps encrypted versions under
+`/etc/hikablue/credentials/<role>/versions/` and atomically switches the
+`current` symlink; it does not copy plaintext inputs into the store. systemd
+decrypts credentials into its private runtime credential directory.
+`hikablue-control.service` loads the control files and the .NET startup code
+maps them into configuration; the agent wrapper passes the node certificate
+paths from `CREDENTIALS_DIRECTORY` to `vpn-agent`.
+
+To rotate credentials, prepare a new private source directory and rerun the
+same command for that role, then restart its service. The previous encrypted
+version is retained. Roll back by switching the links back and restarting:
+
+```bash
+sudo deploy/debian/provision-credentials.sh --role control --rollback
+sudo systemctl restart hikablue-control.service
+```
+
+Repeat with `--role node` and restart `hikablue-agent.service` for node
+credentials. Host-key-encrypted files cannot be moved to another host; issue
+or copy the protected source values through the approved secret process and
+reprovision there. Never commit source credentials or the encrypted store.
 
 ## Start, inspect, and stop
 
@@ -132,10 +169,85 @@ Database migrations must therefore be backward-compatible within the supported
 rollback window; if a migration is irreversible, restore the database backup
 taken before upgrade instead of only rolling back binaries.
 
-Before upgrading the control plane, back up PostgreSQL with your normal lab
-backup procedure. Apply EF Core migrations with `dotnet ef database update`
-or the service startup path used by the deployment. Roll back the database
-only from a backup or an explicitly tested reverse migration.
+Before upgrading the control plane, create a private custom-format backup.
+The commands use libpq connection settings and a protected `PGPASSFILE` (or
+an equivalent local service identity); do not put database passwords in
+arguments. Set `PGUSER` and, when needed, `PGHOST` and `PGPORT` in the
+operator environment. Because the helpers run through `sudo`, configure the
+sudo policy to permit preserving `PGUSER`, `PGPASSFILE`, `PGHOST`, and
+`PGPORT`, then pass those names with `--preserve-env`. If policy does not
+permit that option, run the helper from an authorized privileged environment
+with the same libpq settings. Create the parent once and record the unique
+directory path for the later restore:
+
+```bash
+sudo install -d -m 0700 /var/backups/hikablue
+backup_dir="/var/backups/hikablue/before-upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
+sudo --preserve-env=PGUSER,PGPASSFILE,PGHOST,PGPORT \
+  deploy/debian/backup-postgres.sh \
+  --database vpn_control \
+  --output-dir "$backup_dir"
+```
+
+The output directory must not already exist. The script writes a mode-`0600`
+archive, metadata, and SHA-256 checksum in a mode-`0700` directory.
+Restore requires an existing, empty target database, the exact
+`--confirm-database` value, and a valid archive/checksum. The target may use a
+different name from the source database recorded in the backup; this lets an
+operator retain the original database until the restored copy is verified.
+Create a new target from `template0` using the same database administrator
+identity configured for libpq. `template0` guarantees a pristine schema; if
+the source uses non-default encoding or locale settings, pass matching
+`--encoding`, `--lc-collate`, and `--lc-ctype` values to `createdb` (and the
+matching ICU provider/locale options when applicable). The restore does not
+use `--create`, so configure any database-level owner, privileges, comments,
+or settings the application requires on the target. Before running these
+commands, set `PGUSER` to the database administrator role and configure
+protected authentication through `PGPASSFILE` or an approved local identity;
+set `PGHOST` and `PGPORT` when needed. Do not put passwords in command
+arguments:
+
+```bash
+restore_database="vpn_control_restore"
+: "${PGUSER:?set PGUSER to the database administrator role}"
+createdb --username="$PGUSER" --template=template0 "$restore_database"
+sudo systemctl stop hikablue-agent.service hikablue-engine.service
+sudo systemctl stop hikablue-control.service
+sudo --preserve-env=PGUSER,PGPASSFILE,PGHOST,PGPORT \
+  deploy/debian/restore-postgres.sh \
+  --database "$restore_database" \
+  --backup-dir "$backup_dir" \
+  --confirm-database "$restore_database"
+# Verify the restored database, update the protected connection-string credential,
+# then start the services.
+sudo deploy/debian/provision-credentials.sh \
+  --role control --source-dir /root/hikablue-control-credentials
+sudo systemctl start hikablue-control.service
+sudo systemctl start hikablue-engine.service hikablue-agent.service
+```
+
+Run the stop/start commands on the hosts that own those services; keep all
+nodes stopped while restoring the database. Reuse the exact `backup_dir`
+value recorded when creating the backup. `pg_restore` validates the archive before applying it and uses one
+transaction. The helper checks that the target has no user-created schemas
+or objects before restoring, including large objects, subscriptions,
+foreign-data objects, nonstandard procedural languages, default privileges,
+event triggers, publications, and database-scoped settings. `--clean` only
+drops objects listed in the archive and would leave later, unlisted objects
+behind, so the helper refuses to merge into a populated database.
+This keeps the old database available for rollback while the restored target
+is checked. After verification, update the protected control-plane
+`connection-string` credential to point to the restored database and restart
+the services. `pg_restore --create` is not used because PostgreSQL does not
+allow it with `--single-transaction`.
+Restoring only PostgreSQL while agents or engines retain newer in-memory
+state can make desired and applied state disagree. Starting a node after a
+restore changes its backend identity; the control plane reconciles the empty
+backend and rekeys eligible sessions before they become active again. A
+checksum detects accidental corruption, not a maliciously replaced archive
+and manifest. Apply EF Core migrations with `dotnet ef database update` or
+the service startup path used by the deployment. Roll back the database only
+from a backup or an explicitly tested reverse migration.
 
 ## Backend-reset ordering
 
@@ -144,8 +256,14 @@ enqueue are one PostgreSQL transaction under the same node-row `FOR UPDATE`
 lock used by session creation. Reconnecting the same backend before the reset
 ACK reuses the pending reset row rather than enqueueing another snapshot that
 contains old sessions. While that row is `pending` or `sent`, the node is
-ineligible for new sessions. After a valid applied ACK, fresh provisioning is
-allowed and its commands are not part of the invalidated old generation.
+ineligible for new sessions. The reset snapshot is empty; it carries the
+pre-restart session IDs only as completion metadata. After its valid applied
+ACK, each non-expired pending/active session receives new directional keys,
+wire indexes, `key_epoch`, and lab wire-session ID. Its API session ID,
+virtual IP, owner token, and lease remain unchanged. A new `ProvisionPeer`
+command is then ACKed before the session returns to `active`. Sessions already
+revoking or expired become `revoked` and release their lease only after this
+confirmed empty-state ACK.
 
 ## Failure tracing order
 
@@ -159,12 +277,14 @@ When a tunnel carries no traffic, inspect in this order:
 5. client route and TUN existence;
 6. node forwarding and return-path configuration.
 
-A backend restart is not transparent to existing lab sessions. Old key epochs
-and counters are gone with the process. After the fresh backend confirms its
-empty state through reconciliation, pre-restart pending/active sessions are
-marked `failed` with `backend_restart_requires_new_session`, already-revoking
-sessions complete as `revoked`, leases are released, and clients must create
-fresh sessions with fresh keys.
+A backend restart is not a transparent continuation of the old data plane:
+old key epochs and counters are gone with the process. After the fresh backend
+confirms its empty state, eligible API sessions are reprovisioned with fresh
+keys while retaining their IDs and leases. The `vpn-cli` client polls the
+owner-authenticated status endpoint, stops its old engine when it sees a
+pending/new epoch, and starts a new engine only after the session is active.
+Clients not managed by `vpn-cli` must obtain and install the new keys through
+their authorized client flow; stale keys cannot authenticate packets.
 
 ## Explicit limits
 
@@ -172,5 +292,6 @@ fresh sessions with fresh keys.
   deferred to the full-tunnel/WireGuard phases.
 - The custom UDP engine remains lab-only; do not use these units for real
   traffic.
-- The installer does not manage PostgreSQL, issue certificates, or rotate
-  secrets.
+- The installer does not manage PostgreSQL, issue certificates, or generate
+  plaintext source credentials. PostgreSQL backup/restore and encrypted
+  credential staging are explicit operator commands.

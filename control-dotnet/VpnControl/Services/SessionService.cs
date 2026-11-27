@@ -49,7 +49,7 @@ public sealed class SessionService(
         row.ExpiresAt, row.FailureReason, StatusUrl(row.SessionId),
         row.EgressKey is null ? null : Convert.ToBase64String(row.EgressKey),
         row.IngressKey is null ? null : Convert.ToBase64String(row.IngressKey),
-        row.SenderIndex, row.PeerIndex, sessionToken);
+        row.SenderIndex, row.PeerIndex, sessionToken, row.KeyEpoch);
 
     private static string HashSessionToken(string token) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
@@ -61,7 +61,7 @@ public sealed class SessionService(
     {
         token = "";
         var secret = config["VpnControl:SessionTokenSecret"];
-        if (string.IsNullOrWhiteSpace(secret) || secret.Length < 32)
+        if (string.IsNullOrWhiteSpace(secret) || Encoding.UTF8.GetByteCount(secret) < 32)
         {
             return false;
         }
@@ -180,12 +180,9 @@ public sealed class SessionService(
                         EResultStatus.Unavailable);
                 }
 
-                var labId = await db.Sessions
-                    .Where(s => s.NodeId == node.NodeId &&
-                                (s.Status == SessionStatus.Pending || s.Status == SessionStatus.Active ||
-                                 s.Status == SessionStatus.Revoking))
-                    .Select(s => (int?)s.LabSessionId)
-                    .MaxAsync(cancellationToken) + 1 ?? 1;
+                var usedLabSessionIds = await SessionProvisioning.LoadUsedLabSessionIdsAsync(
+                    db, node.NodeId, cancellationToken);
+                var labId = SessionProvisioning.AllocateLabSessionId(usedLabSessionIds);
 
                 // Probe dispersion (ADR-0001 §3): hash-seeded order over the
                 // WHOLE pool, never a linear scan from index 0 and never a
@@ -205,7 +202,11 @@ public sealed class SessionService(
                 }
 
                 var now = DateTimeOffset.UtcNow;
-                var (senderIndex, peerIndex) = await AllocateWireIndexesAsync(cancellationToken);
+                var usedIndexes = await SessionProvisioning.LoadUsedWireIndexesAsync(
+                    db, cancellationToken);
+                var (senderIndex, peerIndex) =
+                    SessionProvisioning.AllocateWireIndexes(usedIndexes);
+                var (egressKey, ingressKey) = SessionProvisioning.CreateDirectionalKeys();
                 // key_epoch is unique per node stream while the node row lock
                 // makes this single-issuer. Rust tombstoning treats epochs as
                 // backend-unique, so two peers must never share epoch 1.
@@ -225,8 +226,8 @@ public sealed class SessionService(
                     NodeId = node.NodeId,
                     LabSessionId = labId,
                     KeyEpoch = keyEpoch,
-                    EgressKey = RandomNumberGenerator.GetBytes(32),
-                    IngressKey = RandomNumberGenerator.GetBytes(32),
+                    EgressKey = egressKey,
+                    IngressKey = ingressKey,
                     SenderIndex = senderIndex,
                     PeerIndex = peerIndex,
                     ExpiresAt = now.AddSeconds(ttl),
@@ -242,23 +243,7 @@ public sealed class SessionService(
                     CommandType = "ProvisionPeer",
                     Revision = revision,
                     CreatedAt = now,
-                    Payload = JsonSerializer.Serialize(new
-                    {
-                        peer = new
-                        {
-                            session_id = sessionId, lab_session_id = labId,
-                            virtual_ip = free.ToString(), expires_at = row.ExpiresAt,
-                            key_epoch = row.KeyEpoch, key_ref = request.PeerPublicKey
-                        },
-                        key_material = new
-                        {
-                            key_epoch = row.KeyEpoch,
-                            egress_key = row.EgressKey,
-                            ingress_key = row.IngressKey,
-                            sender_index = row.SenderIndex,
-                            peer_index = row.PeerIndex
-                        }
-                    })
+                    Payload = SessionProvisioning.SerializeProvisionPayload(row)
                 };
                 db.Sessions.Add(row);
                 db.Outbox.Add(command);
@@ -347,24 +332,48 @@ public sealed class SessionService(
 
         await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
         await LockNodeAsync(row.NodeId, cancellationToken);
-        var revision = await BumpRevisionAsync(row.NodeId, cancellationToken);
+        var entry = db.Entry(row);
+        await entry.ReloadAsync(cancellationToken);
+        if (entry.State == EntityState.Detached)
+        {
+            return RequestResult<SessionView>.WithError(
+                "session not found", EResultStatus.EntityNotFound);
+        }
+        if (row.Status is SessionStatus.Revoked or SessionStatus.Failed)
+        {
+            return RequestResult<SessionView>.Success(ToView(row), "already terminal");
+        }
+        if (row.Status == SessionStatus.Revoking)
+        {
+            return RequestResult<SessionView>.Success(ToView(row), "revocation already in progress");
+        }
+
+        var resetPending = await BackendResetState.HasPendingBackendResetAsync(
+            db, row.NodeId, cancellationToken);
+        long? revision = resetPending
+            ? null
+            : await BumpRevisionAsync(row.NodeId, cancellationToken);
         var now = DateTimeOffset.UtcNow;
         // The lease stays reserved until the backend confirms removal
-        // (spec §6); only the status moves to revoking here.
+        // (spec §6); during a pending backend reset, its empty-state ACK
+        // confirms removal without a separate RevokePeer command.
         row.Status = SessionStatus.Revoking;
         row.UpdatedAt = now;
-        db.Outbox.Add(new OutboxRow
+        if (revision is not null)
         {
-            CommandId = Guid.NewGuid(),
-            NodeId = row.NodeId,
-            CommandType = "RevokePeer",
-            Revision = revision,
-            CreatedAt = now,
-            Payload = JsonSerializer.Serialize(new
+            db.Outbox.Add(new OutboxRow
             {
-                session_id = row.SessionId, lab_session_id = row.LabSessionId, reason = "user_revoked"
-            })
-        });
+                CommandId = Guid.NewGuid(),
+                NodeId = row.NodeId,
+                CommandType = "RevokePeer",
+                Revision = revision.Value,
+                CreatedAt = now,
+                Payload = JsonSerializer.Serialize(new
+                {
+                    session_id = row.SessionId, lab_session_id = row.LabSessionId, reason = "user_revoked"
+                })
+            });
+        }
         await db.SaveChangesAsync(cancellationToken);
         await tx.CommitAsync(cancellationToken);
         return RequestResult<SessionView>.Success(ToView(row), "revocation pending");
@@ -389,28 +398,6 @@ public sealed class SessionService(
         return requested is null
             ? eligible.MaxBy(n => n.LastSeen)
             : eligible.FirstOrDefault(n => n.NodeId == requested);
-    }
-
-    private async Task<(uint Sender, uint Peer)> AllocateWireIndexesAsync(CancellationToken ct)
-    {
-        var used = (await db.Sessions.AsNoTracking()
-                .Where(s => s.SenderIndex != null || s.PeerIndex != null)
-                .Select(s => new { s.SenderIndex, s.PeerIndex })
-                .ToListAsync(ct))
-            .SelectMany(x => new[] { x.SenderIndex, x.PeerIndex })
-            .Where(x => x.HasValue)
-            .Select(x => x!.Value)
-            .ToHashSet();
-        for (var tries = 0; tries < 128; tries++)
-        {
-            var sender = (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue);
-            var peer = (uint)RandomNumberGenerator.GetInt32(1, int.MaxValue);
-            if (sender != peer && !used.Contains(sender) && !used.Contains(peer))
-            {
-                return (sender, peer);
-            }
-        }
-        throw new InvalidOperationException("unable to allocate unique wire indexes");
     }
 
     private async Task EnsureNodeLockedAsync(string nodeId, Entities.Node node, CancellationToken ct)

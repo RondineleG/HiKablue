@@ -25,4 +25,5 @@ public sealed record SessionView(
     string? IngressKey = null,
     uint? SenderIndex = null,
     uint? PeerIndex = null,
-    string? SessionToken = null);
+    string? SessionToken = null,
+    long KeyEpoch = 0);

@@ -41,14 +41,15 @@ public sealed class SessionServiceTests : IAsyncLifetime
     private ControlDbContext NewDb() => new(_options);
 
     private SessionService NewService(DbContextOptions<ControlDbContext>? options = null,
-        string poolCidr = "10.99.0.0/24") => new(
+        string poolCidr = "10.99.0.0/24",
+        string sessionTokenSecret = "0123456789abcdef0123456789abcdef") => new(
         new ControlDbContext(options ?? _options),
         new NodeService(_registry),
         new ConfigurationBuilder().AddInMemoryCollection(
             new Dictionary<string, string?>
             {
                 ["VpnControl:IpPoolCidr"] = poolCidr,
-                ["VpnControl:SessionTokenSecret"] = "0123456789abcdef0123456789abcdef"
+                ["VpnControl:SessionTokenSecret"] = sessionTokenSecret
             }).Build(),
         NullLogger<SessionService>.Instance);
 
@@ -80,12 +81,26 @@ public sealed class SessionServiceTests : IAsyncLifetime
         Assert.NotNull(view.SenderIndex);
         Assert.NotNull(view.PeerIndex);
         Assert.NotNull(view.SessionToken);
+        Assert.Equal(1L, view.KeyEpoch);
         var row = await db.Sessions.SingleAsync();
         Assert.NotNull(row.SessionTokenHash);
         Assert.NotEqual(view.SessionToken, row.SessionTokenHash);
         Assert.Equal(32, row.EgressKey!.Length);
         Assert.Equal(32, row.IngressKey!.Length);
-        Assert.NotEqual(row.EgressKey, row.IngressKey);
+        Assert.NotEqual(Convert.ToHexString(row.EgressKey!),
+            Convert.ToHexString(row.IngressKey!));
+    }
+
+    [Fact]
+    public async Task UnicodeSessionTokenSecretUsesUtf8ByteLength()
+    {
+        BeatNode();
+        var secret = new string('\u00e9', 16);
+        var result = await NewService(sessionTokenSecret: secret)
+            .CreateSessionAsync(new CreateSessionRequest(), "alice", null);
+
+        Assert.True(result.IsSuccess);
+        Assert.NotNull(result.Data!.SessionToken);
     }
 
     [Fact]

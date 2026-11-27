@@ -83,7 +83,8 @@ else
   "$LLVM_PROFDATA" merge -sparse "$PROFRAW_DIR"/*.profraw \
     -o "$RUST_DIR/target/coverage.profdata" 2>/dev/null
   objs=()
-  for f in "$RUST_DIR"/target/debug/deps/vpn_engine-*; do
+  for f in "$RUST_DIR"/target/debug/deps/vpn_engine-* \
+           "$RUST_DIR"/target/debug/deps/vpn_cli-*; do
     [ -f "$f" ] && [ -x "$f" ] && objs+=(--object "$f")
   done
   lcov="$("$LLVM_COV" export "${objs[@]}" \

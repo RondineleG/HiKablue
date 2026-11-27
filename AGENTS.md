@@ -41,12 +41,19 @@ Name branches `feat/<slug>` for additive work and `fix/<slug>` for bug fixes. Us
   ACKs. `tests/checks.sh --lab` includes the isolated two-client HTTP
   laboratory in normal-revocation, gRPC-interruption, local-expiry, and
   backend-restart recovery modes.
-- **Milestone 5 (deployment and recovery) implemented in the lab.**
-  Debian release construction, idempotent installation, binary upgrade and
-  rollback live under `deploy/debian/` with an offline acceptance test.
-  The exit-engine restart path changes `backend_instance_id`, causes the
-  agent to exit for supervised restart, invalidates pre-restart sessions
-  only after confirmed empty-state reconciliation, releases leases, and
-  requires a fresh session. Transient client TUN interfaces and their
-  connected routes are proven to disappear after `SIGKILL`. Do not advance
-  milestone 6.
+- **Milestone 5 (deployment and recovery) implemented; current recovery
+  changes still need lab verification.** Debian release construction,
+  idempotent installation, binary upgrade/rollback, PostgreSQL backup/restore,
+  and host-key-encrypted systemd credentials live under `deploy/debian/`.
+  After a backend restart, confirmed empty-state reconciliation now triggers
+  fresh keys, indexes, key epoch, and wire session ID for the same non-expired
+  API sessions; their IDs, virtual IPs, tokens, and leases remain stable until
+  new provisioning is ACKed. `vpn-cli` polls and restarts its engine with the
+  new epoch. The previous observed restart run used fresh-session recovery at
+  baseline `c5772ccf7b60`; it does not verify this rekey flow. Re-run
+  `tests/checks.sh --lab` in the isolated Linux lab before claiming the new
+  flow is validated. Review hardening also reloads session rows on ACKs,
+  finalizes revocation through the pending reset ACK, measures token secrets
+  in UTF-8 bytes, binds the Linux engine child to `vpn-cli` with a parent-death
+  signal, and requires a fresh empty PostgreSQL restore target. These changes
+  still need Linux/PostgreSQL verification. Do not advance milestone 6.

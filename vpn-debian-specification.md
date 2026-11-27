@@ -114,7 +114,7 @@ The header is **14 bytes**, all used as AAD. Minimum outer overhead is **58 byte
 | 2 · TUN | Add the Rust interface, test routes, and forwarding for one peer. | Ping works both ways between virtual IPs, and packet captures show traffic on the expected interface. | The difference between an inner IP packet and an outer UDP datagram. |
 | 3 · Control plane | Add PostgreSQL, IPAM, session states, and an outbox in C#. Replace Go's HTTP heartbeat with gRPC over mTLS and apply commands to a test backend. | Two concurrent requests for the last IP produce one reservation. Resending an applied command leaves the same state. | What the database transaction protects and what requires acknowledgment across processes. |
 | 4 · End-to-end session | Integrate the encrypted Rust backend, CLI, peer operations, local expiration, and reconciliation. | Two clients can reach the test service. The engine drops tampered packets, replays, and packets with invalid source IPs. Revoking one client leaves the other connected. | AAD, counters, state after a crash, and when an IP can be released. |
-| 5 · Deployment and recovery | Automate Debian installation and test process restarts, stream loss, and network restoration. | Installation is repeatable. Engine restart requires a new session. Revocation takes effect after reconnect, and route changes roll back. | Which process owns each setting and how to trace failures. |
+| 5 · Deployment and recovery | Automate Debian installation, encrypted credential delivery, PostgreSQL backup/restore, and recovery after process restarts or stream loss. | Installation is repeatable. After an engine restart, non-expired sessions keep their API IDs, IPs, tokens, and leases while fresh keys, indexes, key epochs, and wire session IDs are provisioned; old keys fail, and the client CLI restores connectivity only after the new provision ACK. Revocation releases a lease only after confirmed removal, and client TUN routes disappear with the interface. | Which process owns each setting, why reconciliation must precede rekey, and how to trace failures. |
 | 6 · WireGuard | Implement the agent backend and client configuration. Verify split tunneling. Address DNS and IPv6 before enabling full tunneling. | Repeat provisioning, traffic forwarding, and revocation with WireGuard on two machines. Verify that the client's private key stays local. | Which responsibilities belong to your code and which WireGuard handles. |
 
 **Execution status.** The table above is the planned order; the actual
@@ -153,17 +153,30 @@ are preserved rather than renumbered:
   two-client HTTP connectivity, revocation without interrupting the other
   client, reconciliation after gRPC loss, and local expiry across an agent
   restart all passed in the isolated laboratory.
-- **5 · Deployment and recovery — implemented locally.** Debian release
-  construction, idempotent installation, binary upgrade and rollback are
-  covered offline. Backend restart recovery is covered end to end: the
-  agent exits when the engine returns a fresh `backend_instance_id`, the
-  control plane invalidates pre-restart sessions only after confirmed
-  empty-state reconciliation, leases are released, stale keys cannot pass
-  traffic, and a fresh session restores HTTP connectivity. Client TUN and
-  connected-route rollback after `SIGKILL` are observed. Automatic rekey of
-  the same session, full-tunnel rollback, PostgreSQL backup/rollback, real
-  secret provisioning, and production-network validation remain explicit
-  deferrals.
+- **5 · Deployment and recovery — implementation updated; the new recovery
+  path is not yet validated.** Debian release construction, idempotent
+  installation, binary upgrade/rollback, PostgreSQL backup/restore tooling,
+  and host-key-encrypted systemd credential delivery are implemented. The
+  backend-restart flow now retains each non-expired API session and lease,
+  confirms the new backend is empty, then provisions fresh directional keys,
+  indexes, a `key_epoch`, and a numeric wire session ID. `vpn-cli` follows
+  the owner-authenticated session, stops the old client engine, and starts it
+  with the new epoch. The prior observed restart run at baseline
+  `c5772ccf7b60` used fresh-session recovery and is historical evidence only;
+  it does not verify the current same-session behavior. Run
+  `tests/checks.sh --lab` in the isolated Linux lab before marking the
+  updated flow validated. Review hardening reloads session rows on ACKs,
+  serializes revocation with a pending backend reset, measures token secrets
+  in UTF-8 bytes, binds the Linux engine child to `vpn-cli` with a
+  parent-death signal, and defers expiration revocation until a pending
+  backend-reset ACK confirms the peer is absent. While the client engine is
+  running, a lower key epoch from a status poll is stale data: keep the
+  current engine and continue polling instead of treating it as fatal and
+  requesting session revocation. PostgreSQL restore now requires a fresh
+  empty target and remains transactional; create it with matching source
+  database encoding/locale and required database-level access settings.
+  Linux and PostgreSQL verification is still pending. Full-tunnel rollback
+  and production-network validation remain deferred.
 - **6 — pending.** WireGuard follows deployment/recovery. Full tunneling
   and the HTTP check still depend on the deferred forwarding/NAT work above.
 
@@ -182,6 +195,7 @@ are preserved rather than renumbered:
 - [ ] Repeated requests and commands preserve the expected state. A lost ACK followed by reconnection converges to the expected revision.
 - [ ] Revocation and expiration remove access. The control plane reuses the IP only after the node confirms removal. The other client stays connected.
 - [ ] Restarting either lab endpoint forces fresh directional keys. Stale key references and packets from retired epochs are rejected. A control-stream reconnect preserves live counters.
+- [ ] After a backend restart, the API session ID, virtual IP, owner token, and lease remain stable while `key_epoch`, wire indexes, and the numeric wire session ID change; the session becomes `active` only after the fresh provision ACK.
 - [ ] Reordered packets inside the 2048-packet window pass once. Stale packets and duplicates are rejected. An invalid tag with a high counter leaves the window unchanged.
 - [ ] Database errors, truncated snapshots, checksum/count mismatches, and unauthorized mass removals preserve the applied peer set. An authorized force applies only to its validated snapshot.
 - [ ] The protected Rust packet path reuses the same buffers without intermediate allocations or payload copies. MTU boundary packets and bidirectional TCP MSS clamping pass lab checks.

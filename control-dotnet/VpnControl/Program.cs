@@ -17,6 +17,8 @@ using VpnControl.Workers;
 // refuses to start without a token or on any non-loopback URL, however
 // the URL is configured.
 var builder = WebApplication.CreateBuilder(args);
+SystemdCredentialConfiguration.AddCredentials(
+    builder.Configuration, Environment.GetEnvironmentVariable("CREDENTIALS_DIRECTORY"));
 
 LoopbackGuard.EnforceLoopbackOnly(builder.Configuration);
 builder.WebHost.UseUrls(LoopbackGuard.ListenUrls(builder.Configuration));

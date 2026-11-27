@@ -5,10 +5,9 @@ using VpnControl.Services;
 namespace VpnControl.Workers;
 
 /// <summary>
-/// Expiration worker: expired pending/active sessions move to revoking and
-/// receive a RevokePeer outbox command in the same transaction. Leases stay
-/// reserved until the backend confirms removal; this worker never performs
-/// a forced release merely because a node is unavailable.
+/// Expiration worker: expired pending/active sessions move to revoking. A
+/// RevokePeer is queued unless a backend reset is pending, whose empty-state
+/// ACK confirms removal. Leases stay reserved until removal is confirmed.
 /// </summary>
 public sealed class LeaseReaperWorker(
     IServiceScopeFactory scopeFactory,
@@ -64,28 +63,47 @@ public sealed class LeaseReaperWorker(
         {
             await db.Database.ExecuteSqlAsync(
                 $"SELECT node_id FROM nodes WHERE node_id = {session.NodeId} FOR UPDATE", ct);
+            var sessionEntry = db.Entry(session);
+            await sessionEntry.ReloadAsync(ct);
+            if (sessionEntry.State == EntityState.Detached ||
+                session.Status is not (SessionStatus.Pending or SessionStatus.Active) ||
+                session.ExpiresAt >= now)
+            {
+                continue;
+            }
             var node = await db.Nodes.FirstAsync(n => n.NodeId == session.NodeId, ct);
-            node.DesiredRevision += 1;
+            var resetPending = await BackendResetState.HasPendingBackendResetAsync(
+                db, session.NodeId, ct);
             session.Status = SessionStatus.Revoking;
             session.UpdatedAt = now;
             session.FailureReason = "expired";
-            db.Outbox.Add(new OutboxRow
+            if (resetPending)
             {
-                CommandId = Guid.NewGuid(),
-                NodeId = session.NodeId,
-                CommandType = "RevokePeer",
-                Revision = node.DesiredRevision,
-                CreatedAt = now,
-                Payload = System.Text.Json.JsonSerializer.Serialize(new
+                logger.LogInformation(
+                    "expired session awaits pending backend reset ACK session={SessionId} node={NodeId} ip={VirtualIp}",
+                    session.SessionId, session.NodeId, session.VirtualIp);
+            }
+            else
+            {
+                node.DesiredRevision += 1;
+                db.Outbox.Add(new OutboxRow
                 {
-                    session_id = session.SessionId,
-                    lab_session_id = session.LabSessionId,
-                    reason = "expired"
-                })
-            });
-            logger.LogInformation(
-                "session expired and revocation enqueued session={SessionId} node={NodeId} ip={VirtualIp}",
-                session.SessionId, session.NodeId, session.VirtualIp);
+                    CommandId = Guid.NewGuid(),
+                    NodeId = session.NodeId,
+                    CommandType = "RevokePeer",
+                    Revision = node.DesiredRevision,
+                    CreatedAt = now,
+                    Payload = System.Text.Json.JsonSerializer.Serialize(new
+                    {
+                        session_id = session.SessionId,
+                        lab_session_id = session.LabSessionId,
+                        reason = "expired"
+                    })
+                });
+                logger.LogInformation(
+                    "session expired and revocation enqueued session={SessionId} node={NodeId} ip={VirtualIp}",
+                    session.SessionId, session.NodeId, session.VirtualIp);
+            }
             reaped++;
         }
 

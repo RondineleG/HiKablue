@@ -157,17 +157,60 @@ public sealed class NodeChannelService(
 
         var backendRestarted = previousBackendInstanceId is not null &&
             !string.Equals(previousBackendInstanceId, register.BackendInstanceId, StringComparison.Ordinal);
-        var restartedSessionIds = backendRestarted
+        var restartedSessions = backendRestarted
             ? await db.Sessions
                 .Where(s => s.NodeId == nodeId &&
                     (s.Status == SessionStatus.Pending || s.Status == SessionStatus.Active ||
                      s.Status == SessionStatus.Revoking))
-                .Select(s => s.SessionId)
                 .ToListAsync(ct)
             : [];
+        var restartedSessionIds = restartedSessions.Select(s => s.SessionId).ToArray();
 
         if (backendRestarted)
         {
+            var rekeyableSessions = restartedSessions
+                .Where(s => s.Status is SessionStatus.Pending or SessionStatus.Active)
+                .ToArray();
+            var usedIndexes = rekeyableSessions.Length == 0
+                ? new HashSet<uint>()
+                : await SessionProvisioning.LoadUsedWireIndexesAsync(db, ct);
+            var usedLabSessionIds = rekeyableSessions.Length == 0
+                ? new HashSet<int>()
+                : await SessionProvisioning.LoadUsedLabSessionIdsAsync(db, nodeId, ct);
+            long nextKeyEpoch = 0;
+            if (rekeyableSessions.Length > 0)
+            {
+                nextKeyEpoch = await db.Sessions
+                    .Where(s => s.NodeId == nodeId)
+                    .Select(s => (long?)s.KeyEpoch)
+                    .MaxAsync(ct) ?? 0;
+            }
+
+            foreach (var session in rekeyableSessions)
+            {
+                if (session.ExpiresAt <= now)
+                {
+                    session.Status = SessionStatus.Revoking;
+                    session.UpdatedAt = now;
+                    continue;
+                }
+
+                var (senderIndex, peerIndex) =
+                    SessionProvisioning.AllocateWireIndexes(usedIndexes);
+                var (egressKey, ingressKey) = SessionProvisioning.CreateDirectionalKeys();
+                session.LabSessionId =
+                    SessionProvisioning.AllocateLabSessionId(usedLabSessionIds);
+                nextKeyEpoch = checked(nextKeyEpoch + 1);
+                session.KeyEpoch = nextKeyEpoch;
+                session.EgressKey = egressKey;
+                session.IngressKey = ingressKey;
+                session.SenderIndex = senderIndex;
+                session.PeerIndex = peerIndex;
+                session.Status = SessionStatus.Pending;
+                session.FailureReason = null;
+                session.UpdatedAt = now;
+            }
+
             // Every pre-registration attempt belongs to the dead data-plane
             // generation. The node lock above prevents a concurrent session
             // creation from entering this set, so no fresh-session command is
@@ -237,6 +280,10 @@ public sealed class NodeChannelService(
         }
 
         await using var tx = await db.Database.BeginTransactionAsync(ct);
+        // Keep the node-before-outbox lock order used by registration and
+        // session creation, so ACK side effects cannot race a backend reset.
+        await db.Database.ExecuteSqlAsync(
+            $"SELECT node_id FROM nodes WHERE node_id = {nodeId} FOR UPDATE", ct);
         // Lock the dispatch attempt before evaluating an ACK. This context
         // spans the stream, so read the database instead of tracked values.
         var rows = await db.Outbox.FromSql($"""
@@ -357,8 +404,13 @@ public sealed class NodeChannelService(
                         s => s.SessionId == sessionId, ct);
                     if (session is not null)
                     {
-                        session.Status = SessionStatus.Revoked;
-                        session.UpdatedAt = DateTimeOffset.UtcNow;
+                        var entry = db.Entry(session);
+                        await entry.ReloadAsync(ct);
+                        if (entry.State != EntityState.Detached)
+                        {
+                            session.Status = SessionStatus.Revoked;
+                            session.UpdatedAt = DateTimeOffset.UtcNow;
+                        }
                     }
                 }
                 break;
@@ -370,10 +422,16 @@ public sealed class NodeChannelService(
                 {
                     var session = await db.Sessions.FirstOrDefaultAsync(
                         s => s.SessionId == provSessionId, ct);
-                    if (session is { Status: SessionStatus.Pending })
+                    if (session is not null)
                     {
-                        session.Status = SessionStatus.Active;
-                        session.UpdatedAt = DateTimeOffset.UtcNow;
+                        var entry = db.Entry(session);
+                        await entry.ReloadAsync(ct);
+                        if (entry.State != EntityState.Detached &&
+                            session.Status == SessionStatus.Pending)
+                        {
+                            session.Status = SessionStatus.Active;
+                            session.UpdatedAt = DateTimeOffset.UtcNow;
+                        }
                     }
                 }
                 break;
@@ -384,29 +442,51 @@ public sealed class NodeChannelService(
                 {
                     break;
                 }
+                var resetNode = await db.Nodes.FirstAsync(
+                    n => n.NodeId == row.NodeId, ct);
+                await db.Entry(resetNode).ReloadAsync(ct);
                 foreach (var element in resetIds.EnumerateArray())
                 {
                     if (!Guid.TryParse(element.GetString(), out var resetSessionId))
                     {
                         continue;
                     }
-                    await db.Database.ExecuteSqlAsync(
-                        $"DELETE FROM ip_leases WHERE session_id = {resetSessionId}", ct);
                     var resetSession = await db.Sessions.FirstOrDefaultAsync(
                         s => s.SessionId == resetSessionId, ct);
-                    if (resetSession is { Status: SessionStatus.Pending or SessionStatus.Active })
+                    if (resetSession is null)
                     {
-                        resetSession.Status = SessionStatus.Failed;
-                        resetSession.FailureReason = "backend_restart_requires_new_session";
-                        resetSession.UpdatedAt = DateTimeOffset.UtcNow;
+                        continue;
                     }
-                    else if (resetSession is { Status: SessionStatus.Revoking })
+                    var resetSessionEntry = db.Entry(resetSession);
+                    await resetSessionEntry.ReloadAsync(ct);
+                    if (resetSessionEntry.State == EntityState.Detached)
                     {
-                        // Revocation was already the desired terminal state.
-                        // The fresh backend's confirmed empty state is the
-                        // removal confirmation the old backend can never send.
+                        continue;
+                    }
+
+                    var now = DateTimeOffset.UtcNow;
+                    if (resetSession.Status == SessionStatus.Revoking ||
+                        resetSession.ExpiresAt <= now)
+                    {
+                        await db.Database.ExecuteSqlAsync(
+                            $"DELETE FROM ip_leases WHERE session_id = {resetSessionId}", ct);
                         resetSession.Status = SessionStatus.Revoked;
-                        resetSession.UpdatedAt = DateTimeOffset.UtcNow;
+                        resetSession.UpdatedAt = now;
+                    }
+                    else if (resetSession.Status is SessionStatus.Pending or SessionStatus.Active)
+                    {
+                        resetSession.Status = SessionStatus.Pending;
+                        resetSession.UpdatedAt = now;
+                        resetNode.DesiredRevision = checked(resetNode.DesiredRevision + 1);
+                        db.Outbox.Add(new OutboxRow
+                        {
+                            CommandId = Guid.NewGuid(),
+                            NodeId = resetSession.NodeId,
+                            CommandType = "ProvisionPeer",
+                            Revision = resetNode.DesiredRevision,
+                            CreatedAt = now,
+                            Payload = SessionProvisioning.SerializeProvisionPayload(resetSession)
+                        });
                     }
                 }
                 break;

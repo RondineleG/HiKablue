@@ -39,8 +39,12 @@ t "min over 100 fails"  1 pct_ge_min 95 101
 
 echo "-- lcov-percent.py --"
 # fake_engine.rs: DA 1-4 counted (2 covered → 50.00); DA:6 sits in a
-# lab-only span and DA:9 inside #[cfg(test)] — both must be dropped.
-LCOV=$(printf 'TN:\nSF:%s/fake_engine.rs\nDA:1,1\nDA:2,1\nDA:3,0\nDA:4,0\nDA:6,1\nDA:9,1\nend_of_record\n' "$FIX")
+# lab-only span, DA:10 sits in a second span, and DA:13 is inside #[cfg(test)].
+LCOV_FIX="$FIX"
+if command -v cygpath >/dev/null 2>&1; then
+  LCOV_FIX="$(cygpath -w "$FIX")"
+fi
+LCOV=$(printf 'TN:\nSF:%s/fake_engine.rs\nDA:1,1\nDA:2,1\nDA:3,0\nDA:4,0\nDA:6,1\nDA:10,1\nDA:13,1\nend_of_record\n' "$LCOV_FIX")
 t "valid lcov → 50.00" 0 test "$(printf '%s' "$LCOV" | python3 "$ROOT/tests/lcov-percent.py")" = "50.00"
 t "empty report fails"   1 bash -c "printf '' | python3 $ROOT/tests/lcov-percent.py"
 t "garbage fails"        1 bash -c "printf 'not lcov at all\n' | python3 $ROOT/tests/lcov-percent.py"
@@ -103,6 +107,37 @@ t "selective run still works outside the gate" 0 \
   env COVERAGE_COMPONENTS=rust COVERAGE_MIN=50 \
       CARGO_BIN=/bin/true LLVM_PROFDATA=/bin/true LLVM_COV="$STUB/llvm-cov-fake" \
       bash "$STUB_COV"
+
+# The Rust coverage gate must include the instrumented engine and CLI binaries.
+mkdir -p "$STUB/engine-rust/target/debug/deps"
+for binary in vpn_engine-review-fixture vpn_cli-review-fixture; do
+  printf '#!/bin/sh\nexit 0\n' > "$STUB/engine-rust/target/debug/deps/$binary"
+  chmod +x "$STUB/engine-rust/target/debug/deps/$binary"
+done
+printf '%s' "$LCOV" > "$STUB/fake-rust-coverage.lcov"
+cat > "$STUB/llvm-cov-objects" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$LLVM_COV_OBJECT_ARGS"
+cat "$LLVM_COV_REPORT"
+STUB
+chmod +x "$STUB/llvm-cov-objects"
+if env COVERAGE_COMPONENTS=rust COVERAGE_MIN=50 \
+    CARGO_BIN=/bin/true LLVM_PROFDATA=/bin/true \
+    LLVM_COV="$STUB/llvm-cov-objects" \
+    LLVM_COV_OBJECT_ARGS="$STUB/llvm-cov-object-args" \
+    LLVM_COV_REPORT="$STUB/fake-rust-coverage.lcov" \
+    bash "$STUB_COV" >/dev/null 2>&1; then
+  for binary in vpn_engine-review-fixture vpn_cli-review-fixture; do
+    if grep -Fq -- "$STUB/engine-rust/target/debug/deps/$binary" \
+        "$STUB/llvm-cov-object-args"; then
+      echo "  ok   Rust coverage includes $binary"
+    else
+      echo "  FAIL Rust coverage omits $binary"; fails=1
+    fi
+  done
+else
+  echo "  FAIL Rust coverage object collection scenario"; fails=1
+fi
 
 # Artifact preservation: sentinels sit inside the two dirs coverage.sh
 # rm -rf's before measuring. If a stub run ever touched the real tree the
