@@ -80,12 +80,14 @@ public sealed class SessionServiceTests : IAsyncLifetime
         Assert.NotNull(view.SenderIndex);
         Assert.NotNull(view.PeerIndex);
         Assert.NotNull(view.SessionToken);
+        Assert.Equal(1L, view.KeyEpoch);
         var row = await db.Sessions.SingleAsync();
         Assert.NotNull(row.SessionTokenHash);
         Assert.NotEqual(view.SessionToken, row.SessionTokenHash);
         Assert.Equal(32, row.EgressKey!.Length);
         Assert.Equal(32, row.IngressKey!.Length);
-        Assert.NotEqual(row.EgressKey, row.IngressKey);
+        Assert.NotEqual(Convert.ToHexString(row.EgressKey!),
+            Convert.ToHexString(row.IngressKey!));
     }
 
     [Fact]

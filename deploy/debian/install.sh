@@ -33,8 +33,10 @@ done
 version=$(tr -cd 'A-Za-z0-9._-' <"$release/VERSION" | head -c 80)
 [ -n "$version" ] || { echo "release VERSION is empty or invalid" >&2; exit 1; }
 for required in \
-    bin/vpn-engine bin/vpn-agent bin/hikablue-engine-service \
+    bin/vpn-engine bin/vpn-cli bin/vpn-agent bin/hikablue-engine-service \
     bin/hikablue-agent-service bin/hikablue-control-service \
+    bin/hikablue-backup-postgres bin/hikablue-restore-postgres \
+    bin/hikablue-provision-credentials \
     systemd/hikablue-engine.service systemd/hikablue-agent.service \
     systemd/hikablue-control.service control/VpnControl.dll config/engine.env.sample \
     config/agent.env.sample config/control.env.sample; do
@@ -110,7 +112,11 @@ if [ "$real_system" -eq 1 ] && [ "$skip_users" -eq 0 ]; then
     done
     install -d -m 0755 /var/lib/hikablue
     install -d -m 0700 -o hikablue-agent -g hikablue-agent /var/lib/hikablue/agent-state
-    install -d -m 0755 /etc/hikablue/pki
+fi
+if [ "$real_system" -eq 1 ]; then
+    install -d -m 0700 -o root -g root \
+        /etc/hikablue/credentials/control/versions \
+        /etc/hikablue/credentials/node/versions
 fi
 
 old_target=""

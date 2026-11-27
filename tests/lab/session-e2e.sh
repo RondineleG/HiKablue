@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2024
-# tests/lab/session-e2e.sh — milestone 4 end-to-end session validation.
+# tests/lab/session-e2e.sh — milestone 4/5 end-to-end session validation.
 #
 # Isolated topology (all inside run-owned network namespaces):
 #   client A/B --veth/bridge--> exit node --veth--> HTTP service namespace
@@ -14,6 +14,7 @@
 #   tests/lab/session-e2e.sh                    normal revocation acceptance
 #   tests/lab/session-e2e.sh --drop             gRPC interruption/reconciliation
 #   tests/lab/session-e2e.sh --expire-restart   local expiry across agent restart
+#   tests/lab/session-e2e.sh --engine-restart   same-session client rekey
 set -euo pipefail
 umask 077
 
@@ -82,6 +83,7 @@ B_PEER_IF="hkm4b0$RUN_TAG"
 SVC_HOST_IF="hkm4vs$RUN_TAG"
 SVC_PEER_IF="hkm4s0$RUN_TAG"
 ENGINE="$repo_root/engine-rust/target/release/vpn-engine"
+VPN_CLI="$repo_root/engine-rust/target/release/vpn-cli"
 
 log() { echo "== $*"; }
 
@@ -321,7 +323,7 @@ create_session() {
     api -X POST "$CTRL_URL/v1/sessions" \
         -H 'Content-Type: application/json' -H "X-Subject: $subject" \
         -d "{\"nodeId\":\"exit-node\",\"ttlSeconds\":$ttl}" >"$out" \
-        || { cat "$out" >&2; fail "create $subject failed"; }
+        || { show_session_summary "$out"; fail "create $subject failed"; }
     cp "$out" "$out.bootstrap"
     local id token
     id=$(jq -r '.data.sessionId' "$out.bootstrap")
@@ -333,7 +335,7 @@ create_session() {
         [ "$(jq -r '.data.status' "$out" 2>/dev/null)" = active ] && return 0
         sleep 0.1
     done
-    cat "$out" >&2
+    show_session_summary "$out"
     tail -50 "$AGENT_LOG" >&2
     fail "session $subject never became active"
 }
@@ -368,11 +370,119 @@ start_client() {
     lab_register_root_pid "$client_pid" "$RUN_DIR"
 }
 
+assert_client_engine_key_hygiene() {
+    local state_dir=$1 session_id=$2
+    local pid_file="$state_dir/$session_id/engine.pid"
+    local pid cmdline key_file key key_count=0 key_files
+    lab_as_root test -s "$pid_file" || fail "client engine PID file missing: $pid_file"
+    pid=$(lab_as_root cat "$pid_file")
+    cmdline=$(lab_as_root cat "/proc/$pid/cmdline" | tr '\0' ' ' 2>/dev/null || true)
+    [ -n "$cmdline" ] || fail "cannot inspect client engine command line"
+    key_files=$(lab_as_root find "$state_dir/$session_id" -maxdepth 2 -type f \
+        \( -name tx.key -o -name rx.key \) -print)
+    while IFS= read -r key_file; do
+        [ -n "$key_file" ] || continue
+        key_count=$((key_count + 1))
+        [ "$(lab_as_root stat -c %a "$key_file")" = 600 ] ||
+            fail "client key file is not mode 0600: $key_file"
+        key=$(lab_as_root cat "$key_file")
+        case "$cmdline" in
+            *"$key"*) fail "client engine exposed key material in its command line" ;;
+        esac
+    done <<<"$key_files"
+    [ "$key_count" -eq 2 ] || fail "expected two protected key files for client engine"
+    lab_register_root_pid "$pid" "$RUN_DIR"
+}
+
+start_client_supervisor() {
+    local ns=$1 subject=$2 tag=$3
+    local state_dir="$RUN_DIR/$tag-state"
+    local info_file="$RUN_DIR/$tag-session-info.json"
+    local log_file="$RUN_DIR/$tag-cli.log"
+    local session_id token manager_pid_file manager_pid metrics_sock engine_pid_file
+
+    lab_as_root "$VPN_CLI" \
+        --control-url "$CTRL_URL" \
+        --node-id exit-node \
+        --subject "$subject" \
+        --ca-cert "$RUN_DIR/pki/ca/ca.crt" \
+        --remote 192.168.50.1:51820 \
+        --peer 10.80.1.1 \
+        --tun-prefix 24 \
+        --tun-name tun0 \
+        --netns "$ns" \
+        --engine "$ENGINE" \
+        --state-dir "$state_dir" \
+        --session-info "$info_file" \
+        >"$log_file" 2>&1 &
+
+    wait_for_tenths 100 test -s "$info_file" || {
+        cat "$log_file" >&2
+        fail "$tag vpn-cli did not create its session"
+    }
+    session_id=$(client_info_field "$info_file" '.sessionId')
+    token=$(client_info_field "$info_file" '.sessionToken')
+    [ -n "$session_id" ] && [ "$session_id" != null ] || fail "$tag session ID missing"
+    [ -n "$token" ] && [ "$token" != null ] || fail "$tag session token missing"
+    wait_for_tenths 150 session_is_active "$session_id" "$subject" "$token" || {
+        cat "$log_file" >&2
+        fail "$tag session never became active"
+    }
+
+    manager_pid_file="$state_dir/$session_id/manager.pid"
+    wait_for_tenths 100 lab_as_root test -s "$manager_pid_file" || {
+        cat "$log_file" >&2
+        fail "$tag vpn-cli manager PID file missing"
+    }
+    manager_pid=$(lab_as_root cat "$manager_pid_file")
+    lab_register_root_pid "$manager_pid" "$RUN_DIR"
+
+    engine_pid_file="$state_dir/$session_id/engine.pid"
+    wait_for_tenths 150 lab_as_root test -s "$engine_pid_file" || {
+        cat "$log_file" >&2
+        fail "$tag vpn-engine did not start"
+    }
+    metrics_sock="$state_dir/$session_id/engine.sock"
+    wait_for_tenths 100 lab_as_root test -S "$metrics_sock" || {
+        cat "$log_file" >&2
+        fail "$tag vpn-engine metrics socket missing"
+    }
+    assert_client_engine_key_hygiene "$state_dir" "$session_id"
+}
+
+show_session_summary() {
+    jq -c '{
+        data: {
+            sessionId: .data.sessionId,
+            status: .data.status,
+            virtualIp: .data.virtualIp,
+            expiresAt: .data.expiresAt,
+            keyEpoch: .data.keyEpoch
+        }
+    }' "$1" >&2 2>/dev/null || echo "session response omitted (invalid or unavailable JSON)" >&2
+}
+
 stop_client() {
-    local tag=$1 signal=${2:-TERM} pid
-    [ -f "$RUN_DIR/$tag-engine.pid" ] || return 0
-    pid=$(lab_as_root cat "$RUN_DIR/$tag-engine.pid")
+    local tag=$1 signal=${2:-TERM} pid pid_file manager_pid="" manager_pid_file=""
+    if [ "$MODE" = engine-restart ] && [ "$tag" = client-a ]; then
+        pid_file="$RUN_DIR/client-a-state/$A_ID/engine.pid"
+        manager_pid_file="$RUN_DIR/client-a-state/$A_ID/manager.pid"
+        lab_as_root test -s "$manager_pid_file" &&
+            manager_pid=$(lab_as_root cat "$manager_pid_file")
+    else
+        pid_file="$RUN_DIR/$tag-engine.pid"
+    fi
+    lab_as_root test -s "$pid_file" || return 0
+    pid=$(lab_as_root cat "$pid_file")
     stop_root_owned_pid "$pid" "$signal" || fail "$tag engine did not stop after $signal"
+    if [ -n "$manager_pid" ]; then
+        for _ in $(seq 100); do
+            [ ! -r "/proc/$manager_pid/cmdline" ] && return 0
+            sleep 0.05
+        done
+        stop_root_owned_pid "$manager_pid" TERM ||
+            fail "$tag vpn-cli did not stop after its engine exited"
+    fi
 }
 
 curl_client() {
@@ -385,6 +495,21 @@ curl_client_fast() {
 
 session_status() {
     api "$CTRL_URL/v1/sessions/$1" -H "X-Subject: $2" -H "X-Session-Token: $3" | jq -r '.data.status'
+}
+
+session_is_active() {
+    local status
+    status=$(session_status "$@" 2>/dev/null) || return 1
+    [ "$status" = active ]
+}
+
+session_epoch() {
+    api "$CTRL_URL/v1/sessions/$1" -H "X-Subject: $2" -H "X-Session-Token: $3" |
+        jq -r '.data.keyEpoch'
+}
+
+client_info_field() {
+    lab_as_root cat "$1" | jq -r "$2"
 }
 
 lease_count() {
@@ -417,24 +542,46 @@ if curl_client "$NS_A" >/dev/null; then
 fi
 echo "  OBSERVED: direct path is inaccessible"
 
-log "provision sessions A and B"
-if [ "$MODE" = expire-restart ]; then
-    create_session alice "$RUN_DIR/session-a.json" 20
+log "provision and supervise sessions A and B"
+if [ "$MODE" = engine-restart ]; then
+    start_client_supervisor "$NS_A" alice client-a
+    A_ID=$(client_info_field "$RUN_DIR/client-a-session-info.json" '.sessionId')
+    A_TOKEN=$(client_info_field "$RUN_DIR/client-a-session-info.json" '.sessionToken')
+    A_IP=$(client_info_field "$RUN_DIR/client-a-session-info.json" '.virtualIp')
+    A_EXPIRES_AT=$(client_info_field "$RUN_DIR/client-a-session-info.json" '.expiresAt')
+    A_INITIAL_EPOCH=$(client_info_field "$RUN_DIR/client-a-session-info.json" '.keyEpoch')
+    [ "$(session_epoch "$A_ID" alice "$A_TOKEN")" = "$A_INITIAL_EPOCH" ] ||
+        fail "vpn-cli session epoch changed before backend restart"
 else
-    create_session alice "$RUN_DIR/session-a.json" 180
+    if [ "$MODE" = expire-restart ]; then
+        create_session alice "$RUN_DIR/session-a.json" 20
+    else
+        create_session alice "$RUN_DIR/session-a.json" 180
+    fi
+    A_ID=$(jq -r '.data.sessionId' "$RUN_DIR/session-a.json")
+    A_TOKEN=$(jq -r '.data.sessionToken' "$RUN_DIR/session-a.json.bootstrap")
+    A_IP=$(jq -r '.data.virtualIp' "$RUN_DIR/session-a.json")
+    A_EXPIRES_AT=$(jq -r '.data.expiresAt' "$RUN_DIR/session-a.json")
+    A_INITIAL_EPOCH=$(jq -r '.data.keyEpoch' "$RUN_DIR/session-a.json")
 fi
 create_session bob "$RUN_DIR/session-b.json" 180
-A_ID=$(jq -r '.data.sessionId' "$RUN_DIR/session-a.json")
 B_ID=$(jq -r '.data.sessionId' "$RUN_DIR/session-b.json")
-A_TOKEN=$(jq -r '.data.sessionToken' "$RUN_DIR/session-a.json.bootstrap")
-A_IP=$(jq -r '.data.virtualIp' "$RUN_DIR/session-a.json")
+B_TOKEN=$(jq -r '.data.sessionToken' "$RUN_DIR/session-b.json.bootstrap")
 B_IP=$(jq -r '.data.virtualIp' "$RUN_DIR/session-b.json")
-A_EXPIRES_AT=$(jq -r '.data.expiresAt' "$RUN_DIR/session-a.json")
+B_INITIAL_EPOCH=$(jq -r '.data.keyEpoch' "$RUN_DIR/session-b.json")
+[ -n "$A_ID" ] && [ -n "$B_ID" ] || fail "session IDs missing"
+[ "$A_ID" != "$B_ID" ] || fail "clients received the same session ID"
 [ -n "$B_ID" ] || fail "session B id missing"
 [ "$A_IP" != "$B_IP" ] || fail "clients received the same IP"
+[[ "$A_INITIAL_EPOCH" =~ ^[0-9]+$ ]] || fail "session A key epoch is invalid"
+[[ "$B_INITIAL_EPOCH" =~ ^[0-9]+$ ]] || fail "session B key epoch is invalid"
+A_INITIAL_LAB_ID=$(psql_lab "select lab_session_id from sessions where session_id='$A_ID'")
+B_INITIAL_LAB_ID=$(psql_lab "select lab_session_id from sessions where session_id='$B_ID'")
 echo "  OBSERVED: A=$A_IP B=$B_IP; both pending until ACK, then active"
 
-start_client "$NS_A" "$RUN_DIR/session-a.json.bootstrap" tun0 client-a
+if [ "$MODE" != engine-restart ]; then
+    start_client "$NS_A" "$RUN_DIR/session-a.json.bootstrap" tun0 client-a
+fi
 start_client "$NS_B" "$RUN_DIR/session-b.json.bootstrap" tun0 client-b
 
 log "HTTP connectivity over both tunnels"
@@ -443,9 +590,19 @@ log "HTTP connectivity over both tunnels"
 echo "  OBSERVED: clients A and B received hikablue-m4-ok through the tunnel"
 
 if [ "$MODE" = engine-restart ]; then
-    log "restart the exit engine and require fresh sessions"
+    log "restart the exit engine and rekey the same client session"
     OLD_BACKEND=$(psql_lab "select backend_instance_id from nodes where node_id='exit-node'")
     [ -n "$OLD_BACKEND" ] || fail "initial backend instance id missing"
+    OLD_A_EPOCH=$A_INITIAL_EPOCH
+    OLD_B_EPOCH=$B_INITIAL_EPOCH
+    OLD_A_WIRE_ID=$A_INITIAL_LAB_ID
+    OLD_B_WIRE_ID=$B_INITIAL_LAB_ID
+    [ "$(session_status "$A_ID" alice "$A_TOKEN")" = active ] ||
+        fail "client A session was not active before restart"
+    [ "$(session_status "$B_ID" bob "$B_TOKEN")" = active ] ||
+        fail "client B session was not active before restart"
+    [ "$(lease_count "$A_ID")" = 1 ] || fail "A lease missing before restart"
+    [ "$(lease_count "$B_ID")" = 1 ] || fail "B lease missing before restart"
     ROUTE_BEFORE=$(lab_as_root ip netns exec "$NS_A" ip -4 route show 10.80.1.0/24 2>/dev/null || true)
     case "$ROUTE_BEFORE" in
         *"10.80.1.0/24"*) ;;
@@ -488,21 +645,60 @@ if [ "$MODE" = engine-restart ]; then
     for _ in $(seq 200); do
         A_DB=$(psql_lab "select status from sessions where session_id='$A_ID'" 2>/dev/null || true)
         B_DB=$(psql_lab "select status from sessions where session_id='$B_ID'" 2>/dev/null || true)
-        [ "$A_DB" = Failed ] && [ "$B_DB" = Failed ] && break
+        [ "$A_DB" = Active ] && [ "$B_DB" = Active ] && break
         sleep 0.1
     done
-    [ "$A_DB" = Failed ] && [ "$B_DB" = Failed ] || {
+    [ "$A_DB" = Active ] && [ "$B_DB" = Active ] || {
         tail -80 "$RUN_DIR/agent-backend-restart.log" >&2
-        fail "pre-restart sessions did not fail after confirmed backend reset (A=$A_DB B=$B_DB)"
+        fail "sessions did not return to active after confirmed rekey (A=$A_DB B=$B_DB)"
     }
-    [ "$(lease_count "$A_ID")" = 0 ] || fail "A lease survived confirmed backend reset"
-    [ "$(lease_count "$B_ID")" = 0 ] || fail "B lease survived confirmed backend reset"
-    echo "  OBSERVED: confirmed empty-state reconciliation failed pre-restart sessions and released leases"
+
+    NEW_A_EPOCH=$(session_epoch "$A_ID" alice "$A_TOKEN")
+    NEW_B_EPOCH=$(session_epoch "$B_ID" bob "$B_TOKEN")
+    NEW_A_WIRE_ID=$(psql_lab "select lab_session_id from sessions where session_id='$A_ID'")
+    NEW_B_WIRE_ID=$(psql_lab "select lab_session_id from sessions where session_id='$B_ID'")
+    [ "$NEW_A_EPOCH" -gt "$OLD_A_EPOCH" ] || fail "A key epoch did not increase"
+    [ "$NEW_B_EPOCH" -gt "$OLD_B_EPOCH" ] || fail "B key epoch did not increase"
+    [ "$NEW_A_WIRE_ID" != "$OLD_A_WIRE_ID" ] || fail "A wire session ID was reused"
+    [ "$NEW_B_WIRE_ID" != "$OLD_B_WIRE_ID" ] || fail "B wire session ID was reused"
+    [ "$NEW_A_WIRE_ID" != "$NEW_B_WIRE_ID" ] || fail "rekeyed sessions share a wire session ID"
+    [ "$(psql_lab "select host(virtual_ip) from sessions where session_id='$A_ID'")" = "$A_IP" ] ||
+        fail "A virtual IP changed during rekey"
+    [ "$(psql_lab "select count(*) from sessions where owner_subject='alice'")" = 1 ] ||
+        fail "vpn-cli created a replacement API session"
+    [ "$(lease_count "$A_ID")" = 1 ] || fail "A lease was not retained across rekey"
+    [ "$(lease_count "$B_ID")" = 1 ] || fail "B lease was not retained across rekey"
+    echo "  OBSERVED: same API session IDs and IP leases survived reset; both key epochs and wire session IDs changed"
 
     if curl_client_fast "$NS_B" >/dev/null; then
         fail "client B kept connectivity with pre-restart keys"
     fi
-    echo "  OBSERVED: pre-restart keys cannot carry traffic on the new backend instance"
+    echo "  OBSERVED: client B's old keys and wire session ID cannot carry traffic on the new backend instance"
+
+    wait_for_tenths 200 grep -Fq \
+        "vpn-cli: session $A_ID active at epoch $NEW_A_EPOCH " "$RUN_DIR/client-a-cli.log" || {
+        cat "$RUN_DIR/client-a-cli.log" >&2
+        fail "vpn-cli did not restart the engine with A's new key epoch"
+    }
+    assert_client_engine_key_hygiene "$RUN_DIR/client-a-state" "$A_ID"
+    A_HTTP=0
+    for _ in $(seq 100); do
+        if [ "$(curl_client_fast "$NS_A" 2>/dev/null || true)" = "hikablue-m4-ok" ]; then
+            A_HTTP=1
+            break
+        fi
+        sleep 0.1
+    done
+    [ "$A_HTTP" = 1 ] || {
+        tail -80 "$RUN_DIR/client-a-cli.log" >&2
+        fail "same-session rekey did not restore client A's HTTP connectivity"
+    }
+    ROUTE_AFTER_REKEY=$(lab_as_root ip netns exec "$NS_A" ip -4 route show 10.80.1.0/24 2>/dev/null || true)
+    case "$ROUTE_AFTER_REKEY" in
+        *"10.80.1.0/24"*) ;;
+        *) fail "client A tunnel route missing after rekey" ;;
+    esac
+    echo "  OBSERVED: vpn-cli installed epoch $NEW_A_EPOCH and client A again received hikablue-m4-ok"
 
     stop_client client-a KILL
     LINK_ERR=$(mktemp "$RUN_DIR/link-check.XXXXXX")
@@ -514,12 +710,15 @@ if [ "$MODE" = engine-restart ]; then
     ROUTE_AFTER=$(lab_as_root ip netns exec "$NS_A" ip -4 route show 10.80.1.0/24 2>"$ROUTE_ERR") || { cat "$ROUTE_ERR" >&2; fail "client A route inspection failed"; }
     [ -z "$ROUTE_AFTER" ] || fail "client A tunnel route survived abrupt termination: $ROUTE_AFTER"
     echo "  OBSERVED: abrupt client termination removed tun0 and rolled back its connected tunnel route"
-
-    log "provision a fresh post-restart session"
-    create_session carol "$RUN_DIR/session-c.json" 180
-    start_client "$NS_A" "$RUN_DIR/session-c.json.bootstrap" tun0 client-c
-    [ "$(curl_client "$NS_A")" = "hikablue-m4-ok" ] || fail "fresh post-restart session did not reach the service"
-    echo "  OBSERVED: a fresh session with fresh keys restored service connectivity after engine restart"
+    CLIENT_EXIT_STATUS=""
+    for _ in $(seq 200); do
+        CLIENT_EXIT_STATUS=$(session_status "$A_ID" alice "$A_TOKEN" 2>/dev/null || true)
+        [ "$CLIENT_EXIT_STATUS" = revoked ] && [ "$(lease_count "$A_ID")" = 0 ] && break
+        sleep 0.1
+    done
+    [ "$CLIENT_EXIT_STATUS" = revoked ] || fail "vpn-cli did not revoke A after its engine exited"
+    [ "$(lease_count "$A_ID")" = 0 ] || fail "A lease was not released after the revoke ACK"
+    echo "  OBSERVED: vpn-cli requested session revocation; the node ACK released A's lease"
 elif [ "$MODE" = expire-restart ]; then
     start_b_monitor
     sleep 0.5

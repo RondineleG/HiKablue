@@ -187,35 +187,86 @@ If the stream drops before the reset ACK, the next registration for the same
 backend requeues that same reset row. It does not enqueue a replacement
 snapshot that would resurrect the old peer list. While a reset row with
 backend-reset metadata remains `pending` or `sent`, the node is ineligible
-for new sessions. After the valid applied ACK, creation is allowed again;
-the new session's `ProvisionPeer` command belongs to the new generation and
-is never part of the pre-registration invalidation sweep.
+for new sessions. After the valid applied ACK, reset processing may enqueue fresh
+`ProvisionPeer` commands for the existing sessions whose new key material was
+prepared in the registration transaction. New session creation is also
+allowed; a new session's command belongs to the new generation and is never
+part of the pre-registration invalidation sweep.
 
-Only an applied ACK has a side effect:
+The registration transaction prepares new key material before the reset is
+applied, but does not install it in the empty backend:
 
 ```csharp
-resetSession.Status = SessionStatus.Failed;
-resetSession.FailureReason = "backend_restart_requires_new_session";
-resetSession.UpdatedAt = DateTimeOffset.UtcNow;
+var (senderIndex, peerIndex) =
+    SessionProvisioning.AllocateWireIndexes(usedIndexes);
+var (egressKey, ingressKey) = SessionProvisioning.CreateDirectionalKeys();
+session.LabSessionId =
+    SessionProvisioning.AllocateLabSessionId(usedLabSessionIds);
+nextKeyEpoch = checked(nextKeyEpoch + 1);
+session.KeyEpoch = nextKeyEpoch;
+session.EgressKey = egressKey;
+session.IngressKey = ingressKey;
+session.SenderIndex = senderIndex;
+session.PeerIndex = peerIndex;
+session.Status = SessionStatus.Pending;
 ```
 
-Line by line:
+The control plane generates distinct 32-byte directional keys, allocates
+unused wire indexes and a new lab wire-session ID, and advances the node's
+key epoch. It keeps the API session ID, virtual IP, owner token, expiration,
+and lease unchanged. An expired session is moved to `revoking` instead of
+being rekeyed; one already `revoking` remains on the removal path.
 
-- the session does not become `revoked`: nobody revoked it;
-- `failed` is terminal and records why the client must create a new session;
-- the timestamp preserves operational ordering;
-- in the surrounding code, the lease row is deleted in the same ACK side
-  effect. Before that confirmation, the lease remains reserved.
+Only after the empty `SyncState` receives a valid applied ACK does the control
+plane enqueue a `ProvisionPeer` for each still-eligible session. That command
+installs the fresh material in the new backend. A valid `ProvisionPeer` ACK
+moves that session from `pending` back to `active`. Until then it stays
+`pending` and its lease remains reserved.
 
-A session already in `revoking` follows the other terminal branch: it becomes
-`revoked`, because removal was already desired and the confirmed empty backend
-is the removal confirmation the dead backend can never send. Its lease is
-released in the same ACK side effect.
+Sessions already `revoking`, or that expire before the reset ACK, become
+`revoked` and release their leases only after that confirmed empty-state ACK.
+This keeps a failed or delayed reset from looking like cleanup confirmation.
 
 This is the important honesty boundary: `sent` is not application, and a
 process restart is not cleanup confirmation. The control plane uses the
 fresh backend's applied empty-state reconciliation as the confirmation that
 old data-plane state is absent.
+
+## Rekeying the same API session
+
+The client manager follows the existing session instead of creating a
+replacement. The state flow is:
+
+```text
+new backend ID
+  -> registration stores fresh keys/indices/epoch and queues empty SyncState
+  -> applied empty-state ACK
+  -> fresh ProvisionPeer command
+  -> applied provision ACK: session is active
+  -> client observes the new key epoch and starts a replacement engine
+```
+
+`engine-rust/src/bin/vpn-cli.rs` implements this flow for the isolated lab:
+
+- It creates a session over HTTPS using the configured CA, then keeps the
+  session ID, owner token, virtual IP, and initial epoch for supervision.
+- It polls that same session with `X-Subject` and `X-Session-Token`, and
+  rejects a changed session ID or virtual IP. A temporary API failure is
+  retried; a terminal session state is reported.
+- When the session becomes `pending`, it stops the existing client engine
+  before waiting. Once the session is `active` at a higher epoch, it reads
+  the new directional keys and wire indexes, writes protected key files, and
+  starts a replacement engine. With `--netns`, the manager stays outside the
+  client namespace to reach the loopback API while the child engine runs
+  inside it.
+- On shutdown it stops the child, removes its protected files, and requests
+  session revocation. A failed cleanup or revocation request is surfaced.
+
+Client B intentionally keeps its old bootstrap keys in the restart exercise:
+those keys must fail after the exit backend has restarted. Client A's HTTP
+probe is expected to succeed only after the new provision ACK and engine
+restart. This is lab-only provisioning, not a production client-authentication
+flow.
 
 ## Route rollback
 
@@ -239,23 +290,144 @@ and TCP MSS clamping remain deferred. The verified statement is narrower:
 every network object created by the current client engine is rolled back by
 process death.
 
-## Observed validation
+## Encrypted systemd credentials
 
-Observed on the Ubuntu development VM during this milestone implementation:
+The sample `.env` files contain settings, not secrets. On Debian 12 or later
+with `systemd-creds`, an operator supplies credential files out of band.
+`deploy/debian/provision-credentials.sh` accepts a control source directory
+containing `connection-string`, `heartbeat-token`, `admin-token`,
+`session-token-secret`, `server.crt`, `server.key`, and `lab-ca.crt`; the node
+directory contains `lab-ca.crt`, `node.crt`, and `node.key`. Each source
+directory must be mode `0700`; each regular source file must be non-empty,
+at most 1 MiB, and inaccessible to group and other. The control session-token
+secret must contain at least 32 bytes.
+
+For example:
+
+```sh
+sudo deploy/debian/provision-credentials.sh \
+  --role control --source-dir /root/hikablue-control-credentials
+sudo deploy/debian/provision-credentials.sh \
+  --role node --source-dir /root/hikablue-node-credentials
+```
+
+The helper encrypts each file with `systemd-creds --with-key=host`, stores
+versioned ciphertext under `/etc/hikablue/credentials/<role>/versions/`, and
+atomically switches `current`, retaining `previous`. Plaintext source values
+are not copied into that store or the release tree. systemd decrypts the
+files into its private `CREDENTIALS_DIRECTORY`: the control-plane startup
+maps control values into application configuration, and the agent wrapper
+passes the node certificate paths to `vpn-agent`.
+
+To rotate, supply a new protected source directory and rerun the command for
+that role, then restart its service. To roll back, switch the links back and
+restart:
+
+```sh
+sudo deploy/debian/provision-credentials.sh --role control --rollback
+sudo systemctl restart hikablue-control.service
+```
+
+Repeat with `--role node` and restart `hikablue-agent.service` for node
+credentials. Host-key encryption is machine-bound: ciphertext must be
+reprovisioned on another host from the protected source values. The helper
+stages and rotates supplied credentials; it does not issue certificates or
+generate source secrets.
+
+## PostgreSQL backup and restore
+
+Before a control-plane upgrade or irreversible migration, create a custom
+format backup in a new directory:
+
+```sh
+sudo install -d -m 0700 /var/backups/hikablue
+backup_dir="/var/backups/hikablue/before-upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
+sudo deploy/debian/backup-postgres.sh \
+  --database vpn_control \
+  --output-dir "$backup_dir"
+```
+
+The script uses libpq settings, such as a protected `PGPASSFILE`, rather than
+putting a password in the command line. It creates a mode-`0700` directory
+with a mode-`0600` `backup.dump`, metadata, and SHA-256 checksum. The checksum
+detects accidental corruption; it is not an authenticity signature. Record
+the exact `backup_dir` value for the later restore.
+
+Restore only into an existing, explicitly confirmed target database. Stop
+the control plane and every node's agent and engine first, and keep them
+stopped until the database restore is complete:
+
+```sh
+sudo systemctl stop hikablue-agent.service hikablue-engine.service
+sudo systemctl stop hikablue-control.service
+sudo deploy/debian/restore-postgres.sh \
+  --database vpn_control \
+  --backup-dir "$backup_dir" \
+  --confirm-database vpn_control
+sudo systemctl start hikablue-control.service
+sudo systemctl start hikablue-engine.service hikablue-agent.service
+```
+
+Run each service command on the host that owns those units; all nodes must
+remain stopped while restoring. The restore helper checks the database name,
+private file modes, the single-entry checksum manifest, checksum, and archive
+readability before `pg_restore` uses `--single-transaction --clean
+--if-exists`. A bad confirmation, symlink, malformed manifest, or checksum
+fails before restore. The offline test stubs PostgreSQL clients, so it
+verifies guards and arguments, not a real database restore.
+
+Restoring only PostgreSQL while agents or engines retain newer in-memory
+state can make desired and applied state disagree. After the restore, start
+the control plane before nodes. Each restarted engine reports a new backend
+identity; after the empty-state ACK, eligible sessions receive fresh keys and
+are provisioned again. The operator runbook does not automate backup
+scheduling, remote replication, or certificate issuance.
+
+## Historical deployment and recovery observations
+
+The deployment and earlier restart results below were observed on the Ubuntu
+development VM before the current same-session rekey, encrypted-credential,
+and backup/restore changes. In particular, the restart result is from
+baseline `c5772ccf7b60`, where recovery required a fresh API session; it is
+historical evidence, not validation of current rekey, credential provisioning,
+or real database restore behavior.
 
 | Check | Observed result |
 |---|---|
 | `tests/deploy/install-rollback.test.sh` | PASS — reinstall idempotent, config preserved, v1→v2 upgrade and rollback correct |
 | real release build + staged install | PASS — release tree contained the Rust, Go, and published .NET artifacts and installed into a temporary root |
 | packaged systemd units in a clean Debian 12 VM | PASS — control/engine/agent active under systemd; PostgreSQL-backed REST session reached `active`; agent `GetSessions` saw the peer; revocation emptied the engine and released the lease |
-| `tests/lab/session-e2e.sh --engine-restart` | PASS — agent exited on backend ID change; fresh registration reconciled empty state; pre-restart sessions became `failed`; leases released; old keys failed; fresh session passed HTTP |
-| route rollback in that scenario | PASS — `SIGKILL` removed client `tun0` and the connected `10.80.1.0/24` route |
-| final server metrics in the recorded restart run | `rx_pkts=5`, `tx_pkts=5`, `dropped_pkts=2`, `peers=1` |
+| historical `tests/lab/session-e2e.sh --engine-restart` at `c5772ccf7b60` | PASS — agent exited on backend ID change; reset ACK failed old sessions and released leases; old keys failed; a fresh API session passed HTTP |
+| route rollback in that historical scenario | PASS — `SIGKILL` removed client `tun0` and the connected `10.80.1.0/24` route |
+| final server metrics in the historical restart run | `rx_pkts=5`, `tx_pkts=5`, `dropped_pkts=2`, `peers=1` |
 
-Compilation, packet forwarding, and application connectivity are separate:
-the release build compiled, packets were dropped/forwarded by the engine,
-and the HTTP assertion was the exact body `hikablue-m4-ok` through the
-post-restart session.
+In that historical run, compilation, packet forwarding, and application
+connectivity were separate observations: the release built, the engine
+dropped/forwarded packets, and the HTTP assertion returned the exact body
+`hikablue-m4-ok` through the fresh session.
+
+## Current milestone-5 verification status
+
+These are observations from the Windows development workstation for the
+current uncommitted changes. A check blocked before its assertions is not a
+pass.
+
+| Check | Current result |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `cargo check --all-targets --locked` | BLOCKED before project compilation because MSVC `link.exe` is missing |
+| `dotnet test control-dotnet/VpnControl.Tests/VpnControl.Tests.csproj --filter FullyQualifiedName~SystemdCredentialConfigurationTests` | PASS — 3 credential configuration tests |
+| `BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases` | BLOCKED during Testcontainers initialization because Docker at `npipe://./pipe/docker_engine` is unavailable |
+| `bash -n` on changed deployment, lab, and quality-gate scripts | PASS |
+| `bash tests/deploy/credentials.test.sh` and `bash tests/deploy/postgres-backup-restore.test.sh` | BLOCKED — Git Bash on NTFS could not provide the required POSIX-private directory modes |
+| `bash tests/book/check-parity.sh` | PASS |
+| `tests/lab/session-e2e.sh --engine-restart` | NOT RUN — WSL is not installed |
+
+Rust CLI compilation is unverified. Neither packet forwarding nor application
+connectivity has been observed for same-session rekey. Reproduce the flow in
+the authorized isolated Linux lab with
+`tests/lab/session-e2e.sh --engine-restart`; do not direct test UDP at
+external or production endpoints.
 
 ## Requirement map
 
@@ -264,9 +436,11 @@ post-restart session.
 | repeatable Debian installation | `deploy/debian/build-release.sh`, `install.sh` | `tests/deploy/install-rollback.test.sh` |
 | upgrade and binary rollback | `deploy/debian/rollback.sh` | same offline test |
 | service ownership | `deploy/debian/systemd/`, `service-scripts/` | shell syntax/static review + real systemd socket check |
-| backend restart requires new session | `agent-go/cmd/vpn-agent/main.go`, `control-dotnet/VpnControl/Services/NodeChannelService.cs` | Go/.NET tests + `--engine-restart` lab |
-| stream loss still reconciles | milestone-4 outbox/NodeChannel | `session-e2e.sh --drop` |
-| network restoration | transient TUN ownership | `session-e2e.sh --engine-restart` |
+| same-session rekey after backend restart | `control-dotnet/VpnControl/Services/NodeChannelService.cs`, `control-dotnet/VpnControl/Services/SessionProvisioning.cs`, `engine-rust/src/bin/vpn-cli.rs` | rekey integration test blocked before assertions by unavailable Docker; current isolated `--engine-restart` run is pending |
+| stream loss still reconciles | milestone-4 outbox/NodeChannel | `tests/lab/session-e2e.sh --drop` |
+| network restoration | transient TUN ownership and `vpn-cli` supervision | historical TUN cleanup observed; current rekey/route recreation awaits the Linux lab |
+| encrypted systemd credentials | `deploy/debian/provision-credentials.sh`, systemd units, `control-dotnet/VpnControl/Security/SystemdCredentialConfiguration.cs` | 3 C# configuration tests pass; offline shell test blocked by NTFS mode semantics; no current real-systemd credential test |
+| PostgreSQL backup and restore | `deploy/debian/backup-postgres.sh`, `deploy/debian/restore-postgres.sh` | offline test blocked by NTFS mode semantics; no real PostgreSQL restore observed |
 
 ## Glossary
 
@@ -297,21 +471,27 @@ post-restart session.
 - **`SO_PEERCRED`** — Unix-socket credential check used to identify the local peer process.
 - **`SyncState`** — control-plane snapshot command carrying the desired peer set plus validation metadata.
 - **`--control-group`** — engine flag choosing the local group that owns the control socket file at mode `0660`; it does not replace UID authorization.
+- **`key_epoch`** — monotonically advanced identifier for a session's current directional keys and wire state; a backend restart requires a fresh epoch.
+- **`vpn-cli`** — lab-only client manager that polls an API session and replaces its engine after a new key epoch is active.
+- **`CREDENTIALS_DIRECTORY`** — systemd-provided runtime directory containing decrypted credentials for one service invocation.
+- **`systemd-creds`** — systemd utility used here to encrypt versioned credential files with a host-bound key.
+- **checksum manifest** — SHA-256 file used to detect accidental archive corruption; it does not authenticate who produced the backup.
 - **systemd** — Linux service manager responsible for starting, restarting,
   and logging services.
 - **transient TUN** — TUN interface owned by an open file descriptor; it is
   destroyed when the last descriptor closes.
 
-## Exercise — trace ownership
+## Exercise — trace same-session rekey
 
-A client reports that HTTP stopped after the exit engine restarted. Before
-looking at packets, write the expected state of each row in the ownership
-table. Then check: is the agent still running with the old backend identity?
-Is the session `active` or `failed`? Is the lease still present? Did the
-client create a fresh session?
-
-Hint: an old client key cannot become valid merely because the process came
-back. Check the failure reason `backend_restart_requires_new_session`.
+On the isolated Linux lab, run `tests/lab/session-e2e.sh --engine-restart`.
+Before running it, predict the API session ID, virtual IP, owner token, and
+lease before and after the backend restart. Then trace the new backend
+registration, empty `SyncState` ACK, fresh `ProvisionPeer` ACK, and the
+client's engine transition. The expected result is the same API session and
+lease, a higher `key_epoch`, rejected stale keys on client B, and a successful
+HTTP probe from client A only after the new provision is active. These are
+exercise expectations, not an observed result for the current unverified
+implementation.
 
 ## Exercise — predict rollback
 
@@ -321,16 +501,33 @@ install `v1` again, then install `v2` and roll back. Predict the target of
 Check your answer with `tests/deploy/install-rollback.test.sh`; the script's
 pass line means those transitions were observed in the test root.
 
+## Exercise — rotate credentials and restore a database
+
+Run `bash tests/deploy/credentials.test.sh` and
+`bash tests/deploy/postgres-backup-restore.test.sh` in a Linux environment
+with POSIX file modes. They stub `systemd-creds`, `pg_dump`, and `pg_restore`;
+they verify atomic version rotation/rollback, private-file checks, database
+confirmation, checksum validation, and transactional restore arguments
+without using a host key or database.
+
+For an authorized isolated Debian lab with an existing test database, create
+a backup before a migration, stop the control plane and every node service,
+restore with the exact database confirmation, then start the control plane
+before the nodes. Predict why an engine restart triggers empty-state
+reconciliation and same-session rekey. Never use the exercise against a
+production database or with credentials copied into the repository.
+
 ## Explicit deferrals
 
-- Automatic rekey/reprovisioning of the *same* client session after a
-  backend restart is not implemented; a fresh API session is required.
-- The client has no VPN CLI provisioning flow yet; the laboratory still
-  bootstraps keys through protected files.
+- The same-session rekey code and lab client manager are implemented, but the
+  current isolated Linux acceptance test has not run on this workstation.
+- `vpn-cli` and raw UDP remain isolated-lab tools; production client
+  authentication and production traffic are not supported.
 - DNS, default-route/full-tunnel rollback, IPv6 policy, NAT, MSS clamping,
-  and WireGuard are milestone-6/full-tunnel scope.
-- The installer does not manage PostgreSQL backups, certificate issuance,
-  or secret rotation.
+  and WireGuard remain deferred to the milestone-6/full-tunnel phase.
+- Backup/restore and encrypted credential rotation are operator-invoked;
+  automated backup scheduling, remote replication, certificate issuance,
+  and source-secret generation remain out of scope.
 
 ## Revisions
 
@@ -338,4 +535,5 @@ pass line means those transitions were observed in the test root.
 - `r1` — review hardening: unprivileged group-owned control socket with UID authorization preserved; atomic backend-reset registration; reset reuse across pre-ACK reconnects; node exclusion from provisioning until the reset ACK.
 - `r2` — installation hardening: service-readable release/directory permissions are normalized even under a restrictive umask.
 - `r3` — validation hardening: clean Debian systemd evidence now covers control-plane startup plus REST-to-engine session provisioning and revocation.
+- `r4` — same-session rekey after confirmed empty-state reconciliation, lab client epoch supervision, PostgreSQL backup/restore, and host-key-encrypted systemd credential staging. Current verification blockers and the pending isolated Linux acceptance run are recorded separately from historical results.
 

@@ -49,6 +49,7 @@ bld/
 
 # Build results on 'Bin' directories
 **/[Bb]in/*
+!engine-rust/src/bin/*.rs
 # Uncomment if you have tasks that rely on *.refresh files to move binaries
 # (https://github.com/github/gitignore/pull/3736)
 #!**/[Bb]in/*.refresh
@@ -435,3 +436,6 @@ control-dotnet/**/TestResults/
 
 # Lab PKI output (tests/lab/gen-lab-pki.sh) — unencrypted lab keys, never committed
 tests/lab/pki/
+
+# Local automated pre-PR reports
+.pr-reviews/

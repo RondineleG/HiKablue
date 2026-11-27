@@ -13,7 +13,9 @@ make_release() {
     mkdir -p "$dir/bin" "$dir/control" "$dir/systemd" "$dir/config"
     printf '%s\n' "$version" >"$dir/VERSION"
     printf 'marker=%s\n' "$marker" >"$dir/BUILD_INFO"
-    for f in vpn-engine vpn-agent hikablue-engine-service hikablue-agent-service hikablue-control-service; do
+    for f in vpn-engine vpn-cli vpn-agent hikablue-engine-service hikablue-agent-service \
+        hikablue-control-service hikablue-backup-postgres hikablue-restore-postgres \
+        hikablue-provision-credentials; do
         printf '#!/bin/sh\n# %s %s\n' "$f" "$marker" >"$dir/bin/$f"
         chmod 0755 "$dir/bin/$f"
     done

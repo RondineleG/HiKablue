@@ -1,8 +1,9 @@
-# Milestone 4 session laboratory
+# Milestone 4 and 5 session laboratory
 
 `session-e2e.sh` is the reproducible end-to-end acceptance laboratory for
-milestone 4. It uses only test traffic inside Linux network namespaces
-created by the script and removes those namespaces when it exits.
+milestone 4 session behavior and milestone 5 backend-restart recovery. It uses
+only test traffic inside Linux network namespaces created by the script and
+removes those namespaces when it exits.
 
 ## Topology
 
@@ -35,8 +36,15 @@ deployments). After each client starts, the script reads
 list. Status polling and revocation present the bootstrap `sessionToken` as
 `X-Session-Token`; the script preserves the create response separately for
 that purpose. The client direction is the inverse of the exit engine
-direction. This is lab-only bootstrap, not the later user-facing client
-provisioning flow.
+direction. This protected-file bootstrap remains for the milestone-4 modes;
+milestone 5 uses the lab-only `vpn-cli` manager described below. Neither path
+is approved for real or production traffic.
+
+The `--engine-restart` scenario runs client A's `vpn-cli` manager outside its
+network namespace so it can reach the loopback-bound control API. The manager
+passes `--netns` to run the child `vpn-engine` inside client A's namespace.
+Client B deliberately keeps the bootstrap keys from before the restart; it
+proves that old key material cannot authenticate after the backend changes.
 
 The service namespace runs `python3 -m http.server` bound to
 `10.80.1.100:8080` behind the exit node. The control plane leases only
@@ -108,8 +116,7 @@ tests/lab/session-e2e.sh --drop
 # local expiry enforced across an agent restart (control plane unreachable)
 tests/lab/session-e2e.sh --expire-restart
 
-# milestone 5 backend restart, confirmed invalidation, fresh-session
-# recovery, and client route rollback
+# milestone 5 backend restart, same-session rekey, and client route rollback
 tests/lab/session-e2e.sh --engine-restart
 
 # repository quality gate, including the privileged labs and the
@@ -137,17 +144,24 @@ reserved while removal was unconfirmed and that the expired session is
 never resurrected during reconciliation.
 
 The engine-restart run is the milestone-5 backend recovery acceptance.
-After normal two-client HTTP connectivity, it terminates and restarts the
-exit engine. The agent observes the changed `backend_instance_id`, exits
-for supervised restart, and is started again. Registration with the fresh
-instance enqueues an empty-state reconciliation that deliberately excludes
-the pre-restart sessions. Only after that reconciliation is applied does
-the control plane mark those sessions `failed` with
-`backend_restart_requires_new_session` and release their leases. The script
-then proves three separate things: client B cannot continue with stale
-keys, killing client A with `SIGKILL` removes its transient `tun0` and the
-connected tunnel route, and a fresh session in the same namespace receives
-fresh keys and restores HTTP connectivity.
+After both clients reach the test HTTP service, the script restarts the exit
+engine. The agent observes the changed `backend_instance_id`, exits for
+supervised restart, and reconnects. The control plane rekeys non-expired
+pending/active sessions with fresh directional keys, wire indexes,
+`key_epoch`, and numeric wire session IDs. It retains each API session UUID,
+virtual IP, owner token, and lease. The reset `SyncState` is empty and carries
+the old session IDs only as completion metadata; the new `ProvisionPeer`
+commands are enqueued only after the backend ACKs that empty state. A session
+returns to `active` only after its fresh provision is ACKed.
+
+The scenario then asserts that A's API session/IP/lease are unchanged, B's
+old keys cannot pass traffic, and A's manager stops the old client engine
+before starting one with the new epoch. It verifies A's HTTP response and
+TUN/route recreation. Finally it kills A's engine with `SIGKILL`, proves the
+TUN and connected route disappear, and waits for the manager's session
+revocation to receive a node ACK before expecting A's lease to be released.
+Already-revoking or expired sessions are completed as revoked by the
+confirmed empty-state ACK.
 
 ## Evidence ordering
 
@@ -158,9 +172,13 @@ lease released. Losing the gRPC channel is never reported as data-plane
 loss, and infrastructure failures abort the run instead of counting as
 functional success.
 
-## Observed milestone-4 results
+## Previously observed laboratory results
 
-Observed on the Ubuntu development VM used for this change:
+The normal-revocation, gRPC-interruption, local-expiry, and old engine-restart
+results below were recorded on the Ubuntu development VM before the current
+same-session rekey changes. The old `--engine-restart` behavior is pinned to
+baseline commit `c5772ccf7b60`; it required a new API session and is historical
+evidence, not validation of the current code.
 
 | Area | Result |
 |---|---|
@@ -170,11 +188,35 @@ Observed on the Ubuntu development VM used for this change:
 | Normal revocation | `session-e2e (normal): PASS` — A lost access, B had no failed continuous responses, and A's lease count changed from 1 to 0 only after the node ACK |
 | gRPC interruption | `session-e2e (drop): PASS` — A stayed `revoking` with lease count 1 while the channel was down; restoring the channel completed removal, marked the session `revoked`, released the lease, and A still had no access |
 | Agent restart expiry | `session-e2e (expire-restart): PASS` — the restarted agent expired A from its persisted deadline with no control plane, B had zero failed responses, the reconnect reconciled A to `revoked` without resurrecting it, and the lease was released only after the fenced removal ACK |
-| Engine restart recovery | `session-e2e (engine-restart): PASS` — the agent detected the fresh backend instance, pre-restart sessions became `failed` only after confirmed empty-state reconciliation, stale keys could not pass traffic, the killed client's TUN/route disappeared, and a fresh session restored HTTP connectivity |
+| Historical engine restart recovery (`c5772ccf7b60`) | `session-e2e (engine-restart): PASS` — the agent detected the fresh backend instance, pre-restart sessions became `failed` only after confirmed empty-state reconciliation, stale keys could not pass traffic, the killed client's TUN/route disappeared, and a fresh session restored HTTP connectivity |
 | Key material hygiene | every client engine command line was verified free of key material; keys live only in `0600` files under the private run directory |
 
 Exact counters vary because keepalives and continuous probe timing vary;
 the acceptance output lines are the stable result.
+
+## Current milestone-5 verification status
+
+These are observations from the Windows development workstation for the
+current uncommitted changes. A test that cannot reach its required tool or
+environment is not a pass.
+
+| Check | Current result |
+|---|---|
+| Rust formatting | `cargo fmt --all -- --check` — PASS |
+| Rust type-check/build | `cargo check --all-targets --locked` — BLOCKED before project compilation because the MSVC `link.exe` is missing |
+| C# credential configuration | `dotnet test ... --filter FullyQualifiedName~SystemdCredentialConfigurationTests` — PASS, 3 tests |
+| PostgreSQL-backed rekey test | `BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases` — BLOCKED during Testcontainers initialization because Docker at `npipe://./pipe/docker_engine` is unavailable |
+| Shell syntax | `bash -n` on changed deployment, lab, and quality-gate scripts — PASS |
+| Offline encrypted-credential script test | Started, then BLOCKED because Git Bash on NTFS could not apply the required owner-only directory modes |
+| Offline PostgreSQL backup/restore test | Started, then BLOCKED because Git Bash on NTFS did not report the expected POSIX-private directory mode |
+| Chapter parity | `bash tests/book/check-parity.sh` — PASS |
+| Linux restart lab | NOT RUN; WSL is not installed on this workstation |
+
+Compilation is therefore unverified for the Rust CLI, and neither packet
+forwarding nor application connectivity has been observed for the new
+same-session rekey flow. Reproduce it in the authorized isolated Linux lab
+with `tests/lab/session-e2e.sh --engine-restart`; do not direct test UDP at
+external or production endpoints.
 
 ## Contract notes and explicit deferrals
 
@@ -192,9 +234,10 @@ the acceptance output lines are the stable result.
   the final client key-delivery design.
 - Snapshots intentionally carry peer/key references, not raw keys, so a new
   backend instance cannot resurrect old epochs from `SyncState`. The
-  milestone-5 recovery behavior is explicit invalidation plus a fresh API
-  session; automatic rekeying of an existing client session remains a later
-  architecture step.
+  milestone-5 recovery path applies an empty reset snapshot and then
+  explicitly provisions fresh keys for the existing API sessions. The
+  same-session client behavior is implemented but remains unverified until
+  the isolated Linux lab above passes.
 - The expire-restart scenario restarts only the Go agent while the Rust
   backend keeps running; backend restart recovery is covered separately by
   `--engine-restart`.
@@ -202,6 +245,13 @@ the acceptance output lines are the stable result.
   write + rename + directory fsync) inside a private `-state-dir` (default
   `/run/vpn/agent-state`, validated `0700` and writable before the channel
   starts). Deadlines already past at startup are enforced immediately.
+- The same-session rekey implementation has not yet been validated in the
+  Linux lab on this workstation. The new flow is not evidence that production
+  routing or traffic is supported.
+- The client CLI is for the isolated laboratory only; the older bootstrap
+  path remains for the milestone-4 scenarios.
+- PostgreSQL backup/restore and encrypted credential scripts are operator
+  tools; they do not issue certificates or generate source secrets.
 
 ## Cleanup and failure artifacts
 

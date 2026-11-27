@@ -46,6 +46,7 @@ mkdir -p "$out/bin" "$out/control" "$out/systemd" "$out/config"
 echo "== build rust engine"
 (cd engine-rust && cargo build --release --locked)
 cp engine-rust/target/release/vpn-engine "$out/bin/vpn-engine"
+cp engine-rust/target/release/vpn-cli "$out/bin/vpn-cli"
 
 echo "== build go agent"
 (cd agent-go && go build -o "$out/bin/vpn-agent" ./cmd/vpn-agent)
@@ -59,6 +60,9 @@ dotnet publish control-dotnet/VpnControl/VpnControl.csproj \
 cp deploy/debian/service-scripts/hikablue-engine-service "$out/bin/"
 cp deploy/debian/service-scripts/hikablue-agent-service "$out/bin/"
 cp deploy/debian/service-scripts/hikablue-control-service "$out/bin/"
+cp deploy/debian/backup-postgres.sh "$out/bin/hikablue-backup-postgres"
+cp deploy/debian/restore-postgres.sh "$out/bin/hikablue-restore-postgres"
+cp deploy/debian/provision-credentials.sh "$out/bin/hikablue-provision-credentials"
 chmod 0755 "$out/bin/"*
 cp deploy/debian/systemd/*.service "$out/systemd/"
 cp deploy/debian/config/*.sample "$out/config/"

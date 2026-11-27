@@ -460,10 +460,13 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task BackendRestartSyncExcludesOldSessionsThenConfirmedAckCompletesResetAndReleasesLeases()
+    public async Task BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases()
     {
         var sessionId = Guid.NewGuid();
         var revokingSessionId = Guid.NewGuid();
+        var oldEgressKey = Enumerable.Repeat((byte)0x11, 32).ToArray();
+        var oldIngressKey = Enumerable.Repeat((byte)0x22, 32).ToArray();
+        var sessionIp = System.Net.IPAddress.Parse("10.99.0.7");
         await using (var db = NewDb())
         {
             db.Nodes.Add(new NodeRow
@@ -476,8 +479,9 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
                 SessionId = sessionId, OwnerSubject = "alice",
                 Status = SessionStatus.Active, NodeId = "edge-1",
                 LabSessionId = 7, ExpiresAt = DateTimeOffset.UtcNow.AddHours(1),
-                VirtualIp = System.Net.IPAddress.Parse("10.99.0.7"),
-                KeyEpoch = 1,
+                VirtualIp = sessionIp, KeyEpoch = 1,
+                EgressKey = oldEgressKey, IngressKey = oldIngressKey,
+                SenderIndex = 101, PeerIndex = 102,
                 CreatedAt = DateTimeOffset.UtcNow, UpdatedAt = DateTimeOffset.UtcNow
             });
             db.Sessions.Add(new SessionRow
@@ -513,8 +517,23 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
                 .EnumerateArray().Select(e => e.GetString()).ToArray();
             Assert.Contains(sessionId.ToString(), resetIds);
             Assert.Contains(revokingSessionId.ToString(), resetIds);
-            Assert.Equal(SessionStatus.Active,
-                (await check.Sessions.SingleAsync(s => s.SessionId == sessionId)).Status);
+            var rekeying = await check.Sessions.SingleAsync(s => s.SessionId == sessionId);
+            Assert.Equal(SessionStatus.Pending, rekeying.Status);
+            Assert.Equal(2L, rekeying.KeyEpoch);
+            Assert.NotEqual(7, rekeying.LabSessionId);
+            Assert.NotEqual(8, rekeying.LabSessionId);
+            Assert.Equal(sessionIp, rekeying.VirtualIp);
+            Assert.NotEqual(Convert.ToHexString(oldEgressKey),
+                Convert.ToHexString(rekeying.EgressKey!));
+            Assert.NotEqual(Convert.ToHexString(oldIngressKey),
+                Convert.ToHexString(rekeying.IngressKey!));
+            Assert.NotEqual(Convert.ToHexString(rekeying.EgressKey!),
+                Convert.ToHexString(rekeying.IngressKey!));
+            Assert.Equal(32, rekeying.EgressKey!.Length);
+            Assert.Equal(32, rekeying.IngressKey!.Length);
+            Assert.NotEqual(rekeying.SenderIndex, rekeying.PeerIndex);
+            Assert.NotEqual((uint?)101, rekeying.SenderIndex);
+            Assert.NotEqual((uint?)102, rekeying.PeerIndex);
             Assert.Equal(SessionStatus.Revoking,
                 (await check.Sessions.SingleAsync(s => s.SessionId == revokingSessionId)).Status);
             Assert.Equal(1, await check.IpLeases.CountAsync(l => l.SessionId == sessionId));
@@ -536,12 +555,40 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
 
         await using var verify = NewDb();
         var session = await verify.Sessions.SingleAsync(s => s.SessionId == sessionId);
-        Assert.Equal(SessionStatus.Failed, session.Status);
-        Assert.Equal("backend_restart_requires_new_session", session.FailureReason);
+        Assert.Equal(SessionStatus.Pending, session.Status);
+        Assert.Null(session.FailureReason);
+        Assert.Equal(2L, session.KeyEpoch);
         var revoking = await verify.Sessions.SingleAsync(s => s.SessionId == revokingSessionId);
         Assert.Equal(SessionStatus.Revoked, revoking.Status);
-        Assert.Equal(0, await verify.IpLeases.CountAsync(l => l.SessionId == sessionId));
+        Assert.Equal(1, await verify.IpLeases.CountAsync(l => l.SessionId == sessionId));
         Assert.Equal(0, await verify.IpLeases.CountAsync(l => l.SessionId == revokingSessionId));
+
+        var provision = await verify.Outbox.SingleAsync(o =>
+            o.CommandType == "ProvisionPeer" && o.Status == "pending");
+        using (var payload = System.Text.Json.JsonDocument.Parse(provision.Payload))
+        {
+            var provisionRoot = payload.RootElement;
+            Assert.Equal((uint)session.LabSessionId, provisionRoot.GetProperty("peer")
+                .GetProperty("lab_session_id").GetUInt32());
+            Assert.Equal(2, provisionRoot.GetProperty("key_material")
+                .GetProperty("key_epoch").GetInt64());
+        }
+        provision.Status = "sent";
+        provision.Attempts = 1;
+        provision.StreamEpoch = "e2";
+        provision.BackendInstanceId = "b2";
+        verify.Outbox.Update(provision);
+        await verify.SaveChangesAsync();
+
+        await NewService().OnCommandAckAsync("edge-1", Stream("e2", "b2"),
+            Ack(provision, AckOutcome.Applied, epoch: "e2", backend: "b2"),
+            CancellationToken.None);
+
+        await using var activeDb = NewDb();
+        var activeSession = await activeDb.Sessions.SingleAsync(s => s.SessionId == sessionId);
+        Assert.Equal(SessionStatus.Active, activeSession.Status);
+        Assert.Equal(2L, activeSession.KeyEpoch);
+        Assert.Equal(1, await activeDb.IpLeases.CountAsync(l => l.SessionId == sessionId));
     }
 
     [Fact]
@@ -749,9 +796,12 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
 
         await using var verify = NewDb();
         var session = await verify.Sessions.SingleAsync();
-        Assert.Equal(SessionStatus.Failed, session.Status);
-        Assert.Equal("backend_restart_requires_new_session", session.FailureReason);
-        Assert.Equal(0, await verify.IpLeases.CountAsync(l => l.SessionId == sessionId));
+        Assert.Equal(SessionStatus.Pending, session.Status);
+        Assert.Equal(2L, session.KeyEpoch);
+        Assert.Equal(1, await verify.IpLeases.CountAsync(l => l.SessionId == sessionId));
+        Assert.Single(await verify.Outbox
+            .Where(o => o.CommandType == "ProvisionPeer" && o.Status == "pending")
+            .ToListAsync());
         Assert.False(await BackendResetState.HasPendingBackendResetAsync(verify, "edge-1", CancellationToken.None));
     }
 
