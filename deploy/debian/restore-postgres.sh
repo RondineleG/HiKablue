@@ -141,6 +141,7 @@ SELECT CASE WHEN
             WHERE d.datname = pg_catalog.current_database()
         )
     )
+THEN 1 ELSE 0 END
 "); then
     echo "could not verify that the target database is empty" >&2
     exit 1

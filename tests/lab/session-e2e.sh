@@ -132,7 +132,7 @@ cleanup() {
     fi
     lab_cleanup_scope
     case "$RUN_DIR" in
-        /tmp/hk-m4-session.*) rm -rf "$RUN_DIR" ;;
+        /tmp/hk-m4-session.*) lab_as_root rm -rf -- "$RUN_DIR" ;;
     esac
 }
 trap cleanup EXIT

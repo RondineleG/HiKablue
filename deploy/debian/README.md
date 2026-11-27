@@ -172,13 +172,19 @@ taken before upgrade instead of only rolling back binaries.
 Before upgrading the control plane, create a private custom-format backup.
 The commands use libpq connection settings and a protected `PGPASSFILE` (or
 an equivalent local service identity); do not put database passwords in
-arguments. Create the parent once and record the unique directory path for
-the later restore:
+arguments. Set `PGUSER` and, when needed, `PGHOST` and `PGPORT` in the
+operator environment. Because the helpers run through `sudo`, configure the
+sudo policy to permit preserving `PGUSER`, `PGPASSFILE`, `PGHOST`, and
+`PGPORT`, then pass those names with `--preserve-env`. If policy does not
+permit that option, run the helper from an authorized privileged environment
+with the same libpq settings. Create the parent once and record the unique
+directory path for the later restore:
 
 ```bash
 sudo install -d -m 0700 /var/backups/hikablue
 backup_dir="/var/backups/hikablue/before-upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
-sudo deploy/debian/backup-postgres.sh \
+sudo --preserve-env=PGUSER,PGPASSFILE,PGHOST,PGPORT \
+  deploy/debian/backup-postgres.sh \
   --database vpn_control \
   --output-dir "$backup_dir"
 ```
@@ -207,7 +213,8 @@ restore_database="vpn_control_restore"
 createdb --username="$PGUSER" --template=template0 "$restore_database"
 sudo systemctl stop hikablue-agent.service hikablue-engine.service
 sudo systemctl stop hikablue-control.service
-sudo deploy/debian/restore-postgres.sh \
+sudo --preserve-env=PGUSER,PGPASSFILE,PGHOST,PGPORT \
+  deploy/debian/restore-postgres.sh \
   --database "$restore_database" \
   --backup-dir "$backup_dir" \
   --confirm-database "$restore_database"

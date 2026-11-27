@@ -167,12 +167,16 @@ are preserved rather than renumbered:
   `tests/checks.sh --lab` in the isolated Linux lab before marking the
   updated flow validated. Review hardening reloads session rows on ACKs,
   serializes revocation with a pending backend reset, measures token secrets
-  in UTF-8 bytes, and binds the Linux engine child to `vpn-cli` with a
-  parent-death signal. PostgreSQL restore now requires a fresh empty target
-  and remains transactional; create it with matching source database
-  encoding/locale and required database-level access settings. Linux and
-  PostgreSQL verification is still pending. Full-tunnel rollback and
-  production-network validation remain deferred.
+  in UTF-8 bytes, binds the Linux engine child to `vpn-cli` with a
+  parent-death signal, and defers expiration revocation until a pending
+  backend-reset ACK confirms the peer is absent. While the client engine is
+  running, a lower key epoch from a status poll is stale data: keep the
+  current engine and continue polling instead of treating it as fatal and
+  requesting session revocation. PostgreSQL restore now requires a fresh
+  empty target and remains transactional; create it with matching source
+  database encoding/locale and required database-level access settings.
+  Linux and PostgreSQL verification is still pending. Full-tunnel rollback
+  and production-network validation remain deferred.
 - **6 — pending.** WireGuard follows deployment/recovery. Full tunneling
   and the HTTP check still depend on the deferred forwarding/NAT work above.
 

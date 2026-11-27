@@ -1,5 +1,3 @@
-// coverage: lab-only begin — session provisioning and TUN process supervision
-// require the isolated control-plane lab and CAP_NET_ADMIN.
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Parser;
@@ -183,6 +181,23 @@ enum PollError {
     Permanent(anyhow::Error),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum EpochDecision {
+    Stale(u64),
+    Unchanged,
+    New,
+}
+
+fn compare_epoch(current_epoch: Option<u64>, candidate_epoch: u64) -> EpochDecision {
+    match current_epoch {
+        Some(current) if candidate_epoch < current => EpochDecision::Stale(current),
+        Some(current) if candidate_epoch == current => EpochDecision::Unchanged,
+        _ => EpochDecision::New,
+    }
+}
+
+// coverage: lab-only begin — the end-to-end CLI entrypoint provisions a session
+// and supervises the privileged TUN process in the isolated control-plane lab.
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -267,6 +282,8 @@ async fn run() -> Result<()> {
         ))),
     }
 }
+
+// coverage: lab-only end
 
 fn validate_args(args: &Args) -> Result<()> {
     if args.control_url.scheme() != "https" {
@@ -365,6 +382,8 @@ fn write_session_info(path: &Path, info: &SessionInfo) -> Result<()> {
     write_private_new_file(path, &content)
 }
 
+// coverage: lab-only begin — supervises the privileged TUN engine and polls
+// session state in the isolated control-plane lab.
 async fn supervise(client: &Client, args: &Args, info: &SessionInfo) -> Result<()> {
     ensure_private_directory(&args.state_dir)?;
     let state_dir = args.state_dir.join(&info.session_id);
@@ -449,19 +468,22 @@ async fn supervise(client: &Client, args: &Args, info: &SessionInfo) -> Result<(
             }
         }
 
-        if let Some(current_epoch) = active_epoch {
-            if epoch < current_epoch {
-                break Err(anyhow!("control plane returned a stale key epoch"));
-            }
-            if epoch == current_epoch {
+        match compare_epoch(active_epoch, epoch) {
+            EpochDecision::Stale(current_epoch) => {
+                eprintln!(
+                    "vpn-cli: ignoring stale key epoch {epoch}; waiting for epoch {current_epoch}"
+                );
                 continue;
             }
-            if let Some(engine) = running.take() {
-                if let Err(error) = stop_engine(engine).await {
-                    break Err(error);
+            EpochDecision::Unchanged => continue,
+            EpochDecision::New => {
+                if let Some(engine) = running.take() {
+                    if let Err(error) = stop_engine(engine).await {
+                        break Err(error);
+                    }
                 }
+                active_epoch = None;
             }
-            active_epoch = None;
         }
 
         let keys = match client_keys(&mut view) {
@@ -501,6 +523,8 @@ async fn supervise(client: &Client, args: &Args, info: &SessionInfo) -> Result<(
     remove_file_if_exists(&manager_pid_file)?;
     loop_result
 }
+
+// coverage: lab-only end
 
 async fn fetch_session(
     client: &Client,
@@ -629,6 +653,8 @@ fn decode_key(name: &str, encoded: Option<String>) -> Result<Zeroizing<[u8; 32]>
     Ok(key)
 }
 
+// coverage: lab-only begin — creates protected key files and starts vpn-engine,
+// which creates the client TUN interface in the isolated lab.
 async fn spawn_engine(
     args: &Args,
     state_dir: &Path,
@@ -724,6 +750,8 @@ async fn spawn_engine(
     key_dir_cleanup.disarm();
     Ok(engine)
 }
+
+// coverage: lab-only end
 
 fn bind_engine_to_manager(command: &mut std::process::Command) {
     #[cfg(target_os = "linux")]
@@ -909,6 +937,8 @@ async fn stop_child(child: &mut Child) -> Result<()> {
     Ok(())
 }
 
+// coverage: lab-only begin — installs the manager's signal handler; this path
+// is exercised by the isolated TUN supervisor.
 async fn shutdown_signal() -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -1043,6 +1073,14 @@ mod tests {
         assert!(validate_args(&args).is_err());
         args.tun_prefix = 24;
         assert!(validate_args(&args).is_ok());
+    }
+
+    #[test]
+    fn stale_key_epoch_is_ignored_while_waiting_for_newer_epoch() {
+        assert_eq!(compare_epoch(Some(7), 6), EpochDecision::Stale(7));
+        assert_eq!(compare_epoch(Some(7), 7), EpochDecision::Unchanged);
+        assert_eq!(compare_epoch(Some(7), 8), EpochDecision::New);
+        assert_eq!(compare_epoch(None, 1), EpochDecision::New);
     }
 
     #[test]

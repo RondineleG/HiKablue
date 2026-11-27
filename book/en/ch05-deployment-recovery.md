@@ -278,6 +278,12 @@ new backend ID
 - It polls that same session with `X-Subject` and `X-Session-Token`, and
   rejects a changed session ID or virtual IP. A temporary API failure is
   retried; a terminal session state is reported.
+- If an active poll returns a `key_epoch` below the running engine's epoch,
+  it treats the response as stale, keeps the current engine running, and
+  polls again. A stale response is not a fatal supervision error that would
+  cause `run()` to request session revocation. The unit test
+  `stale_key_epoch_is_ignored_while_waiting_for_newer_epoch` covers the
+  epoch decision.
 - When the session becomes `pending`, it stops the existing client engine
   before waiting. Once the session is `active` at a higher epoch, it reads
   the new directional keys and wire indexes, writes protected key files, and
@@ -391,12 +397,17 @@ generate source secrets.
 ## PostgreSQL backup and restore
 
 Before a control-plane upgrade or irreversible migration, create a custom
-format backup in a new directory:
+format backup in a new directory. Set `PGUSER`, `PGPASSFILE`, and, when
+needed, `PGHOST` and `PGPORT`. Because the helpers run through `sudo`,
+configure sudo policy to permit preserving these variables and pass them with
+`--preserve-env`. If policy forbids that option, run the helper from an
+authorized privileged environment with the same libpq settings.
 
 ```sh
 sudo install -d -m 0700 /var/backups/hikablue
 backup_dir="/var/backups/hikablue/before-upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
-sudo deploy/debian/backup-postgres.sh \
+sudo --preserve-env=PGUSER,PGPASSFILE,PGHOST,PGPORT \
+  deploy/debian/backup-postgres.sh \
   --database vpn_control \
   --output-dir "$backup_dir"
 ```
@@ -430,7 +441,8 @@ restore_database="vpn_control_restore"
 createdb --username="$PGUSER" --template=template0 "$restore_database"
 sudo systemctl stop hikablue-agent.service hikablue-engine.service
 sudo systemctl stop hikablue-control.service
-sudo deploy/debian/restore-postgres.sh \
+sudo --preserve-env=PGUSER,PGPASSFILE,PGHOST,PGPORT \
+  deploy/debian/restore-postgres.sh \
   --database "$restore_database" \
   --backup-dir "$backup_dir" \
   --confirm-database "$restore_database"
@@ -498,8 +510,10 @@ workstation. A check blocked before its assertions is not a pass.
 | `cargo fmt --all -- --check` from `engine-rust` | PASS — invoked with the user-local Cargo executable |
 | `cargo check --all-targets --locked` from `engine-rust` | BLOCKED before project compilation because MSVC `link.exe` is missing |
 | `SystemdCredentialConfigurationTests` | PASS — 3 tests, using the repository-pinned .NET 10 SDK |
-| `BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases`, `RevocationDuringBackendResetIsFinalizedByEmptyStateAck`, `UnicodeSessionTokenSecretUsesUtf8ByteLength` | BLOCKED before assertions because Testcontainers cannot reach Docker at `npipe://./pipe/docker_engine` |
+| `BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases`, `RevocationDuringBackendResetIsFinalizedByEmptyStateAck`, `ReaperDefersExpiredRevokeUntilPendingResetAck`, `UnicodeSessionTokenSecretUsesUtf8ByteLength` | BLOCKED before assertions because Testcontainers cannot reach Docker at `npipe://./pipe/docker_engine` |
+| `cargo test --locked --bin vpn-cli stale_key_epoch_is_ignored_while_waiting_for_newer_epoch` | BLOCKED before project compilation because MSVC `link.exe` is missing |
 | `bash -n` on `deploy/debian/restore-postgres.sh`, `tests/deploy/postgres-backup-restore.test.sh`, and `deploy/debian/backup-postgres.sh` | PASS |
+| `bash tests/coverage.test.sh` | PASS on Git Bash with a temporary shell function mapping `python3` to Python 3.13 because the Windows Store alias failed; verifies disjoint lab-only spans and both Rust binaries |
 | `bash tests/deploy/credentials.test.sh` and `bash tests/deploy/postgres-backup-restore.test.sh` | BLOCKED — Git Bash on NTFS could not enforce the required private POSIX modes |
 | `bash tests/book/check-parity.sh` | PASS |
 | `git diff --check` | PASS |
@@ -510,7 +524,7 @@ The .NET tests were run with these PowerShell commands:
 ```powershell
 $dotnet = Join-Path $env:USERPROFILE '.dotnet\dotnet.exe'
 & $dotnet test control-dotnet\VpnControl.Tests\VpnControl.Tests.csproj --no-restore --filter FullyQualifiedName~SystemdCredentialConfigurationTests
-& $dotnet test control-dotnet\VpnControl.Tests\VpnControl.Tests.csproj --no-restore --filter 'FullyQualifiedName~BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases|FullyQualifiedName~RevocationDuringBackendResetIsFinalizedByEmptyStateAck|FullyQualifiedName~UnicodeSessionTokenSecretUsesUtf8ByteLength'
+& $dotnet test control-dotnet\VpnControl.Tests\VpnControl.Tests.csproj --no-restore --filter 'FullyQualifiedName~BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases|FullyQualifiedName~RevocationDuringBackendResetIsFinalizedByEmptyStateAck|FullyQualifiedName~ReaperDefersExpiredRevokeUntilPendingResetAck|FullyQualifiedName~UnicodeSessionTokenSecretUsesUtf8ByteLength'
 ```
 
 Rust CLI compilation is unverified. Neither packet forwarding nor application
@@ -528,12 +542,14 @@ external or production endpoints.
 | service ownership | `deploy/debian/systemd/`, `service-scripts/` | shell syntax/static review + real systemd socket check |
 | same-session rekey after backend restart | `control-dotnet/VpnControl/Services/NodeChannelService.cs`, `control-dotnet/VpnControl/Services/SessionProvisioning.cs`, `engine-rust/src/bin/vpn-cli.rs` | rekey integration test blocked before assertions by unavailable Docker; current isolated `--engine-restart` run is pending |
 | revoke during a pending backend reset | `NodeChannelService.cs`, `SessionService.cs` | `RevocationDuringBackendResetIsFinalizedByEmptyStateAck` (blocked before assertions by unavailable Docker) |
+| expiry during a pending backend reset | `LeaseReaperWorker.cs`, `NodeChannelService.cs` | `ReaperDefersExpiredRevokeUntilPendingResetAck` (blocked before assertions by unavailable Docker) |
+| stale client key epoch | `vpn-cli.rs:compare_epoch` | `stale_key_epoch_is_ignored_while_waiting_for_newer_epoch` (blocked before project compilation because MSVC `link.exe` is missing) |
 | stream loss still reconciles | milestone-4 outbox/NodeChannel | `tests/lab/session-e2e.sh --drop` |
 | network restoration | transient TUN ownership and `vpn-cli` supervision | historical TUN cleanup observed; current rekey/route recreation awaits the Linux lab |
 | engine lifetime follows the client manager | `engine-rust/src/bin/vpn-cli.rs` | Linux-only `parent_death_signal_terminates_engine_child` test; not run on this Windows workstation |
 | encrypted systemd credentials | `deploy/debian/provision-credentials.sh`, systemd units, `control-dotnet/VpnControl/Security/SystemdCredentialConfiguration.cs` | 3 C# configuration tests pass; offline shell test blocked by NTFS mode semantics; no current real-systemd credential test |
 | UTF-8 session-token secret length | `SystemdCredentialConfiguration.cs`, `SessionService.cs` | config test accepts a multibyte secret; `UnicodeSessionTokenSecretUsesUtf8ByteLength` is blocked before assertions by unavailable Docker |
-| PostgreSQL backup and exact restore target | `deploy/debian/backup-postgres.sh`, `deploy/debian/restore-postgres.sh` | offline test checks the empty-target guard but is blocked by NTFS mode semantics; no real PostgreSQL restore observed |
+| PostgreSQL backup and exact restore target | `deploy/debian/backup-postgres.sh`, `deploy/debian/restore-postgres.sh` | offline test checks helper executable bits, the complete CASE query, archive-list separation, and rejection of non-empty targets; blocked by NTFS mode semantics; no real PostgreSQL restore observed |
 
 ## Glossary
 
@@ -652,4 +668,5 @@ repository.
 - `r3` — validation hardening: clean Debian systemd evidence now covers control-plane startup plus REST-to-engine session provisioning and revocation.
 - `r4` — same-session rekey after confirmed empty-state reconciliation, lab client epoch supervision, PostgreSQL backup/restore, and host-key-encrypted systemd credential staging. Current verification blockers and the pending isolated Linux acceptance run are recorded separately from historical results.
 - `r5` — review fixes: serialize revocation with backend reset and reload session state on ACKs; require an empty PostgreSQL restore target; use UTF-8 byte length consistently for session secrets; terminate the Linux engine when its `vpn-cli` manager dies. Linux/PostgreSQL integration checks remain unverified in this Windows environment.
+- `r6` — review fixes: ignore stale client key epochs without triggering session revocation; defer expiration revocation until a pending backend-reset ACK; complete the restore-target CASE expression and distinguish archive listing from restore attempts; mark deployment helpers executable; preserve libpq settings through `sudo`; clean root-owned lab state as root; include `vpn-cli` in coverage and test multiple lab-only spans. Current platform blockers remain listed above.
 

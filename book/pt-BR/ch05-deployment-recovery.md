@@ -276,6 +276,12 @@ isolado:
 - Consulta essa mesma sessão com `X-Subject` e `X-Session-Token`, e rejeita
   alterações no ID da sessão ou no IP virtual. Tenta novamente após erros
   temporários da API e informa estados terminais.
+- Se uma consulta ativa retornar `key_epoch` menor que o do engine que está
+  rodando, considera a resposta obsoleta, mantém o engine atual e consulta
+  novamente. Essa resposta não é um erro fatal que faria `run()` solicitar a
+  revogação da sessão. O teste unitário
+  `stale_key_epoch_is_ignored_while_waiting_for_newer_epoch` cobre essa
+  decisão.
 - Quando a sessão passa para `pending`, para o engine cliente atual antes de
   aguardar. Quando volta a `active` com uma época maior, lê as novas chaves
   direcionais e índices, grava arquivos protegidos e inicia um engine novo.
@@ -389,12 +395,18 @@ não emite certificados nem gera os segredos de origem.
 ## Backup e restauração do PostgreSQL
 
 Antes de atualizar o control plane ou aplicar uma migration irreversível,
-crie um backup em um diretório novo:
+crie um backup em um diretório novo. Configure `PGUSER`, `PGPASSFILE` e,
+quando necessário, `PGHOST` e `PGPORT`. Como os helpers são executados com
+`sudo`, configure a política do sudo para permitir a preservação dessas
+variáveis e passe-as com `--preserve-env`. Se a política não permitir essa
+opção, execute o helper em um ambiente privilegiado autorizado com as mesmas
+configurações do libpq.
 
 ```sh
 sudo install -d -m 0700 /var/backups/hikablue
 backup_dir="/var/backups/hikablue/before-upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
-sudo deploy/debian/backup-postgres.sh \
+sudo --preserve-env=PGUSER,PGPASSFILE,PGHOST,PGPORT \
+  deploy/debian/backup-postgres.sh \
   --database vpn_control \
   --output-dir "$backup_dir"
 ```
@@ -428,7 +440,8 @@ restore_database="vpn_control_restore"
 createdb --username="$PGUSER" --template=template0 "$restore_database"
 sudo systemctl stop hikablue-agent.service hikablue-engine.service
 sudo systemctl stop hikablue-control.service
-sudo deploy/debian/restore-postgres.sh \
+sudo --preserve-env=PGUSER,PGPASSFILE,PGHOST,PGPORT \
+  deploy/debian/restore-postgres.sh \
   --database "$restore_database" \
   --backup-dir "$backup_dir" \
   --confirm-database "$restore_database"
@@ -500,9 +513,11 @@ Windows. Uma verificação bloqueada antes das assertions não é um PASS.
 | `cargo fmt --all -- --check` em `engine-rust` | PASS — executado com o Cargo instalado para o usuário |
 | `cargo check --all-targets --locked` em `engine-rust` | BLOQUEADO antes de compilar o projeto porque falta MSVC `link.exe` |
 | `SystemdCredentialConfigurationTests` | PASS — 3 testes com o SDK .NET 10 fixado pelo repositório |
-| `BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases`, `RevocationDuringBackendResetIsFinalizedByEmptyStateAck`, `UnicodeSessionTokenSecretUsesUtf8ByteLength` | BLOQUEADOS ao iniciar Testcontainers porque Docker em `npipe://./pipe/docker_engine` não está disponível |
+| `BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases`, `RevocationDuringBackendResetIsFinalizedByEmptyStateAck`, `ReaperDefersExpiredRevokeUntilPendingResetAck`, `UnicodeSessionTokenSecretUsesUtf8ByteLength` | BLOQUEADOS ao iniciar Testcontainers porque Docker em `npipe://./pipe/docker_engine` não está disponível |
+| `cargo test --locked --bin vpn-cli stale_key_epoch_is_ignored_while_waiting_for_newer_epoch` | BLOQUEADO antes de compilar o projeto porque falta MSVC `link.exe` |
 | `parent_death_signal_terminates_engine_child` | NÃO EXECUTADO: o teste exige Linux e o WSL não está instalado |
 | `bash -n` em `deploy/debian/restore-postgres.sh`, `tests/deploy/postgres-backup-restore.test.sh` e `deploy/debian/backup-postgres.sh` | PASS |
+| `bash tests/coverage.test.sh` | PASS no Git Bash com uma função temporária que redirecionou `python3` para o Python 3.13 porque o alias da Microsoft Store falhava; verifica vários spans lab-only e os dois binários Rust |
 | `bash tests/deploy/credentials.test.sh` e `bash tests/deploy/postgres-backup-restore.test.sh` | BLOQUEADOS: Git Bash em NTFS não forneceu os modos POSIX privados necessários; o teste PostgreSQL agora inclui a proteção de destino vazio |
 | `bash tests/book/check-parity.sh` | PASS |
 | `git diff --check` | PASS |
@@ -513,7 +528,7 @@ Os testes .NET foram executados com estes comandos do PowerShell:
 ```powershell
 $dotnet = Join-Path $env:USERPROFILE '.dotnet\dotnet.exe'
 & $dotnet test control-dotnet\VpnControl.Tests\VpnControl.Tests.csproj --no-restore --filter FullyQualifiedName~SystemdCredentialConfigurationTests
-& $dotnet test control-dotnet\VpnControl.Tests\VpnControl.Tests.csproj --no-restore --filter 'FullyQualifiedName~BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases|FullyQualifiedName~RevocationDuringBackendResetIsFinalizedByEmptyStateAck|FullyQualifiedName~UnicodeSessionTokenSecretUsesUtf8ByteLength'
+& $dotnet test control-dotnet\VpnControl.Tests\VpnControl.Tests.csproj --no-restore --filter 'FullyQualifiedName~BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases|FullyQualifiedName~RevocationDuringBackendResetIsFinalizedByEmptyStateAck|FullyQualifiedName~ReaperDefersExpiredRevokeUntilPendingResetAck|FullyQualifiedName~UnicodeSessionTokenSecretUsesUtf8ByteLength'
 ```
 
 A compilação do CLI Rust não foi verificada. Não se observou forwarding de
@@ -531,12 +546,14 @@ endpoints externos ou de produção.
 | ownership de serviços | `deploy/debian/systemd/`, `service-scripts/` | sintaxe shell/revisão estática + verificação real dos sockets sob systemd |
 | rekey da mesma sessão após reinício do backend | `control-dotnet/VpnControl/Services/NodeChannelService.cs`, `control-dotnet/VpnControl/Services/SessionProvisioning.cs`, `engine-rust/src/bin/vpn-cli.rs` | teste de integração bloqueado antes das assertions por falta do Docker; falta executar o laboratório isolado atual `--engine-restart` |
 | revogação durante reset pendente | `NodeChannelService.cs`, `SessionService.cs` | `RevocationDuringBackendResetIsFinalizedByEmptyStateAck` (bloqueado antes das assertions por falta do Docker) |
+| expiração durante reset pendente | `LeaseReaperWorker.cs`, `NodeChannelService.cs` | `ReaperDefersExpiredRevokeUntilPendingResetAck` (bloqueado antes das assertions por falta do Docker) |
+| época de chave obsoleta do cliente | `vpn-cli.rs:compare_epoch` | `stale_key_epoch_is_ignored_while_waiting_for_newer_epoch` (bloqueado antes de compilar o projeto porque falta MSVC `link.exe`) |
 | perda de stream ainda reconcilia | outbox/NodeChannel do Marco 4 | `tests/lab/session-e2e.sh --drop` |
 | restauração de rede | ownership do TUN transitório e supervisão do `vpn-cli` | limpeza histórica do TUN observada; rekey/restauração de rota atuais aguardam o laboratório Linux |
 | vida do engine vinculada ao gerenciador cliente | `engine-rust/src/bin/vpn-cli.rs` | teste Linux `parent_death_signal_terminates_engine_child`; não executado nesta estação Windows |
 | credenciais systemd criptografadas | `deploy/debian/provision-credentials.sh`, units systemd, `control-dotnet/VpnControl/Security/SystemdCredentialConfiguration.cs` | 3 testes C# passam; teste shell offline bloqueado por modos NTFS; sem teste atual com systemd real |
 | tamanho UTF-8 do segredo do token de sessão | `SystemdCredentialConfiguration.cs`, `SessionService.cs` | teste de configuração aceita segredo multibyte; `UnicodeSessionTokenSecretUsesUtf8ByteLength` bloqueado antes das assertions por falta do Docker |
-| backup e restauração PostgreSQL em destino exato | `deploy/debian/backup-postgres.sh`, `deploy/debian/restore-postgres.sh` | teste offline verifica a rejeição de destinos não vazios, mas está bloqueado por modos NTFS; nenhuma restauração real observada |
+| backup e restauração PostgreSQL em destino exato | `deploy/debian/backup-postgres.sh`, `deploy/debian/restore-postgres.sh` | teste offline verifica os bits executáveis dos helpers, o CASE completo, separa a listagem do arquivo das tentativas de restauração e rejeita destinos não vazios; bloqueado por modos NTFS; nenhuma restauração real observada |
 
 ## Glossário
 
@@ -654,4 +671,5 @@ repositório.
 - `r3` — hardening de validação: a evidência limpa do Debian systemd agora cobre partida do control-plane, provisionamento REST→engine e revogação.
 - `r4` — rekey da mesma sessão após confirmar o estado vazio, supervisão de época pelo cliente do laboratório, backup/restauração PostgreSQL e credenciais systemd criptografadas com chave do host. Os bloqueios atuais de verificação e o teste Linux isolado pendente são registrados separadamente dos resultados históricos.
 - `r5` — correções da revisão: serializa a revogação com o reset do backend e recarrega o estado da sessão nos ACKs; exige um destino PostgreSQL vazio; mede o tamanho dos segredos de sessão em bytes UTF-8 de forma consistente; encerra o engine Linux quando o gerenciador `vpn-cli` morre. As verificações de integração Linux/PostgreSQL continuam sem validação nesta estação Windows.
+- `r6` — correções da revisão: ignora épocas de chave obsoletas sem provocar revogação; adia a revogação por expiração até o ACK de um reset pendente; completa o CASE da verificação PostgreSQL e separa a listagem do arquivo das tentativas de restauração; marca os helpers de implantação como executáveis; preserva as configurações libpq através do `sudo`; limpa como root o estado do laboratório que pertence à execução; inclui `vpn-cli` na cobertura e testa vários spans lab-only. Os bloqueios de plataforma continuam registrados acima.
 

@@ -390,6 +390,101 @@ public sealed class WorkersTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ReaperDefersExpiredRevokeUntilPendingResetAck()
+    {
+        var expiredSessionId = Guid.NewGuid();
+        var liveSessionId = Guid.NewGuid();
+        var now = DateTimeOffset.UtcNow;
+        var writer = new CollectWriter();
+        var active = _streams.Attach("edge-1", "b2", writer,
+            new CancellationTokenSource());
+        await using (var db = NewDb())
+        {
+            db.Nodes.Add(new NodeRow
+            {
+                NodeId = "edge-1", BackendInstanceId = "b2",
+                RegisteredAt = now, LastSeenAt = now, EngineHealthy = true,
+                DesiredRevision = 5
+            });
+            db.Sessions.Add(new SessionRow
+            {
+                SessionId = expiredSessionId, OwnerSubject = "alice",
+                Status = SessionStatus.Active, NodeId = "edge-1",
+                LabSessionId = 1, VirtualIp = IPAddress.Parse("10.99.0.7"),
+                ExpiresAt = now.AddMinutes(-5),
+                CreatedAt = now.AddHours(-1), UpdatedAt = now.AddHours(-1)
+            });
+            db.Sessions.Add(new SessionRow
+            {
+                SessionId = liveSessionId, OwnerSubject = "bob",
+                PeerPublicKey = "test-key-ref",
+                Status = SessionStatus.Active, NodeId = "edge-1",
+                LabSessionId = 2, VirtualIp = IPAddress.Parse("10.99.0.8"),
+                KeyEpoch = 1, EgressKey = new byte[32], IngressKey = new byte[32],
+                SenderIndex = 101, PeerIndex = 202,
+                ExpiresAt = now.AddHours(1), CreatedAt = now, UpdatedAt = now
+            });
+            db.Outbox.Add(new OutboxRow
+            {
+                CommandId = Guid.NewGuid(), NodeId = "edge-1",
+                CommandType = "SyncState", Revision = 5, CreatedAt = now,
+                Status = "sent", Attempts = 1, StreamEpoch = active.StreamEpoch,
+                BackendInstanceId = active.BackendInstanceId,
+                Payload = System.Text.Json.JsonSerializer.Serialize(new
+                {
+                    backend_reset_session_ids = new[] { expiredSessionId, liveSessionId }
+                })
+            });
+            await db.SaveChangesAsync();
+            await db.Database.ExecuteSqlAsync(
+                $"INSERT INTO ip_leases (address, session_id, node_id, reserved_at) VALUES (CAST({"10.99.0.7"} AS inet), {expiredSessionId}, {"edge-1"}, {now})");
+            await db.Database.ExecuteSqlAsync(
+                $"INSERT INTO ip_leases (address, session_id, node_id, reserved_at) VALUES (CAST({"10.99.0.8"} AS inet), {liveSessionId}, {"edge-1"}, {now})");
+        }
+
+        Assert.Equal(1, await NewReaper().ReapOnceAsync(CancellationToken.None));
+        await using (var verify = NewDb())
+        {
+            Assert.Equal(SessionStatus.Revoking,
+                (await verify.Sessions.SingleAsync(s => s.SessionId == expiredSessionId)).Status);
+            Assert.Equal(5L, (await verify.Nodes.SingleAsync()).DesiredRevision);
+            Assert.Equal(1, await verify.IpLeases.CountAsync(
+                l => l.SessionId == expiredSessionId));
+            Assert.False(await verify.Outbox.AnyAsync(o => o.CommandType == "RevokePeer"));
+        }
+
+        await using (var ackDb = NewDb())
+        {
+            var service = new NodeChannelService(ackDb, _streams, new NodeRegistry(),
+                NullLogger<NodeChannelService>.Instance);
+            var reset = await ackDb.Outbox.SingleAsync(o => o.CommandType == "SyncState");
+            await service.OnCommandAckAsync("edge-1", active, new CommandAck
+            {
+                CommandId = reset.CommandId.ToString(),
+                StreamEpoch = active.StreamEpoch,
+                BackendInstanceId = active.BackendInstanceId,
+                Outcome = AckOutcome.Applied,
+                AppliedRevision = (ulong)reset.Revision
+            }, CancellationToken.None);
+        }
+
+        await using var completed = NewDb();
+        Assert.Equal(SessionStatus.Revoked,
+            (await completed.Sessions.SingleAsync(s => s.SessionId == expiredSessionId)).Status);
+        Assert.Equal(0, await completed.IpLeases.CountAsync(
+            l => l.SessionId == expiredSessionId));
+        Assert.Equal(1, await completed.IpLeases.CountAsync(
+            l => l.SessionId == liveSessionId));
+        var provision = await completed.Outbox.SingleAsync(o =>
+            o.CommandType == "ProvisionPeer");
+        Assert.Equal(6L, provision.Revision);
+        Assert.Equal("pending", provision.Status);
+        Assert.False(await completed.Outbox.AnyAsync(o => o.CommandType == "RevokePeer"));
+        Assert.Equal(6L, (await completed.Nodes.SingleAsync()).DesiredRevision);
+        active.Closed.Cancel();
+    }
+
+    [Fact]
     public async Task ReaperExpiresSessionsEvenWhenNodeIsLive()
     {
         await using (var db = NewDb())

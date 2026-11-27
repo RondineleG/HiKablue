@@ -6,6 +6,13 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 tmp=$(mktemp -d /tmp/hk-m5-postgres-test.XXXXXX)
 trap 'rm -rf -- "$tmp"' EXIT
 
+for helper in provision-credentials.sh backup-postgres.sh restore-postgres.sh; do
+    [[ -x "$repo_root/deploy/debian/$helper" ]] || {
+        echo "FAIL: deployment helper is not executable: $helper" >&2
+        exit 1
+    }
+done
+
 mkdir -p "$tmp/bin" "$tmp/backups"
 cat >"$tmp/bin/pg_dump" <<'STUB'
 #!/usr/bin/env bash
@@ -24,11 +31,12 @@ STUB
 cat >"$tmp/bin/pg_restore" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' "$*" >>"$PG_RESTORE_ARGS"
 if [[ " $* " == *" --list "* ]]; then
+    printf '%s\n' "$*" >>"$PG_RESTORE_LIST_ARGS"
     [ -f "${*: -1}" ]
     exit
 fi
+printf '%s\n' "$*" >>"$PG_RESTORE_ARGS"
 [ "${FAIL_RESTORE:-}" != 1 ] || exit 1
 STUB
 cat >"$tmp/bin/psql" <<'STUB'
@@ -41,6 +49,7 @@ chmod 0755 "$tmp/bin/pg_dump" "$tmp/bin/pg_restore" "$tmp/bin/psql"
 export PATH="$tmp/bin:$PATH"
 export PG_DUMP_ARGS="$tmp/pg-dump-args"
 export PG_RESTORE_ARGS="$tmp/pg-restore-args"
+export PG_RESTORE_LIST_ARGS="$tmp/pg-restore-list-args"
 export PSQL_ARGS="$tmp/psql-args"
 export PGPASSWORD="not-a-command-line-argument"
 
@@ -70,7 +79,7 @@ if bash "$repo_root/deploy/debian/restore-postgres.sh" \
     echo "FAIL: mismatched restore confirmation was accepted" >&2
     exit 1
 fi
-[ ! -e "$PG_RESTORE_ARGS" ] || {
+[ ! -e "$PG_RESTORE_ARGS" ] && [ ! -e "$PG_RESTORE_LIST_ARGS" ] || {
     echo "FAIL: pg_restore ran before explicit confirmation" >&2
     exit 1
 }
@@ -92,6 +101,14 @@ grep -q -- '--dbname=restored_vpn' "$PG_RESTORE_ARGS" || {
 }
 grep -q -- '--dbname=restored_vpn' "$PSQL_ARGS" || {
     echo "FAIL: target emptiness was not checked" >&2
+    exit 1
+}
+grep -Fq 'THEN 1 ELSE 0 END' "$PSQL_ARGS" || {
+    echo "FAIL: target emptiness query has an incomplete CASE expression" >&2
+    exit 1
+}
+[ -s "$PG_RESTORE_LIST_ARGS" ] || {
+    echo "FAIL: pg_restore did not validate the archive" >&2
     exit 1
 }
 
