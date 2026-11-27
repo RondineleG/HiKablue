@@ -227,6 +227,31 @@ Sessions already `revoking`, or that expire before the reset ACK, become
 `revoked` and release their leases only after that confirmed empty-state ACK.
 This keeps a failed or delayed reset from looking like cleanup confirmation.
 
+Revocation can also arrive after registration but before that ACK. In this
+window, `RevokeSessionAsync` records `revoking` without enqueueing a separate
+`RevokePeer`: the empty reset is already the removal operation. It checks for
+the pending reset while holding the node-row lock, so the reset ACK and
+revocation cannot make conflicting decisions.
+
+The ACK handler must also refresh the session before acting on it:
+
+```csharp
+var resetSessionEntry = db.Entry(resetSession);
+await resetSessionEntry.ReloadAsync(ct);
+if (resetSessionEntry.State == EntityState.Detached)
+{
+    continue;
+}
+```
+
+Line by line: `Entry` gets EF Core's tracked row; `ReloadAsync` replaces
+possibly stale in-memory values with the committed database state; a detached
+row no longer exists, so the loop skips it instead of acting on stale data.
+The same refresh is used before applying provision and revoke ACK side
+effects. `RevocationDuringBackendResetIsFinalizedByEmptyStateAck` proves that
+the reset ACK sees the concurrent revocation, releases the lease, and queues
+neither a duplicate revoke nor a fresh provision.
+
 This is the important honesty boundary: `sent` is not application, and a
 process restart is not cleanup confirmation. The control plane uses the
 fresh backend's applied empty-state reconciliation as the confirmation that
@@ -261,6 +286,35 @@ new backend ID
   inside it.
 - On shutdown it stops the child, removes its protected files, and requests
   session revocation. A failed cleanup or revocation request is surfaced.
+- On Linux, it sets `PR_SET_PDEATHSIG` to `SIGKILL` on the child before
+  `exec`. If `vpn-cli` is killed abruptly, the kernel terminates the engine
+  too, closing the transient TUN. A parent-PID check closes the race where
+  the manager exits before installing the signal.
+
+The process hook is in `engine-rust/src/bin/vpn-cli.rs`:
+
+```rust
+let manager_pid = std::process::id() as libc::pid_t;
+// Keep the transient TUN owned by the manager even after SIGKILL.
+unsafe {
+    command.pre_exec(move || {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::getppid() != manager_pid {
+            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        Ok(())
+    });
+}
+```
+
+Line by line: the manager captures its PID before spawning; `pre_exec` runs
+in the child before `exec`; `prctl` asks Linux to send `SIGKILL` when the
+parent exits; `getppid` rejects the startup race. Normal shutdown still
+removes the protected key files. A forced kill cannot run that cleanup, so
+files may remain in the private state directory; the default `/run` location
+is volatile, while a custom persistent location needs manual cleanup.
 
 Client B intentionally keeps its old bootstrap keys in the restart exercise:
 those keys must fail after the exit backend has restarted. Client A's HTTP
@@ -353,28 +407,56 @@ with a mode-`0600` `backup.dump`, metadata, and SHA-256 checksum. The checksum
 detects accidental corruption; it is not an authenticity signature. Record
 the exact `backup_dir` value for the later restore.
 
-Restore only into an existing, explicitly confirmed target database. Stop
-the control plane and every node's agent and engine first, and keep them
-stopped until the database restore is complete:
+Restore into an existing, empty target database. The target can have a
+different name from the source database recorded in the backup, which lets
+the original database remain available until the restored copy is verified.
+Create the target from `template0` using the database administrator identity
+configured for libpq. `template0` provides a pristine schema but not the
+source database's custom encoding or locale; if the source uses custom
+settings, create the target with matching `--encoding`, `--lc-collate`, and
+`--lc-ctype` values, or matching ICU provider/locale options. Because this
+restore does not use `--create`, configure any required database owner,
+privileges, comments, and database-level settings on the target separately.
+Before creating or restoring the target, set `PGUSER` to the database
+administrator role and configure protected authentication through `PGPASSFILE`
+or an approved local identity; set `PGHOST` and `PGPORT` when needed. Do not
+put passwords in command arguments.
+Stop the control plane and every node's agent and engine first, and keep them
+stopped until the restore is verified:
 
 ```sh
+restore_database="vpn_control_restore"
+: "${PGUSER:?set PGUSER to the database administrator role}"
+createdb --username="$PGUSER" --template=template0 "$restore_database"
 sudo systemctl stop hikablue-agent.service hikablue-engine.service
 sudo systemctl stop hikablue-control.service
 sudo deploy/debian/restore-postgres.sh \
-  --database vpn_control \
+  --database "$restore_database" \
   --backup-dir "$backup_dir" \
-  --confirm-database vpn_control
+  --confirm-database "$restore_database"
+# Verify the database, update the protected connection-string credential,
+# then start the services.
+sudo deploy/debian/provision-credentials.sh \
+  --role control --source-dir /root/hikablue-control-credentials
 sudo systemctl start hikablue-control.service
 sudo systemctl start hikablue-engine.service hikablue-agent.service
 ```
 
 Run each service command on the host that owns those units; all nodes must
-remain stopped while restoring. The restore helper checks the database name,
+remain stopped while restoring. The helper checks the confirmed target name,
 private file modes, the single-entry checksum manifest, checksum, and archive
-readability before `pg_restore` uses `--single-transaction --clean
---if-exists`. A bad confirmation, symlink, malformed manifest, or checksum
-fails before restore. The offline test stubs PostgreSQL clients, so it
-verifies guards and arguments, not a real database restore.
+readability. It also checks PostgreSQL catalogs for objects that can survive
+without belonging to a schema: large objects, subscriptions for this
+database, foreign-data objects, nonstandard procedural languages, default
+privileges, event triggers, publications, and database-specific settings.
+Together with the schema and `public`-object checks, this rejects populated
+targets before restore.
+The helper does not use `--clean`: that option drops only objects present in
+the archive. It restores in one transaction; PostgreSQL does not permit
+`pg_restore --create` with `--single-transaction`. After verifying the target,
+point the protected control-plane connection string at it and retain the old
+database until the switch is confirmed. The offline test stubs PostgreSQL
+clients, so it verifies guards and arguments, not a real database restore.
 
 Restoring only PostgreSQL while agents or engines retain newer in-memory
 state can make desired and applied state disagree. After the restore, start
@@ -408,20 +490,28 @@ dropped/forwarded packets, and the HTTP assertion returned the exact body
 
 ## Current milestone-5 verification status
 
-These are observations from the Windows development workstation for the
-current uncommitted changes. A check blocked before its assertions is not a
-pass.
+These are observations from the review-fix changes on the Windows development
+workstation. A check blocked before its assertions is not a pass.
 
 | Check | Current result |
 |---|---|
-| `cargo fmt --all -- --check` | PASS |
-| `cargo check --all-targets --locked` | BLOCKED before project compilation because MSVC `link.exe` is missing |
-| `dotnet test control-dotnet/VpnControl.Tests/VpnControl.Tests.csproj --filter FullyQualifiedName~SystemdCredentialConfigurationTests` | PASS — 3 credential configuration tests |
-| `BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases` | BLOCKED during Testcontainers initialization because Docker at `npipe://./pipe/docker_engine` is unavailable |
-| `bash -n` on changed deployment, lab, and quality-gate scripts | PASS |
-| `bash tests/deploy/credentials.test.sh` and `bash tests/deploy/postgres-backup-restore.test.sh` | BLOCKED — Git Bash on NTFS could not provide the required POSIX-private directory modes |
+| `cargo fmt --all -- --check` from `engine-rust` | PASS — invoked with the user-local Cargo executable |
+| `cargo check --all-targets --locked` from `engine-rust` | BLOCKED before project compilation because MSVC `link.exe` is missing |
+| `SystemdCredentialConfigurationTests` | PASS — 3 tests, using the repository-pinned .NET 10 SDK |
+| `BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases`, `RevocationDuringBackendResetIsFinalizedByEmptyStateAck`, `UnicodeSessionTokenSecretUsesUtf8ByteLength` | BLOCKED before assertions because Testcontainers cannot reach Docker at `npipe://./pipe/docker_engine` |
+| `bash -n` on `deploy/debian/restore-postgres.sh`, `tests/deploy/postgres-backup-restore.test.sh`, and `deploy/debian/backup-postgres.sh` | PASS |
+| `bash tests/deploy/credentials.test.sh` and `bash tests/deploy/postgres-backup-restore.test.sh` | BLOCKED — Git Bash on NTFS could not enforce the required private POSIX modes |
 | `bash tests/book/check-parity.sh` | PASS |
-| `tests/lab/session-e2e.sh --engine-restart` | NOT RUN — WSL is not installed |
+| `git diff --check` | PASS |
+| `parent_death_signal_terminates_engine_child` and `tests/lab/session-e2e.sh --engine-restart` | NOT RUN — the test requires Linux and WSL is not installed |
+
+The .NET tests were run with these PowerShell commands:
+
+```powershell
+$dotnet = Join-Path $env:USERPROFILE '.dotnet\dotnet.exe'
+& $dotnet test control-dotnet\VpnControl.Tests\VpnControl.Tests.csproj --no-restore --filter FullyQualifiedName~SystemdCredentialConfigurationTests
+& $dotnet test control-dotnet\VpnControl.Tests\VpnControl.Tests.csproj --no-restore --filter 'FullyQualifiedName~BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases|FullyQualifiedName~RevocationDuringBackendResetIsFinalizedByEmptyStateAck|FullyQualifiedName~UnicodeSessionTokenSecretUsesUtf8ByteLength'
+```
 
 Rust CLI compilation is unverified. Neither packet forwarding nor application
 connectivity has been observed for same-session rekey. Reproduce the flow in
@@ -437,10 +527,13 @@ external or production endpoints.
 | upgrade and binary rollback | `deploy/debian/rollback.sh` | same offline test |
 | service ownership | `deploy/debian/systemd/`, `service-scripts/` | shell syntax/static review + real systemd socket check |
 | same-session rekey after backend restart | `control-dotnet/VpnControl/Services/NodeChannelService.cs`, `control-dotnet/VpnControl/Services/SessionProvisioning.cs`, `engine-rust/src/bin/vpn-cli.rs` | rekey integration test blocked before assertions by unavailable Docker; current isolated `--engine-restart` run is pending |
+| revoke during a pending backend reset | `NodeChannelService.cs`, `SessionService.cs` | `RevocationDuringBackendResetIsFinalizedByEmptyStateAck` (blocked before assertions by unavailable Docker) |
 | stream loss still reconciles | milestone-4 outbox/NodeChannel | `tests/lab/session-e2e.sh --drop` |
 | network restoration | transient TUN ownership and `vpn-cli` supervision | historical TUN cleanup observed; current rekey/route recreation awaits the Linux lab |
+| engine lifetime follows the client manager | `engine-rust/src/bin/vpn-cli.rs` | Linux-only `parent_death_signal_terminates_engine_child` test; not run on this Windows workstation |
 | encrypted systemd credentials | `deploy/debian/provision-credentials.sh`, systemd units, `control-dotnet/VpnControl/Security/SystemdCredentialConfiguration.cs` | 3 C# configuration tests pass; offline shell test blocked by NTFS mode semantics; no current real-systemd credential test |
-| PostgreSQL backup and restore | `deploy/debian/backup-postgres.sh`, `deploy/debian/restore-postgres.sh` | offline test blocked by NTFS mode semantics; no real PostgreSQL restore observed |
+| UTF-8 session-token secret length | `SystemdCredentialConfiguration.cs`, `SessionService.cs` | config test accepts a multibyte secret; `UnicodeSessionTokenSecretUsesUtf8ByteLength` is blocked before assertions by unavailable Docker |
+| PostgreSQL backup and exact restore target | `deploy/debian/backup-postgres.sh`, `deploy/debian/restore-postgres.sh` | offline test checks the empty-target guard but is blocked by NTFS mode semantics; no real PostgreSQL restore observed |
 
 ## Glossary
 
@@ -473,9 +566,28 @@ external or production endpoints.
 - **`--control-group`** — engine flag choosing the local group that owns the control socket file at mode `0660`; it does not replace UID authorization.
 - **`key_epoch`** — monotonically advanced identifier for a session's current directional keys and wire state; a backend restart requires a fresh epoch.
 - **`vpn-cli`** — lab-only client manager that polls an API session and replaces its engine after a new key epoch is active.
+- **UTF-8** — byte encoding used to measure the minimum session-token secret; .NET `string.Length` counts UTF-16 code units instead.
+- **`ReloadAsync`** — EF Core method that reloads a tracked entity from the database, replacing cached values.
+- **`EntityState.Detached`** — EF Core state meaning an entity is no longer tracked; here it signals that the row disappeared before the ACK.
 - **`CREDENTIALS_DIRECTORY`** — systemd-provided runtime directory containing decrypted credentials for one service invocation.
 - **`systemd-creds`** — systemd utility used here to encrypt versioned credential files with a host-bound key.
 - **checksum manifest** — SHA-256 file used to detect accidental archive corruption; it does not authenticate who produced the backup.
+- **`psql`** — PostgreSQL command-line client used here for a read-only check that the restore target has no user objects.
+- **`createdb`** — PostgreSQL command that creates the empty restore target.
+- **`template0`** — pristine PostgreSQL template used to create a database without application objects copied from another template.
+- **`pg_restore`** — PostgreSQL utility that reconstructs objects and data from a custom-format `pg_dump` archive.
+- **`--single-transaction`** — `pg_restore` option that commits the restore as one transaction or rolls it back on error.
+- **`--clean`** — `pg_restore` option that drops only archive-listed objects; it does not remove objects absent from the archive.
+- **database locale** — the encoding and collation/character-classification settings of a database; a fresh restore target must match the source when those settings are customized.
+- **large object** — PostgreSQL data stored outside a schema and tracked in `pg_largeobject_metadata`.
+- **logical subscription** — a database's subscription to a logical-replication publication; the restore preflight rejects subscriptions attached to its target.
+- **foreign-data objects** — foreign-data wrappers, servers, and user mappings configured in a database.
+- **default privileges** — PostgreSQL rules that grant permissions automatically to newly created objects.
+- **`PR_SET_PDEATHSIG`** — Linux `prctl` option that sends a selected signal to a process when its parent exits.
+- **`prctl`** — Linux syscall used to configure process-specific behavior such as the parent-death signal.
+- **`pre_exec`** — Rust process hook that runs in the child immediately before `exec`.
+- **`getppid`** — Linux call that returns the current process's parent PID; the CLI uses it to detect a startup race.
+- **`libc`** — Rust crate exposing C-library and Linux system-call interfaces used by the process hook.
 - **systemd** — Linux service manager responsible for starting, restarting,
   and logging services.
 - **transient TUN** — TUN interface owned by an open file descriptor; it is
@@ -505,17 +617,20 @@ pass line means those transitions were observed in the test root.
 
 Run `bash tests/deploy/credentials.test.sh` and
 `bash tests/deploy/postgres-backup-restore.test.sh` in a Linux environment
-with POSIX file modes. They stub `systemd-creds`, `pg_dump`, and `pg_restore`;
-they verify atomic version rotation/rollback, private-file checks, database
-confirmation, checksum validation, and transactional restore arguments
-without using a host key or database.
+with POSIX file modes. They stub `systemd-creds`, `pg_dump`, `pg_restore`,
+and `psql`; they verify atomic version rotation/rollback, private-file checks,
+database confirmation, checksum validation, rejection of a populated restore
+target, and transactional restore arguments without using a host key or
+database.
 
-For an authorized isolated Debian lab with an existing test database, create
-a backup before a migration, stop the control plane and every node service,
-restore with the exact database confirmation, then start the control plane
-before the nodes. Predict why an engine restart triggers empty-state
-reconciliation and same-session rekey. Never use the exercise against a
-production database or with credentials copied into the repository.
+For an authorized isolated Debian lab, create a backup before a migration,
+create a separate empty target from `template0`, stop the control plane and
+every node service, and restore with the exact target confirmation. Verify
+the copy before updating the protected connection-string credential and
+starting the control plane before the nodes. Predict why an engine restart
+triggers empty-state reconciliation and same-session rekey. Never use the
+exercise against a production database or with credentials copied into the
+repository.
 
 ## Explicit deferrals
 
@@ -536,4 +651,5 @@ production database or with credentials copied into the repository.
 - `r2` — installation hardening: service-readable release/directory permissions are normalized even under a restrictive umask.
 - `r3` — validation hardening: clean Debian systemd evidence now covers control-plane startup plus REST-to-engine session provisioning and revocation.
 - `r4` — same-session rekey after confirmed empty-state reconciliation, lab client epoch supervision, PostgreSQL backup/restore, and host-key-encrypted systemd credential staging. Current verification blockers and the pending isolated Linux acceptance run are recorded separately from historical results.
+- `r5` — review fixes: serialize revocation with backend reset and reload session state on ACKs; require an empty PostgreSQL restore target; use UTF-8 byte length consistently for session secrets; terminate the Linux engine when its `vpn-cli` manager dies. Linux/PostgreSQL integration checks remain unverified in this Windows environment.
 

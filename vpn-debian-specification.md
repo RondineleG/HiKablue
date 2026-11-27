@@ -165,8 +165,14 @@ are preserved rather than renumbered:
   `c5772ccf7b60` used fresh-session recovery and is historical evidence only;
   it does not verify the current same-session behavior. Run
   `tests/checks.sh --lab` in the isolated Linux lab before marking the
-  updated flow validated. Full-tunnel rollback and production-network
-  validation remain deferred.
+  updated flow validated. Review hardening reloads session rows on ACKs,
+  serializes revocation with a pending backend reset, measures token secrets
+  in UTF-8 bytes, and binds the Linux engine child to `vpn-cli` with a
+  parent-death signal. PostgreSQL restore now requires a fresh empty target
+  and remains transactional; create it with matching source database
+  encoding/locale and required database-level access settings. Linux and
+  PostgreSQL verification is still pending. Full-tunnel rollback and
+  production-network validation remain deferred.
 - **6 — pending.** WireGuard follows deployment/recovery. Full tunneling
   and the HTTP check still depend on the deferred forwarding/NAT work above.
 

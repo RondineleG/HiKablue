@@ -52,4 +52,8 @@ Name branches `feat/<slug>` for additive work and `fix/<slug>` for bug fixes. Us
   new epoch. The previous observed restart run used fresh-session recovery at
   baseline `c5772ccf7b60`; it does not verify this rekey flow. Re-run
   `tests/checks.sh --lab` in the isolated Linux lab before claiming the new
-  flow is validated. Do not advance milestone 6.
+  flow is validated. Review hardening also reloads session rows on ACKs,
+  finalizes revocation through the pending reset ACK, measures token secrets
+  in UTF-8 bytes, binds the Linux engine child to `vpn-cli` with a parent-death
+  signal, and requires a fresh empty PostgreSQL restore target. These changes
+  still need Linux/PostgreSQL verification. Do not advance milestone 6.

@@ -659,6 +659,7 @@ async fn spawn_engine(
     } else {
         Command::new(&engine_path)
     };
+    bind_engine_to_manager(command.as_std_mut());
     command
         .args([
             "client",
@@ -722,6 +723,29 @@ async fn spawn_engine(
     };
     key_dir_cleanup.disarm();
     Ok(engine)
+}
+
+fn bind_engine_to_manager(command: &mut std::process::Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let manager_pid = std::process::id() as libc::pid_t;
+        // Keep the transient TUN owned by the manager even after SIGKILL.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != manager_pid {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = command;
 }
 
 fn resolve_engine_path(explicit: Option<&Path>) -> Result<PathBuf> {
@@ -920,6 +944,73 @@ mod tests {
             peer_index: Some(22),
             session_token: Some("secret-token".to_owned()),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parent_death_signal_terminates_engine_child() {
+        const PID_FILE_ENV: &str = "HIKABLUE_TEST_ENGINE_CHILD_PID_FILE";
+        if let Ok(pid_file) = std::env::var(PID_FILE_ENV) {
+            let mut command = std::process::Command::new("/bin/sleep");
+            command.arg("60");
+            bind_engine_to_manager(&mut command);
+            let child = command
+                .spawn()
+                .expect("start child with parent-death signal");
+            fs::write(&pid_file, child.id().to_string()).expect("write child PID");
+            std::mem::forget(child);
+            std::process::exit(0);
+        }
+
+        let pid_file =
+            std::env::temp_dir().join(format!("hikablue-engine-child-{}.pid", Uuid::new_v4()));
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("locate current test executable"),
+        )
+        .args([
+            "--exact",
+            "tests::parent_death_signal_terminates_engine_child",
+            "--nocapture",
+        ])
+        .env(PID_FILE_ENV, &pid_file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("start parent helper");
+        assert!(status.success(), "parent helper failed: {status}");
+
+        let child_pid = fs::read_to_string(&pid_file)
+            .expect("read child PID")
+            .parse::<libc::pid_t>()
+            .expect("parse child PID");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut terminated = false;
+        while std::time::Instant::now() < deadline {
+            if unsafe { libc::kill(child_pid, 0) } != 0 {
+                terminated = std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+                if terminated {
+                    break;
+                }
+            } else if fs::read_to_string(format!("/proc/{child_pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(") ")
+                        .map(|(_, fields)| fields.starts_with('Z'))
+                })
+                .unwrap_or(false)
+            {
+                terminated = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !terminated {
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+            }
+        }
+        let _ = fs::remove_file(pid_file);
+        assert!(terminated, "engine child survived manager termination");
     }
 
     #[test]

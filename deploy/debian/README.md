@@ -184,25 +184,55 @@ sudo deploy/debian/backup-postgres.sh \
 ```
 
 The output directory must not already exist. The script writes a mode-`0600`
-archive, metadata, and SHA-256 checksum in a mode-`0700` directory. Restore
-requires an existing target database, the exact `--confirm-database` value,
-and a valid archive/checksum:
+archive, metadata, and SHA-256 checksum in a mode-`0700` directory.
+Restore requires an existing, empty target database, the exact
+`--confirm-database` value, and a valid archive/checksum. The target may use a
+different name from the source database recorded in the backup; this lets an
+operator retain the original database until the restored copy is verified.
+Create a new target from `template0` using the same database administrator
+identity configured for libpq. `template0` guarantees a pristine schema; if
+the source uses non-default encoding or locale settings, pass matching
+`--encoding`, `--lc-collate`, and `--lc-ctype` values to `createdb` (and the
+matching ICU provider/locale options when applicable). The restore does not
+use `--create`, so configure any database-level owner, privileges, comments,
+or settings the application requires on the target. Before running these
+commands, set `PGUSER` to the database administrator role and configure
+protected authentication through `PGPASSFILE` or an approved local identity;
+set `PGHOST` and `PGPORT` when needed. Do not put passwords in command
+arguments:
 
 ```bash
+restore_database="vpn_control_restore"
+: "${PGUSER:?set PGUSER to the database administrator role}"
+createdb --username="$PGUSER" --template=template0 "$restore_database"
 sudo systemctl stop hikablue-agent.service hikablue-engine.service
 sudo systemctl stop hikablue-control.service
 sudo deploy/debian/restore-postgres.sh \
-  --database vpn_control \
+  --database "$restore_database" \
   --backup-dir "$backup_dir" \
-  --confirm-database vpn_control
+  --confirm-database "$restore_database"
+# Verify the restored database, update the protected connection-string credential,
+# then start the services.
+sudo deploy/debian/provision-credentials.sh \
+  --role control --source-dir /root/hikablue-control-credentials
 sudo systemctl start hikablue-control.service
 sudo systemctl start hikablue-engine.service hikablue-agent.service
 ```
 
 Run the stop/start commands on the hosts that own those services; keep all
 nodes stopped while restoring the database. Reuse the exact `backup_dir`
-value recorded when creating the backup. `pg_restore` validates the archive
-before applying it and uses one transaction with `--clean --if-exists`.
+value recorded when creating the backup. `pg_restore` validates the archive before applying it and uses one
+transaction. The helper checks that the target has no user-created schemas
+or objects before restoring, including large objects, subscriptions,
+foreign-data objects, nonstandard procedural languages, default privileges,
+event triggers, publications, and database-scoped settings. `--clean` only
+drops objects listed in the archive and would leave later, unlisted objects
+behind, so the helper refuses to merge into a populated database.
+This keeps the old database available for rollback while the restored target
+is checked. After verification, update the protected control-plane
+`connection-string` credential to point to the restored database and restart
+the services. `pg_restore --create` is not used because PostgreSQL does not
+allow it with `--single-transaction`.
 Restoring only PostgreSQL while agents or engines retain newer in-memory
 state can make desired and applied state disagree. Starting a node after a
 restore changes its backend identity; the control plane reconciles the empty

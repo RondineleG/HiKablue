@@ -15,7 +15,8 @@ public sealed class SystemdCredentialConfigurationTests
             Write(directory, "connection-string", "Host=db;Database=vpn\n");
             Write(directory, "heartbeat-token", "heartbeat\n");
             Write(directory, "admin-token", "admin\n");
-            Write(directory, "session-token-secret", new string('s', 32));
+            var sessionTokenSecret = new string('\u00e9', 16);
+            Write(directory, "session-token-secret", sessionTokenSecret);
             Write(directory, "server.crt", "certificate");
             Write(directory, "server.key", "private-key");
             Write(directory, "lab-ca.crt", "lab-ca");
@@ -28,8 +29,7 @@ public sealed class SystemdCredentialConfigurationTests
                 configuration["VpnControl:ConnectionString"]);
             Assert.Equal("heartbeat", configuration["VpnControl:HeartbeatToken"]);
             Assert.Equal("admin", configuration["VpnControl:AdminToken"]);
-            Assert.Equal(new string('s', 32),
-                configuration["VpnControl:SessionTokenSecret"]);
+            Assert.Equal(sessionTokenSecret, configuration["VpnControl:SessionTokenSecret"]);
             Assert.Equal(Path.Combine(directory, "server.crt"),
                 configuration["Kestrel:Certificates:Default:Path"]);
             Assert.Equal(Path.Combine(directory, "server.key"),

@@ -61,7 +61,7 @@ public sealed class SessionService(
     {
         token = "";
         var secret = config["VpnControl:SessionTokenSecret"];
-        if (string.IsNullOrWhiteSpace(secret) || secret.Length < 32)
+        if (string.IsNullOrWhiteSpace(secret) || Encoding.UTF8.GetByteCount(secret) < 32)
         {
             return false;
         }
@@ -332,24 +332,48 @@ public sealed class SessionService(
 
         await using var tx = await db.Database.BeginTransactionAsync(cancellationToken);
         await LockNodeAsync(row.NodeId, cancellationToken);
-        var revision = await BumpRevisionAsync(row.NodeId, cancellationToken);
+        var entry = db.Entry(row);
+        await entry.ReloadAsync(cancellationToken);
+        if (entry.State == EntityState.Detached)
+        {
+            return RequestResult<SessionView>.WithError(
+                "session not found", EResultStatus.EntityNotFound);
+        }
+        if (row.Status is SessionStatus.Revoked or SessionStatus.Failed)
+        {
+            return RequestResult<SessionView>.Success(ToView(row), "already terminal");
+        }
+        if (row.Status == SessionStatus.Revoking)
+        {
+            return RequestResult<SessionView>.Success(ToView(row), "revocation already in progress");
+        }
+
+        var resetPending = await BackendResetState.HasPendingBackendResetAsync(
+            db, row.NodeId, cancellationToken);
+        long? revision = resetPending
+            ? null
+            : await BumpRevisionAsync(row.NodeId, cancellationToken);
         var now = DateTimeOffset.UtcNow;
         // The lease stays reserved until the backend confirms removal
-        // (spec §6); only the status moves to revoking here.
+        // (spec §6); during a pending backend reset, its empty-state ACK
+        // confirms removal without a separate RevokePeer command.
         row.Status = SessionStatus.Revoking;
         row.UpdatedAt = now;
-        db.Outbox.Add(new OutboxRow
+        if (revision is not null)
         {
-            CommandId = Guid.NewGuid(),
-            NodeId = row.NodeId,
-            CommandType = "RevokePeer",
-            Revision = revision,
-            CreatedAt = now,
-            Payload = JsonSerializer.Serialize(new
+            db.Outbox.Add(new OutboxRow
             {
-                session_id = row.SessionId, lab_session_id = row.LabSessionId, reason = "user_revoked"
-            })
-        });
+                CommandId = Guid.NewGuid(),
+                NodeId = row.NodeId,
+                CommandType = "RevokePeer",
+                Revision = revision.Value,
+                CreatedAt = now,
+                Payload = JsonSerializer.Serialize(new
+                {
+                    session_id = row.SessionId, lab_session_id = row.LabSessionId, reason = "user_revoked"
+                })
+            });
+        }
         await db.SaveChangesAsync(cancellationToken);
         await tx.CommitAsync(cancellationToken);
         return RequestResult<SessionView>.Success(ToView(row), "revocation pending");

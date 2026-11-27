@@ -225,6 +225,33 @@ Las sesiones ya `revoking`, o que expiran antes del ACK del reset, pasan a
 `revoked` y liberan sus leases solo después de confirmar el estado vacío.
 Así, un reset fallido o demorado nunca parece una limpieza confirmada.
 
+La revocación también puede llegar después del registro y antes de ese ACK.
+En esa ventana, `RevokeSessionAsync` guarda `revoking` sin encolar un
+`RevokePeer` separado: el reset vacío ya es la operación de eliminación.
+Comprueba si el reset está pendiente mientras mantiene el bloqueo de la fila
+del nodo, de modo que el ACK del reset y la revocación no tomen decisiones
+contradictorias.
+
+El handler del ACK también debe recargar la sesión antes de actuar:
+
+```csharp
+var resetSessionEntry = db.Entry(resetSession);
+await resetSessionEntry.ReloadAsync(ct);
+if (resetSessionEntry.State == EntityState.Detached)
+{
+    continue;
+}
+```
+
+Línea por línea: `Entry` obtiene la fila seguida por EF Core; `ReloadAsync`
+sustituye los valores posiblemente obsoletos en memoria por el estado
+confirmado de la base; una fila separada ya no existe, así que el bucle la
+omite en vez de actuar con datos obsoletos. La misma recarga se usa antes de
+aplicar efectos secundarios de ACK de aprovisionamiento y revocación.
+`RevocationDuringBackendResetIsFinalizedByEmptyStateAck` prueba que el ACK
+del reset observa la revocación concurrente, libera el lease y no encola ni
+una revocación duplicada ni un nuevo aprovisionamiento.
+
 Esta es la frontera de honestidad: `sent` no es aplicación, y un reinicio
 no es confirmación de limpieza. El plano de control usa la reconciliación
 vacía aplicada por el backend nuevo como confirmación de que el estado viejo
@@ -260,6 +287,37 @@ aislado:
 - Al terminar, detiene el hijo, elimina sus archivos protegidos y solicita
   la revocación de la sesión. Los fallos de limpieza o de revocación se
   informan explícitamente.
+- En Linux, configura `PR_SET_PDEATHSIG` como `SIGKILL` en el hijo antes de
+  `exec`. Si `vpn-cli` muere abruptamente, el kernel también termina el motor
+  y cierra el TUN transitorio. Una comprobación del PID padre cierra la
+  carrera en la que el gestor sale antes de instalar la señal.
+
+El hook de proceso está en `engine-rust/src/bin/vpn-cli.rs`:
+
+```rust
+let manager_pid = std::process::id() as libc::pid_t;
+// Keep the transient TUN owned by the manager even after SIGKILL.
+unsafe {
+    command.pre_exec(move || {
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::getppid() != manager_pid {
+            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        Ok(())
+    });
+}
+```
+
+Línea por línea: el gestor captura su PID antes de crear el proceso; `pre_exec`
+se ejecuta en el hijo antes de `exec`; `prctl` solicita a Linux que envíe
+`SIGKILL` cuando termina el padre; `getppid` detecta la carrera de inicio.
+El apagado normal todavía elimina los archivos de claves protegidos. Una
+muerte forzada no puede ejecutar esa limpieza, por lo que pueden quedar
+archivos en el directorio privado de estado; la ruta predeterminada `/run` es
+volátil, mientras que una ruta persistente personalizada requiere limpieza
+manual.
 
 El cliente B conserva intencionalmente sus claves bootstrap antiguas en el
 ejercicio de reinicio: deben fallar después del reinicio del backend de
@@ -352,30 +410,58 @@ modo `0700` con `backup.dump`, metadatos y checksum SHA-256 en modo `0600`.
 El checksum detecta corrupción accidental; no es una firma de autenticidad.
 Registra el valor exacto de `backup_dir` para la restauración posterior.
 
-Restaura solo en una base existente y confirmada explícitamente. Detén el
-control plane y los agentes y motores de todos los nodos antes de restaurar;
-déjalos detenidos hasta que termine:
+Restaura en una base de destino existente y vacía. El destino puede tener un
+nombre distinto del registrado en los metadatos del backup, lo que permite
+conservar la base original hasta verificar la copia restaurada. Crea el
+destino desde `template0` con la identidad de administrador configurada para
+libpq. `template0` proporciona un esquema limpio, pero no la codificación ni
+la configuración regional personalizada de la base de origen; si usa valores
+personalizados, crea el destino con los mismos valores de `--encoding`,
+`--lc-collate` y `--lc-ctype`, o con las opciones equivalentes de proveedor y
+configuración regional ICU. Como esta restauración no usa `--create`, configura
+por separado en el destino el propietario, los privilegios, los comentarios y
+los ajustes de base de datos que necesite la aplicación. Detén el control
+plane y los agentes y motores de todos los nodos antes de restaurar; déjalos
+detenidos hasta verificarla. Antes de crear o restaurar el destino, configura
+`PGUSER` con el rol administrador y la autenticación protegida mediante
+`PGPASSFILE` o una identidad local aprobada; configura `PGHOST` y `PGPORT` si
+es necesario. No pongas contraseñas en los argumentos:
 
 ```sh
+restore_database="vpn_control_restore"
+: "${PGUSER:?define PGUSER con el rol administrador de la base de datos}"
+createdb --username="$PGUSER" --template=template0 "$restore_database"
 sudo systemctl stop hikablue-agent.service hikablue-engine.service
 sudo systemctl stop hikablue-control.service
 sudo deploy/debian/restore-postgres.sh \
-  --database vpn_control \
+  --database "$restore_database" \
   --backup-dir "$backup_dir" \
-  --confirm-database vpn_control
+  --confirm-database "$restore_database"
+# Verify the database, update the protected connection-string credential,
+# then start the services.
+sudo deploy/debian/provision-credentials.sh \
+  --role control --source-dir /root/hikablue-control-credentials
 sudo systemctl start hikablue-control.service
 sudo systemctl start hikablue-engine.service hikablue-agent.service
 ```
 
 Ejecuta cada comando de servicio en el host propietario de esas units; todos
 los nodos deben permanecer detenidos durante la restauración. El helper
-comprueba el nombre de la base, los modos privados, el manifiesto de checksum
-con una sola entrada, el checksum y la legibilidad del archivo antes de que
-`pg_restore` use `--single-transaction --clean --if-exists`. Una confirmación
-incorrecta, un symlink, un manifiesto mal formado o un checksum inválido
-detienen el proceso antes de restaurar. La prueba offline sustituye los
-clientes PostgreSQL, así que valida las protecciones y argumentos, no una
-restauración real.
+comprueba el nombre confirmado del destino, los modos privados, el manifiesto
+de checksum con una sola entrada, el checksum y la legibilidad del archivo.
+También consulta los catálogos de PostgreSQL para detectar objetos que
+pueden sobrevivir sin pertenecer a un esquema: objetos grandes, suscripciones
+de esta base, objetos de datos externos, lenguajes procedurales no estándar,
+privilegios predeterminados, event triggers, publicaciones y ajustes propios
+de la base. Junto con las comprobaciones de esquemas y objetos de `public`,
+esto rechaza destinos poblados antes de restaurar.
+El helper no usa `--clean`: esa opción elimina solo los objetos incluidos en
+el archivo. La restauración se hace en una transacción; PostgreSQL no permite
+combinar `pg_restore --create` con `--single-transaction`. Tras verificar el
+destino, apunta allí la cadena de conexión protegida del control plane y
+conserva la base antigua hasta confirmar el cambio. La prueba offline
+sustituye los clientes PostgreSQL, así que valida protecciones y argumentos,
+no una restauración real.
 
 Restaurar solo PostgreSQL mientras los agentes o motores conservan un estado
 en memoria más nuevo puede desalinear el estado deseado y el aplicado.
@@ -411,20 +497,30 @@ paquetes y la comprobación HTTP devolvió el cuerpo exacto
 
 ## Estado actual de verificación del milestone 5
 
-Estas son observaciones de los cambios actuales, sin commit, en la estación
-Windows de desarrollo. Una comprobación bloqueada antes de sus assertions no
-es un PASS.
+Estas son observaciones de las correcciones de revisión en la estación Windows
+de desarrollo. Una comprobación bloqueada antes de sus assertions no es un
+PASS.
 
 | Comprobación | Resultado actual |
 |---|---|
-| `cargo fmt --all -- --check` | PASS |
-| `cargo check --all-targets --locked` | BLOQUEADO antes de compilar el proyecto porque falta MSVC `link.exe` |
-| `dotnet test control-dotnet/VpnControl.Tests/VpnControl.Tests.csproj --filter FullyQualifiedName~SystemdCredentialConfigurationTests` | PASS — 3 pruebas de configuración de credenciales |
-| `BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases` | BLOQUEADO al iniciar Testcontainers porque Docker en `npipe://./pipe/docker_engine` no está disponible |
-| `bash -n` sobre scripts modificados de despliegue, laboratorio y quality gate | PASS |
-| `bash tests/deploy/credentials.test.sh` y `bash tests/deploy/postgres-backup-restore.test.sh` | BLOQUEADOS: Git Bash en NTFS no pudo ofrecer los modos privados POSIX requeridos |
+| `cargo fmt --all -- --check` desde `engine-rust` | PASS — ejecutado con el Cargo instalado para el usuario |
+| `cargo check --all-targets --locked` desde `engine-rust` | BLOQUEADO antes de compilar el proyecto porque falta MSVC `link.exe` |
+| `SystemdCredentialConfigurationTests` | PASS — 3 pruebas con el SDK .NET 10 fijado por el repositorio |
+| `BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases`, `RevocationDuringBackendResetIsFinalizedByEmptyStateAck`, `UnicodeSessionTokenSecretUsesUtf8ByteLength` | BLOQUEADOS al iniciar Testcontainers porque Docker en `npipe://./pipe/docker_engine` no está disponible |
+| `parent_death_signal_terminates_engine_child` | NO EJECUTADO: la prueba requiere Linux y WSL no está instalado |
+| `bash -n` en `deploy/debian/restore-postgres.sh`, `tests/deploy/postgres-backup-restore.test.sh` y `deploy/debian/backup-postgres.sh` | PASS |
+| `bash tests/deploy/credentials.test.sh` y `bash tests/deploy/postgres-backup-restore.test.sh` | BLOQUEADOS: Git Bash en NTFS no pudo ofrecer los modos privados POSIX requeridos; el test PostgreSQL ahora incluye la guardia de destino vacío |
 | `bash tests/book/check-parity.sh` | PASS |
+| `git diff --check` | PASS |
 | `tests/lab/session-e2e.sh --engine-restart` | NO EJECUTADO: WSL no está instalado |
+
+Las pruebas .NET se ejecutaron con estos comandos de PowerShell:
+
+```powershell
+$dotnet = Join-Path $env:USERPROFILE '.dotnet\dotnet.exe'
+& $dotnet test control-dotnet\VpnControl.Tests\VpnControl.Tests.csproj --no-restore --filter FullyQualifiedName~SystemdCredentialConfigurationTests
+& $dotnet test control-dotnet\VpnControl.Tests\VpnControl.Tests.csproj --no-restore --filter 'FullyQualifiedName~BackendRestartRekeysSessionsAfterConfirmedEmptyStateAndKeepsTheirLeases|FullyQualifiedName~RevocationDuringBackendResetIsFinalizedByEmptyStateAck|FullyQualifiedName~UnicodeSessionTokenSecretUsesUtf8ByteLength'
+```
 
 La compilación del CLI Rust no está verificada. No se observó forwarding de
 paquetes ni conectividad de aplicación para el rekey de la misma sesión.
@@ -440,10 +536,13 @@ endpoints externos o de producción.
 | upgrade y rollback binario | `deploy/debian/rollback.sh` | misma prueba offline |
 | propiedad de servicios | `deploy/debian/systemd/`, `service-scripts/` | sintaxis shell/revisión estática + verificación real de sockets bajo systemd |
 | rekey de la misma sesión tras reinicio del backend | `control-dotnet/VpnControl/Services/NodeChannelService.cs`, `control-dotnet/VpnControl/Services/SessionProvisioning.cs`, `engine-rust/src/bin/vpn-cli.rs` | test de integración bloqueado antes de sus assertions por falta de Docker; falta ejecutar el laboratorio aislado actual `--engine-restart` |
+| revocación durante un reset pendiente | `NodeChannelService.cs`, `SessionService.cs` | `RevocationDuringBackendResetIsFinalizedByEmptyStateAck` (bloqueado antes de las assertions por falta de Docker) |
 | pérdida de stream reconcilia | outbox/NodeChannel del milestone 4 | `tests/lab/session-e2e.sh --drop` |
 | restauración de red | propiedad TUN transitoria y supervisión de `vpn-cli` | limpieza histórica del TUN observada; rekey/restauración de ruta actuales pendientes del laboratorio Linux |
+| vida del motor ligada al gestor cliente | `engine-rust/src/bin/vpn-cli.rs` | prueba Linux `parent_death_signal_terminates_engine_child`; no ejecutada en esta estación Windows |
 | credenciales systemd cifradas | `deploy/debian/provision-credentials.sh`, units systemd, `control-dotnet/VpnControl/Security/SystemdCredentialConfiguration.cs` | 3 pruebas C# pasan; test shell offline bloqueado por modos NTFS; no hay prueba actual con systemd real |
-| backup y restauración PostgreSQL | `deploy/debian/backup-postgres.sh`, `deploy/debian/restore-postgres.sh` | test offline bloqueado por modos NTFS; no se observó una restauración PostgreSQL real |
+| longitud UTF-8 del secreto de token de sesión | `SystemdCredentialConfiguration.cs`, `SessionService.cs` | test de configuración acepta un secreto multibyte; `UnicodeSessionTokenSecretUsesUtf8ByteLength` bloqueado antes de las assertions por falta de Docker |
+| backup y restauración PostgreSQL en destino exacto | `deploy/debian/backup-postgres.sh`, `deploy/debian/restore-postgres.sh` | el test offline comprueba el rechazo de destinos no vacíos, pero está bloqueado por modos NTFS; no se observó una restauración real |
 
 ## Glosario
 
@@ -475,9 +574,28 @@ endpoints externos o de producción.
 - **`--control-group`** — flag del motor que elige el grupo local propietario del socket de control en modo `0660`; no sustituye la autorización por UID.
 - **`key_epoch`** — identificador que avanza para las claves direccionales y estado wire actuales de una sesión; un reinicio de backend exige una época nueva.
 - **`vpn-cli`** — gestor de cliente del laboratorio que consulta una sesión API y reemplaza el motor cuando se activa una época nueva.
+- **UTF-8** — codificación de bytes usada para medir la longitud mínima del secreto del token de sesión; `string.Length` de .NET cuenta unidades de código UTF-16.
+- **`ReloadAsync`** — método de EF Core que recarga una entidad seguida desde la base y reemplaza los valores almacenados en memoria.
+- **`EntityState.Detached`** — estado de EF Core que indica que la entidad ya no está seguida; aquí significa que la fila desapareció antes del ACK.
 - **`CREDENTIALS_DIRECTORY`** — directorio runtime proporcionado por systemd con credenciales descifradas para una ejecución del servicio.
 - **`systemd-creds`** — utilidad de systemd usada para cifrar archivos de credenciales versionados con una clave ligada al host.
 - **manifiesto de checksum** — archivo SHA-256 que detecta corrupción accidental del backup; no autentica a quien lo creó.
+- **`psql`** — cliente de línea de comandos de PostgreSQL usado para comprobar que el destino no contiene objetos de usuario.
+- **`createdb`** — comando de PostgreSQL que crea el destino vacío para la restauración.
+- **`template0`** — plantilla PostgreSQL prístina que crea una base sin objetos de aplicación copiados de otra plantilla.
+- **`pg_restore`** — utilidad PostgreSQL que reconstruye objetos y datos de un archivo custom-format de `pg_dump`.
+- **`--single-transaction`** — opción de `pg_restore` que confirma toda la restauración en una transacción o la revierte ante un error.
+- **`--clean`** — opción de `pg_restore` que elimina solo objetos incluidos en el archivo; no elimina objetos ausentes de él.
+- **locale de base de datos** — codificación y reglas de orden/clasificación de caracteres de la base; el destino nuevo debe coincidir con la fuente si esos valores son personalizados.
+- **objeto grande** — datos PostgreSQL almacenados fuera de un esquema y registrados en `pg_largeobject_metadata`.
+- **suscripción lógica** — suscripción de una base a una publicación de replicación lógica; la precomprobación rechaza las asociadas al destino.
+- **objetos de datos externos** — wrappers, servidores y mapeos de usuario de datos externos configurados en una base.
+- **privilegios predeterminados** — reglas PostgreSQL que asignan permisos automáticamente a los objetos nuevos.
+- **`PR_SET_PDEATHSIG`** — opción de `prctl` de Linux que envía una señal a un proceso cuando termina su padre.
+- **`prctl`** — llamada de Linux usada para configurar comportamientos del proceso, como la señal al morir el padre.
+- **`pre_exec`** — hook de procesos Rust que se ejecuta en el hijo inmediatamente antes de `exec`.
+- **`getppid`** — llamada de Linux que devuelve el PID del proceso padre; el CLI la usa para detectar una carrera de inicio.
+- **`libc`** — crate Rust que expone interfaces de la biblioteca C y llamadas de sistema Linux usadas por el hook de proceso.
 - **systemd** — administrador Linux de servicios, reinicios y logs.
 - **TUN transitorio** — interfaz TUN perteneciente a un descriptor; se
   destruye al cerrarse el último descriptor.
@@ -507,18 +625,19 @@ transiciones fueron observadas.
 
 Ejecuta `bash tests/deploy/credentials.test.sh` y
 `bash tests/deploy/postgres-backup-restore.test.sh` en Linux con modos POSIX.
-Los scripts sustituyen `systemd-creds`, `pg_dump` y `pg_restore`; verifican la
-rotación/reversión atómica de versiones, permisos privados, confirmación de
-la base, checksum y argumentos transaccionales sin usar una clave del host
-ni una base de datos real.
+Los scripts sustituyen `systemd-creds`, `pg_dump`, `pg_restore` y `psql`;
+verifican la rotación/reversión atómica de versiones, permisos privados,
+confirmación de la base, checksum, rechazo de un destino poblado y argumentos
+transaccionales sin usar una clave del host ni una base real.
 
-En un laboratorio Debian aislado autorizado con una base de prueba existente,
-crea un backup antes de una migration, detén el control plane y todos los
-servicios de los nodos, restaura confirmando exactamente el nombre de la base
-y luego inicia el control plane antes que los nodos. Predice por qué el
-reinicio del engine dispara reconciliación vacía y rekey de la misma sesión.
-Nunca uses el ejercicio en una base de producción ni copies credenciales al
-repositorio.
+En un laboratorio Debian aislado autorizado, crea un backup antes de una
+migration, crea un destino vacío separado desde `template0`, detén el control
+plane y todos los servicios de los nodos, y restaura confirmando exactamente
+el destino. Verifica la copia antes de actualizar la credencial protegida de
+cadena de conexión e iniciar el control plane antes que los nodos. Predice
+por qué el reinicio del engine dispara reconciliación vacía y rekey de la
+misma sesión. Nunca uses el ejercicio en una base de producción ni copies
+credenciales al repositorio.
 
 ## Diferidos explícitos
 
@@ -541,4 +660,5 @@ repositorio.
 - `r2` — endurecimiento de instalación: permisos legibles por los servicios normalizados en release/directorios incluso con una umask restrictiva.
 - `r3` — endurecimiento de validación: la evidencia Debian systemd limpia ahora cubre arranque del control plane, aprovisionamiento REST→engine y revocación.
 - `r4` — rekey de la misma sesión tras confirmar el estado vacío, supervisión de época por el cliente del laboratorio, backup/restauración PostgreSQL y credenciales systemd cifradas con clave del host. Los bloqueos de verificación actuales y la prueba Linux aislada pendiente se registran aparte de los resultados históricos.
+- `r5` — correcciones de revisión: sincroniza revocación con el reset del backend y recarga el estado de sesión en los ACK; exige un destino PostgreSQL vacío; mide secretos de sesión en bytes UTF-8 de forma coherente; termina el motor Linux cuando muere su gestor `vpn-cli`. Las comprobaciones de integración Linux/PostgreSQL siguen sin verificar en esta estación Windows.
 

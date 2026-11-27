@@ -31,10 +31,17 @@ if [[ " $* " == *" --list "* ]]; then
 fi
 [ "${FAIL_RESTORE:-}" != 1 ] || exit 1
 STUB
-chmod 0755 "$tmp/bin/pg_dump" "$tmp/bin/pg_restore"
+cat >"$tmp/bin/psql" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$PSQL_ARGS"
+printf '%s\n' "${TARGET_HAS_OBJECTS:-0}"
+STUB
+chmod 0755 "$tmp/bin/pg_dump" "$tmp/bin/pg_restore" "$tmp/bin/psql"
 export PATH="$tmp/bin:$PATH"
 export PG_DUMP_ARGS="$tmp/pg-dump-args"
 export PG_RESTORE_ARGS="$tmp/pg-restore-args"
+export PSQL_ARGS="$tmp/psql-args"
 export PGPASSWORD="not-a-command-line-argument"
 
 bash "$repo_root/deploy/debian/backup-postgres.sh" \
@@ -69,22 +76,42 @@ fi
 }
 
 bash "$repo_root/deploy/debian/restore-postgres.sh" \
-    --database isolated_vpn --backup-dir "$backup" \
-    --confirm-database isolated_vpn >/dev/null
+    --database restored_vpn --backup-dir "$backup" \
+    --confirm-database restored_vpn >/dev/null
 grep -q -- '--single-transaction' "$PG_RESTORE_ARGS" || {
     echo "FAIL: restore is not transactional" >&2
     exit 1
 }
-grep -q -- '--clean' "$PG_RESTORE_ARGS" || {
-    echo "FAIL: restore does not replace archived objects" >&2
+if grep -q -- '--clean' "$PG_RESTORE_ARGS"; then
+    echo "FAIL: restore must not merge into a non-empty target with --clean" >&2
+    exit 1
+fi
+grep -q -- '--dbname=restored_vpn' "$PG_RESTORE_ARGS" || {
+    echo "FAIL: restore did not use the explicitly confirmed target database" >&2
+    exit 1
+}
+grep -q -- '--dbname=restored_vpn' "$PSQL_ARGS" || {
+    echo "FAIL: target emptiness was not checked" >&2
+    exit 1
+}
+
+: >"$PG_RESTORE_ARGS"
+if TARGET_HAS_OBJECTS=1 bash "$repo_root/deploy/debian/restore-postgres.sh" \
+    --database restored_vpn --backup-dir "$backup" \
+    --confirm-database restored_vpn >/dev/null 2>&1; then
+    echo "FAIL: restore accepted a non-empty target database" >&2
+    exit 1
+fi
+[ ! -s "$PG_RESTORE_ARGS" ] || {
+    echo "FAIL: pg_restore ran against a non-empty target" >&2
     exit 1
 }
 
 cp -a "$backup" "$tmp/backups/corrupt"
 printf 'tampered\n' >>"$tmp/backups/corrupt/backup.dump"
 if bash "$repo_root/deploy/debian/restore-postgres.sh" \
-    --database isolated_vpn --backup-dir "$tmp/backups/corrupt" \
-    --confirm-database isolated_vpn >/dev/null 2>&1; then
+    --database restored_vpn --backup-dir "$tmp/backups/corrupt" \
+    --confirm-database restored_vpn >/dev/null 2>&1; then
     echo "FAIL: corrupted backup was restored" >&2
     exit 1
 fi
@@ -93,8 +120,8 @@ cp -a "$backup" "$tmp/backups/manifest-tampered"
 printf '%s\n' "$(cat "$tmp/backups/manifest-tampered/SHA256SUMS")" \
     >>"$tmp/backups/manifest-tampered/SHA256SUMS"
 if bash "$repo_root/deploy/debian/restore-postgres.sh" \
-    --database isolated_vpn --backup-dir "$tmp/backups/manifest-tampered" \
-    --confirm-database isolated_vpn >/dev/null 2>&1; then
+    --database restored_vpn --backup-dir "$tmp/backups/manifest-tampered" \
+    --confirm-database restored_vpn >/dev/null 2>&1; then
     echo "FAIL: multi-entry checksum manifest was accepted" >&2
     exit 1
 fi
@@ -103,8 +130,8 @@ cp -a "$backup" "$tmp/backups/manifest-symlink"
 rm "$tmp/backups/manifest-symlink/SHA256SUMS"
 ln -s METADATA "$tmp/backups/manifest-symlink/SHA256SUMS"
 if bash "$repo_root/deploy/debian/restore-postgres.sh" \
-    --database isolated_vpn --backup-dir "$tmp/backups/manifest-symlink" \
-    --confirm-database isolated_vpn >/dev/null 2>&1; then
+    --database restored_vpn --backup-dir "$tmp/backups/manifest-symlink" \
+    --confirm-database restored_vpn >/dev/null 2>&1; then
     echo "FAIL: symlinked checksum manifest was accepted" >&2
     exit 1
 fi

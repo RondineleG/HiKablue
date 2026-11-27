@@ -52,12 +52,14 @@ checksum_manifest="$backup_dir/SHA256SUMS"
     echo "backup metadata or checksum manifest is missing" >&2
     exit 1
 }
-grep -Fqx "database=$database" "$metadata" || {
-    echo "backup database does not match the confirmed target" >&2
+source_database=$(sed -n 's/^database=//p' "$metadata")
+[[ "$source_database" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}$ ]] || {
+    echo "backup metadata must contain exactly one safe source database name" >&2
     exit 1
 }
 command -v sha256sum >/dev/null || { echo "sha256sum is required" >&2; exit 1; }
 command -v pg_restore >/dev/null || { echo "pg_restore is required" >&2; exit 1; }
+command -v psql >/dev/null || { echo "psql is required" >&2; exit 1; }
 
 mode=$(stat -c '%a' "$backup_dir")
 if (( (8#$mode & 077) != 0 )); then
@@ -89,7 +91,66 @@ checksum_line=$(cat "$checksum_manifest")
 ) || { echo "backup checksum verification failed" >&2; exit 1; }
 pg_restore --no-password --list "$archive" >/dev/null
 
-echo "restoring into database '$database'; stop hikablue-control.service first"
+if ! target_has_objects=$(psql --no-password --set=ON_ERROR_STOP=1 \
+    --tuples-only --no-align --dbname="$database" --command="
+SELECT CASE WHEN
+    EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_namespace AS n
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'public')
+          AND n.nspname !~ '^pg_'
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_depend AS d
+        WHERE d.refclassid = 'pg_catalog.pg_namespace'::regclass
+          AND d.classid <> 'pg_catalog.pg_namespace'::regclass
+          AND d.refobjid = (
+              SELECT n.oid
+              FROM pg_catalog.pg_namespace AS n
+              WHERE n.nspname = 'public'
+          )
+    )
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_largeobject_metadata)
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_event_trigger)
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_publication)
+    OR EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_subscription AS s
+        WHERE s.subdbid = (
+            SELECT d.oid
+            FROM pg_catalog.pg_database AS d
+            WHERE d.datname = pg_catalog.current_database()
+        )
+    )
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_default_acl)
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_foreign_data_wrapper)
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_foreign_server)
+    OR EXISTS (SELECT 1 FROM pg_catalog.pg_user_mapping)
+    OR EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_language AS l
+        WHERE l.lanname NOT IN ('internal', 'c', 'sql', 'plpgsql')
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_db_role_setting AS s
+        WHERE s.setdatabase = (
+            SELECT d.oid
+            FROM pg_catalog.pg_database AS d
+            WHERE d.datname = pg_catalog.current_database()
+        )
+    )
+"); then
+    echo "could not verify that the target database is empty" >&2
+    exit 1
+fi
+[[ "$target_has_objects" == "0" ]] || {
+    echo "target database must be empty; restore into a fresh database to avoid retaining objects absent from the archive" >&2
+    exit 1
+}
+
+echo "restoring backup from '$source_database' into empty database '$database'; stop hikablue-control.service first"
 pg_restore --no-password --exit-on-error --single-transaction \
-    --clean --if-exists --dbname="$database" "$archive"
+    --dbname="$database" "$archive"
 echo "database restore completed: $database"

@@ -404,8 +404,13 @@ public sealed class NodeChannelService(
                         s => s.SessionId == sessionId, ct);
                     if (session is not null)
                     {
-                        session.Status = SessionStatus.Revoked;
-                        session.UpdatedAt = DateTimeOffset.UtcNow;
+                        var entry = db.Entry(session);
+                        await entry.ReloadAsync(ct);
+                        if (entry.State != EntityState.Detached)
+                        {
+                            session.Status = SessionStatus.Revoked;
+                            session.UpdatedAt = DateTimeOffset.UtcNow;
+                        }
                     }
                 }
                 break;
@@ -417,10 +422,16 @@ public sealed class NodeChannelService(
                 {
                     var session = await db.Sessions.FirstOrDefaultAsync(
                         s => s.SessionId == provSessionId, ct);
-                    if (session is { Status: SessionStatus.Pending })
+                    if (session is not null)
                     {
-                        session.Status = SessionStatus.Active;
-                        session.UpdatedAt = DateTimeOffset.UtcNow;
+                        var entry = db.Entry(session);
+                        await entry.ReloadAsync(ct);
+                        if (entry.State != EntityState.Detached &&
+                            session.Status == SessionStatus.Pending)
+                        {
+                            session.Status = SessionStatus.Active;
+                            session.UpdatedAt = DateTimeOffset.UtcNow;
+                        }
                     }
                 }
                 break;
@@ -443,6 +454,12 @@ public sealed class NodeChannelService(
                     var resetSession = await db.Sessions.FirstOrDefaultAsync(
                         s => s.SessionId == resetSessionId, ct);
                     if (resetSession is null)
+                    {
+                        continue;
+                    }
+                    var resetSessionEntry = db.Entry(resetSession);
+                    await resetSessionEntry.ReloadAsync(ct);
+                    if (resetSessionEntry.State == EntityState.Detached)
                     {
                         continue;
                     }

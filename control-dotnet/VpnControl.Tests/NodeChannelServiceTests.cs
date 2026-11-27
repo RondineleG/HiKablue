@@ -45,6 +45,15 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
         new ControlDbContext(_options), _streams, _nodeRegistry,
         NullLogger<NodeChannelService>.Instance);
 
+    private SessionService NewSessionService() => new(
+        NewDb(), new NodeService(_nodeRegistry),
+        new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["VpnControl:IpPoolCidr"] = "10.99.0.0/24",
+            ["VpnControl:SessionTokenSecret"] = "0123456789abcdef0123456789abcdef"
+        }).Build(),
+        NullLogger<SessionService>.Instance);
+
     private static ActiveStream Stream(string epoch = "e1", string backend = "b1") =>
         new(epoch, backend, new NoopWriter(), new CancellationTokenSource());
 
@@ -589,6 +598,69 @@ public sealed class NodeChannelServiceTests : IAsyncLifetime
         Assert.Equal(SessionStatus.Active, activeSession.Status);
         Assert.Equal(2L, activeSession.KeyEpoch);
         Assert.Equal(1, await activeDb.IpLeases.CountAsync(l => l.SessionId == sessionId));
+    }
+
+    [Fact]
+    public async Task RevocationDuringBackendResetIsFinalizedByEmptyStateAck()
+    {
+        var sessionId = Guid.NewGuid();
+        await using (var db = NewDb())
+        {
+            db.Nodes.Add(new NodeRow
+            {
+                NodeId = "edge-1", BackendInstanceId = "b1",
+                RegisteredAt = DateTimeOffset.UtcNow, EngineHealthy = true
+            });
+            db.Sessions.Add(new SessionRow
+            {
+                SessionId = sessionId, OwnerSubject = "alice",
+                Status = SessionStatus.Active, NodeId = "edge-1",
+                LabSessionId = 7, ExpiresAt = DateTimeOffset.UtcNow.AddHours(1),
+                VirtualIp = System.Net.IPAddress.Parse("10.99.0.7"), KeyEpoch = 1,
+                CreatedAt = DateTimeOffset.UtcNow, UpdatedAt = DateTimeOffset.UtcNow
+            });
+            await db.SaveChangesAsync();
+            await db.Database.ExecuteSqlAsync(
+                $"INSERT INTO ip_leases (address, session_id, node_id, reserved_at) VALUES (CAST({"10.99.0.7"} AS inet), {sessionId}, {"edge-1"}, {DateTimeOffset.UtcNow})");
+        }
+
+        await _service.OnRegisterAsync("edge-1",
+            new NodeRegister { NodeId = "edge-1", BackendInstanceId = "b2" },
+            CancellationToken.None, "e2");
+
+        OutboxRow reset;
+        await using (var db = NewDb())
+        {
+            reset = await db.Outbox.SingleAsync(o => o.CommandType == "SyncState");
+            reset.Status = "sent";
+            reset.Attempts = 1;
+            reset.StreamEpoch = "e2";
+            reset.BackendInstanceId = "b2";
+            db.Outbox.Update(reset);
+            await db.SaveChangesAsync();
+        }
+
+        var revoke = await NewSessionService().RevokeSessionAsync(
+            sessionId, "alice", true, cancellationToken: CancellationToken.None);
+        Assert.True(revoke.IsSuccess);
+        Assert.Equal("revoking", revoke.Data!.Status);
+        await using (var db = NewDb())
+        {
+            Assert.False(await db.Outbox.AnyAsync(o => o.CommandType == "RevokePeer"));
+        }
+
+        await _service.OnCommandAckAsync("edge-1", Stream("e2", "b2"),
+            Ack(reset, AckOutcome.Applied, epoch: "e2", backend: "b2"),
+            CancellationToken.None);
+
+        await using var verify = NewDb();
+        Assert.Equal("acked",
+            (await verify.Outbox.SingleAsync(o => o.CommandType == "SyncState")).Status);
+        Assert.Equal(SessionStatus.Revoked,
+            (await verify.Sessions.SingleAsync(s => s.SessionId == sessionId)).Status);
+        Assert.Equal(0, await verify.IpLeases.CountAsync(l => l.SessionId == sessionId));
+        Assert.False(await verify.Outbox.AnyAsync(o =>
+            o.CommandType == "ProvisionPeer" || o.CommandType == "RevokePeer"));
     }
 
     [Fact]
